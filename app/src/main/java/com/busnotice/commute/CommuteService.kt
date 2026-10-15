@@ -64,10 +64,11 @@ class CommuteService : Service() {
         private const val NEAR_STOP_M = 120.0
         @Volatile var instance: CommuteService? = null
 
-        fun start(ctx: Context, tripId: String, manual: Boolean) {
+        fun start(ctx: Context, tripId: String, manual: Boolean, fresh: Boolean = false) {
             val i = Intent(ctx, CommuteService::class.java)
                 .putExtra(EXTRA_TRIP_ID, tripId)
                 .putExtra(EXTRA_MANUAL, manual)
+                .putExtra("fresh", fresh)
             ctx.startForegroundService(i)
         }
 
@@ -131,16 +132,22 @@ class CommuteService : Service() {
         stationAt = 0L; metroRideSec.clear(); metroRoutes.clear(); alightAt = 0L; fenceFixes.clear(); stillSince = 0L; lastFastAt = 0L; rideLearned = false; stopAlerted = ""
         legIdx = 0; boardedAt = 0L; nearSince = 0L; fastFixes = 0; alertedKey = null; planDone = false; planAlerted = ""
         maxStops.clear(); maxEta.clear()
-        manualRun = manual; riding = false; transferAlerted = false; arriveAlertedAt = 0L
+        manualRun = manual; pendingBoardAt = 0L; pendingBoardLoc = null; boardCommitted = false; riding = false; transferAlerted = false; arriveAlertedAt = 0L
         speeds.clear(); routeHits.clear(); lastGpsFix = null
         power = null; highSince = 0L; coolUntil = 0L
         setPower(Power.HIGH) // 预热：先拿到一个准的位置
         scope.launch(Dispatchers.IO) { prefetchMetroStops(t); prefetch(t) }
         loop?.cancel()
-        val resumedDl = restoreRun(t)
-        loop = scope.launch { runLoop(resumedDl ?: deadline(t, manual)) }
+        // 围栏拉起的是一趟全新的行程：不接中断前的进度
+        val fresh = intent?.getBooleanExtra("fresh", false) == true
+        if (fresh) clearRun()
+        val resumedDl = if (fresh) null else restoreRun(t)
+        loop = scope.launch { runLoop(resumedDl ?: if (fresh) freshDeadline(t) else deadline(t, manual)) }
         return START_STICKY
     }
+
+    private fun freshDeadline(t: Trip): Long =
+        System.currentTimeMillis() + (t.legs.sumOf { it.rideMin + it.transferWalkMin } + 50) * 60_000L
 
     private fun deadline(t: Trip, manual: Boolean): Long {
         val now = System.currentTimeMillis()
@@ -210,6 +217,29 @@ class CommuteService : Service() {
     private var stationAt = 0L     // 推断进站的时刻
     private var alightAt = 0L      // 推断下了上一段地铁的时刻
     private val fenceFixes = ArrayDeque<android.location.Location>()
+    private var pendingBoardAt = 0L
+    private var pendingBoardLoc: Location? = null
+    private var boardCommitted = false
+
+    /**
+     * 真坐车 vs 测试：上车后离上车点 1.5 公里以上、或已经到了下一段（换乘/下地铁），
+     * 且距上车已过 5 分钟，才算一次真实乘车写进习惯。原地反复点测试永远够不上。
+     */
+    private fun commitBoard(now: Long) {
+        if (pendingBoardAt == 0L || boardCommitted || manualRun) return
+        if (now - pendingBoardAt < 5 * 60_000L) return
+        val from = pendingBoardLoc
+        val moved = from != null && best?.let { b ->
+            b.time > pendingBoardAt && b.accuracy < 300 &&
+                Geo.distanceM(from.latitude, from.longitude, b.latitude, b.longitude) > 1_500
+        } == true
+        val progressed = legIdx > 0 && (alightAt > 0 || riding || legIdx > 1)
+        if (!moved && !progressed) return
+        boardCommitted = true
+        Learn.record(this, trip.id, pendingBoardAt)
+        Learn.autoAdjust(this, trip)?.let { Scheduler.schedule(this, it) }
+        Log.i(TAG, "记下一次真实乘车：${if (moved) "位移" else "到了下一段"}")
+    }
     private var stillSince = 0L
     private var lastFastAt = 0L
 
@@ -261,8 +291,10 @@ class CommuteService : Service() {
         val now = at
         stationAt = 0L
         if (manual && !riding && trip.legs[legIdx].isMetroOnly()) runCatching { learnMetro(trip.legs[legIdx]) }
-        // 只学自动启动的行程：手动点开测试的不算习惯
-        if (legIdx == 0 && boardedAt == 0L && !manualRun) Learn.record(this, trip.id, now)
+        // 只学自动启动的行程：手动点开测试的不算习惯；先挂起，确认真的坐了一段才记（commitBoard）
+        if (legIdx == 0 && boardedAt == 0L && !manualRun && !boardCommitted) {
+            pendingBoardAt = now; pendingBoardLoc = best?.let { Location(it) }
+        }
         if (legIdx >= trip.legs.size - 1) {
             if (riding) return            // 已经在车上：重复点「已上车」不做任何事
             if (alight == null) { finish(); return }
@@ -332,6 +364,7 @@ class CommuteService : Service() {
 
     /** 刷新一次，返回下次刷新的间隔 */
     private suspend fun tick(): Long {
+        commitBoard(System.currentTimeMillis())
         val leg = trip.legs[legIdx]
         val prev = trip.legs.getOrNull(legIdx - 1)
         val now = System.currentTimeMillis()
@@ -787,7 +820,9 @@ class CommuteService : Service() {
             .putString("trip", trip.id).putInt("leg", legIdx).putLong("boardedAt", boardedAt)
             .putBoolean("riding", riding).putLong("alightAt", alightAt).putLong("deadline", deadline)
             .putString("ridingCand", ridingCand?.let { "${it.name}|${it.stopName}" } ?: "")
-            .putBoolean("manual", manualRun).apply()
+            .putBoolean("manual", manualRun)
+            .putLong("pendBoard", pendingBoardAt).putBoolean("boardDone", boardCommitted)
+            .putString("pendLoc", pendingBoardLoc?.let { "${it.latitude},${it.longitude}" } ?: "").apply()
     }
 
     private fun clearRun() = runPrefs().edit().clear().apply()
@@ -808,6 +843,11 @@ class CommuteService : Service() {
         riding = p.getBoolean("riding", false)
         alightAt = p.getLong("alightAt", 0)
         manualRun = p.getBoolean("manual", manualRun)
+        pendingBoardAt = p.getLong("pendBoard", 0L); boardCommitted = p.getBoolean("boardDone", false)
+        pendingBoardLoc = (p.getString("pendLoc", "") ?: "").split(',').takeIf { it.size == 2 }?.let { (a, b) ->
+            val la = a.toDoubleOrNull(); val lo = b.toDoubleOrNull()
+            if (la == null || lo == null) null else Location("saved").apply { latitude = la; longitude = lo }
+        }
         rideLearned = true // 中断过的这趟不再学乘车时长，免得样本不准
         val rc = p.getString("ridingCand", "") ?: ""
         ridingCand = t.legs[leg].candidates.firstOrNull { "${it.name}|${it.stopName}" == rc }
