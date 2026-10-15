@@ -128,7 +128,7 @@ class CommuteService : Service() {
         instance = this
         if (!manual) Diag.mark(this, "已自动启动")
         trip = t
-        stationAt = 0L; metroRideSec.clear(); metroRoutes.clear(); alightAt = 0L; rideLearned = false; stopAlerted = ""
+        stationAt = 0L; metroRideSec.clear(); metroRoutes.clear(); alightAt = 0L; fenceFixes.clear(); stillSince = 0L; lastFastAt = 0L; rideLearned = false; stopAlerted = ""
         legIdx = 0; boardedAt = 0L; nearSince = 0L; fastFixes = 0; alertedKey = null; planDone = false; planAlerted = ""
         maxStops.clear(); maxEta.clear()
         manualRun = manual; riding = false; transferAlerted = false; arriveAlertedAt = 0L
@@ -209,6 +209,16 @@ class CommuteService : Service() {
 
     private var stationAt = 0L     // 推断进站的时刻
     private var alightAt = 0L      // 推断下了上一段地铁的时刻
+    private val fenceFixes = ArrayDeque<android.location.Location>()
+    private var stillSince = 0L
+    private var lastFastAt = 0L
+
+    /** 这段地铁的下车站坐标：途经站数据 > 候选里填的下车站 > 下一段上车点 */
+    private fun alightStation(i: Int): Pair<Double, Double>? {
+        metroRoutes[i]?.stations?.lastOrNull()?.let { return it.lat to it.lng }
+        MetroRoutes.target(trip, i)?.let { return it.second to it.third }
+        return null
+    }
     private var rideLearned = false
     private var stopAlerted = ""   // 已在站牌边提醒过的那班车
     private var steps = 0
@@ -270,6 +280,7 @@ class CommuteService : Service() {
         legIdx++
         nearSince = 0L; fastFixes = 0; alertedKey = null; transferAlerted = false
         alightAt = 0L; rideLearned = false; stopAlerted = ""; stepSensor(false)
+        fenceFixes.clear(); stillSince = 0L; lastFastAt = 0L
         maxStops.clear(); maxEta.clear(); speeds.clear(); routeHits.clear()
         loop?.cancel()
         val dl = deadline(trip, false).coerceAtLeast(now + 20 * 60_000L)
@@ -341,15 +352,40 @@ class CommuteService : Service() {
         // 换乘中：还在上一段车上，按「剩余乘车 + 换乘步行」估算到下一站的时间
         val expectArrive = if (boardedAt > 0 && prev != null) boardedAt + rideMs(legIdx - 1) else 0L
         val fromMetro = prev?.isMetroOnly() == true
-        // 判断下了地铁：① 快到站后计步器数到 25 步以上 ② 出站 GPS 恢复（有新定位）③ 过了预计时间 3 分钟兜底
+        // 判断下了地铁：地理围栏（换乘站附近）+ 移动速度 + 计步，三者配合
         if (fromMetro && expectArrive > 0 && alightAt == 0L) {
-            stepSensor(now >= expectArrive - 3 * 60_000L)
+            val window = now >= expectArrive - 3 * 60_000L
+            stepSensor(window)
+            val st = alightStation(legIdx - 1)
+            // 任何来源的新位置（站里多是网络定位，误差放宽到 500 米）
+            val fix = best?.takeIf { now - it.time < 60_000 && it.time > boardedAt && it.accuracy < 500 }
+            if (fix != null && (fenceFixes.isEmpty() || fenceFixes.last().time != fix.time)) {
+                fenceFixes.addLast(android.location.Location(fix)); while (fenceFixes.size > 6) fenceFixes.removeFirst()
+            }
+            // 两次定位之间 ≥ 6 米/秒 = 还在车上：清零步数（车厢里走动不算下车），也清掉静止计时
+            val pair = fenceFixes.toList().takeLast(2)
+            val speed = if (pair.size == 2 && pair[1].time > pair[0].time)
+                Geo.distanceM(pair[0].latitude, pair[0].longitude, pair[1].latitude, pair[1].longitude) /
+                    ((pair[1].time - pair[0].time) / 1000.0) else null
+            if (speed != null && speed >= 6.0) { steps = 0; stillSince = 0L; lastFastAt = now }
+            val dist = if (fix != null && st != null) Geo.distanceM(fix.latitude, fix.longitude, st.first, st.second) else null
+            val inFence = dist != null && dist <= 350 + fix!!.accuracy.coerceAtMost(200f)
+            if (inFence && (speed == null || speed < 2.0)) { if (stillSince == 0L) stillSince = now } else if (!inFence) stillSince = 0L
+            val recentlyFast = now - lastFastAt < 60_000
+            val noLocFor = fenceFixes.lastOrNull()?.let { now - it.time } ?: Long.MAX_VALUE
             val by = when {
-                stepOn && steps >= 25 -> "steps"
-                // 只认卫星定位：站里的网络定位也可能很准，但人还在车上
+                // 出站：卫星定位恢复（地下收不到卫星）
                 lastGpsFix?.let { now - it.time < 60_000 && it.time > boardedAt } == true &&
-                    now >= expectArrive - 2 * 60_000L -> "gps"
-                now >= expectArrive + 3 * 60_000L -> "time"
+                    now >= expectArrive - 2 * 60_000L && (dist == null || dist < 1_500) -> "gps"
+                // 在换乘站围栏内 + 走了 25 步，且最近一分钟没有车速移动
+                window && inFence && stepOn && steps >= 25 && !recentlyFast -> "fence+steps"
+                // 在换乘站围栏内静止超过 90 秒（站台上等、在站里坐着等公交）
+                window && inFence && stillSince > 0 && now - stillSince >= 90_000 -> "fence+still"
+                // 完全没有位置时才单靠步数
+                window && noLocFor > 3 * 60_000L && stepOn && steps >= 40 -> "steps"
+                // 兜底：过了预计时间 3 分钟；但定位显示离换乘站还远且在动，说明晚点了，最多再等 10 分钟
+                now >= expectArrive + 3 * 60_000L && !(dist != null && dist > 1_500 && recentlyFast &&
+                    now < expectArrive + 10 * 60_000L) -> "time"
                 else -> null
             }
             if (by != null) {
