@@ -130,6 +130,7 @@ class CommuteService : Service() {
         maxStops.clear(); maxEta.clear()
         manualRun = manual; riding = false; transferAlerted = false; arriveAlertedAt = 0L
         speeds.clear(); routeHits.clear(); lastGpsFix = null
+        power = null; highSince = 0L; coolUntil = 0L
         setPower(Power.HIGH) // 预热：先拿到一个准的位置
         scope.launch(Dispatchers.IO) { prefetch(t) }
         loop?.cancel()
@@ -287,11 +288,12 @@ class CommuteService : Service() {
                             val peakNow = Decision.headwayAt(secOfDay / 60, weekday, 1, 2) == 1
                             val off = if (c.metroDir.isNotEmpty()) Learn.metroOffsetSec(this@CommuteService, Learn.metroKey(c, peakNow)) else 0
                             val arr = dirs.flatMap { d ->
-                                Decision.metroSchedule(secOfDay - off, d.firstMin, d.lastMin, weekday, c.peakHw(), c.offPeakHw())
+                                Decision.metroSchedule(secOfDay - off, d.firstMin, d.lastMin, weekday, c.peakHw(), c.offPeakHw(), 3, Decision.DWELL_SEC)
                                     .map { Decision.Arrival(it, -1, if (dirs.size > 1) "往${d.dest}" else "", estimated = true) }
                             }
                             Decision.Option(c, walk, arr,
-                                if (dirs.isNotEmpty() && arr.isEmpty()) Decision.END_OF_SERVICE else "")
+                                if (dirs.isNotEmpty() && arr.isEmpty()) Decision.END_OF_SERVICE else "",
+                                located = connecting || dists[i] != null)
                         }
                     }
                 }
@@ -330,7 +332,7 @@ class CommuteService : Service() {
         val hot = when (a.mode) {
             Decision.Mode.LEAVE_NOW, Decision.Mode.HURRY, Decision.Mode.AT_STOP -> true
             Decision.Mode.LEAVE_LATER -> a.leaveInSec < 300
-            Decision.Mode.METRO -> nearest != null && nearest < 400
+            Decision.Mode.METRO -> nearest != null && nearest < 200
             else -> nearest != null && nearest < 300
         } || loc == null
         setPower(if (hot) Power.HIGH else Power.LOW)
@@ -406,7 +408,11 @@ class CommuteService : Service() {
         val need = now + p.leaveSec * 1000L + trip.legs.sumOf { it.rideMin + it.transferWalkMin + 10 } * 60_000L
         if (need > deadlineAt) deadlineAt = need
         setPower(if (p.leaveSec < 300) Power.HIGH else Power.LOW)
-        return if (p.leaveSec < 600) 20_000L else 45_000L
+        return when {
+            p.leaveSec < 600 -> 20_000L
+            p.leaveSec < 1800 -> 45_000L
+            else -> 90_000L     // 离出发还早：少查几次，省电
+        }
     }
 
     /** 最后一段车上：快到下车站时提醒一次，到了就收起 */
@@ -506,20 +512,42 @@ class CommuteService : Service() {
     }
 
     @SuppressLint("MissingPermission")
-    private fun setPower(p: Power) {
+    private var highSince = 0L
+    private var coolUntil = 0L
+
+    /**
+     * 省电：室内搜不到卫星时 GPS 会一直全速搜星，是发热大户。
+     * 高精度开了 90 秒还拿不到 50 米内的定位 → 退回网络定位，冷却 5 分钟再试。
+     */
+    private fun setPower(want: Power) {
+        val now = System.currentTimeMillis()
+        var p = want
+        if (p == Power.HIGH) {
+            if (now < coolUntil) p = Power.LOW
+            else if (power == Power.HIGH && highSince > 0 && now - highSince > 90_000 &&
+                (best?.let { it.accuracy > 50 || now - it.time > 30_000 } != false)) {
+                coolUntil = now + 5 * 60_000L; p = Power.LOW
+                Log.i(TAG, "室内搜星无果，降到网络定位")
+            }
+        }
+        if (p == Power.HIGH && power != Power.HIGH) highSince = now
+        applyPower(p)
+    }
+
+    private fun applyPower(p: Power) {
         if (p == power) return
         power = p
         val m = lm ?: getSystemService(LocationManager::class.java).also { lm = it }
         try { m.removeUpdates(listener) } catch (_: Exception) { }
         val providers = m.allProviders.filter {
             when (p) {
-                Power.HIGH -> it == LocationManager.GPS_PROVIDER || it == LocationManager.NETWORK_PROVIDER ||
-                    it == LocationManager.FUSED_PROVIDER
+                // GPS + 网络两路就够，不再叠加 fused（它内部也会开 GPS，等于重复）
+                Power.HIGH -> it == LocationManager.GPS_PROVIDER || it == LocationManager.NETWORK_PROVIDER
                 Power.LOW -> it == LocationManager.NETWORK_PROVIDER || it == LocationManager.FUSED_PROVIDER
             }
         }.ifEmpty { listOf(LocationManager.GPS_PROVIDER) }
-        val interval = if (p == Power.HIGH) 3_000L else 20_000L
-        val minDist = if (p == Power.HIGH) 0f else 15f
+        val interval = if (p == Power.HIGH) 5_000L else 30_000L
+        val minDist = if (p == Power.HIGH) 3f else 20f
         providers.forEach { pr ->
             try {
                 if (best == null) m.getLastKnownLocation(pr)?.let { onLocation(it) }
@@ -561,6 +589,7 @@ class CommuteService : Service() {
 
     private fun finish() {
         try { lm?.removeUpdates(listener) } catch (_: Exception) { }
+        power = null; highSince = 0L; coolUntil = 0L
         LiveState.snapshot.value = null
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
