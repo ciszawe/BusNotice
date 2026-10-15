@@ -113,7 +113,10 @@ object ChelaileApi {
     }
 
     /** 地铁站某线某方向的首末班（车来了只给这个，没有列车实时位置） */
-    data class SubwayDir(val line: String, val shortName: String, val dest: String, val firstMin: Int, val lastMin: Int)
+    data class SubwayDir(
+        val line: String, val shortName: String, val dest: String, val firstMin: Int, val lastMin: Int,
+        val subLineId: String = "", val order: Int = -1,   // 该方向的编号、本站是这个方向的第几站
+    )
 
     private fun hm(t: String): Int {
         val p = t.split(":", "：")
@@ -144,10 +147,44 @@ object ChelaileApi {
                 out += SubwayDir(
                     line = info?.optString("lineName") ?: "", shortName = info?.optString("shortName") ?: "",
                     dest = sl.optString("destName"), firstMin = hm(sl.optString("firstTime")), lastMin = hm(sl.optString("lastTime")),
+                    subLineId = sl.optString("subLineId"), order = sl.optInt("orderNum", -1),
                 )
             }
         }
         return out
+    }
+
+    /**
+     * 地铁坐几站：上车站各方向的「第几站」和换乘点附近同一方向的「第几站」相减。
+     * 换乘点用下一段上车点的坐标找最近的、有同一方向编号的地铁站。拿不到返回 null。
+     */
+    fun metroStops(board: List<SubwayDir>, toLat: Double, toLng: Double, cityId: String = CITY_ID): Int? {
+        val ids = board.filter { it.subLineId.isNotEmpty() && it.order >= 0 }.associateBy { it.subLineId }
+        if (ids.isEmpty()) return null
+        val d = signedGet(
+            "/api/bus/stop!encryptedHomePage.action",
+            linkedMapOf(
+                "cityId" to cityId, "localCityId" to "undefined",
+                "lat" to "$toLat", "lng" to "$toLng", "geo_lat" to "$toLat", "geo_lng" to "$toLng",
+                "type" to "5", "permission" to "0",
+            )
+        )
+        val arr = d.optJSONArray("nearSts") ?: return null
+        val subs = (0 until arr.length()).map { arr.getJSONObject(it) }.filter { it.optInt("isSubway") == 1 }
+            .sortedBy { it.optInt("distance") }
+        for (st in subs) {
+            val lines = st.optJSONArray("subwayV2Lines") ?: continue
+            for (i in 0 until lines.length()) {
+                val subl = lines.getJSONObject(i).optJSONArray("sublines") ?: continue
+                for (k in 0 until subl.length()) {
+                    val sl = subl.getJSONObject(k)
+                    val b = ids[sl.optString("subLineId")] ?: continue
+                    val n = sl.optInt("orderNum", -1) - b.order
+                    if (n > 0) return n   // 只认往前开的那个方向
+                }
+            }
+        }
+        return null
     }
 
     /** 线路名是否对得上：「4号线」「地铁4号线」都算 */
