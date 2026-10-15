@@ -234,6 +234,14 @@ object Decision {
         return out
     }
 
+    /** 实际时间 - 最近一班推算时间，折到 ±半个间隔；首班前/末班后返回 null */
+    fun metroResidual(nowSec: Int, firstMin: Int, lastMin: Int, weekday: Boolean, peak: Int, offPeak: Int): Int? {
+        val hw = headwayAt((nowSec / 60) % 1440, weekday, peak, offPeak) * 60
+        val around = metroSchedule(nowSec - hw, firstMin, lastMin, weekday, peak, offPeak, 3).map { nowSec - hw + it }
+        val nearest = around.minByOrNull { kotlin.math.abs(it - nowSec) } ?: return null
+        return (nowSec - nearest).takeIf { kotlin.math.abs(it) <= hw / 2 }
+    }
+
     /** 列车到本站秒数：有 travelTime 用它，没有按每站约 2.5 分钟推 */
     fun metroEtaSec(a: Arrival): Int = when {
         a.etaSec >= 0 -> a.etaSec
