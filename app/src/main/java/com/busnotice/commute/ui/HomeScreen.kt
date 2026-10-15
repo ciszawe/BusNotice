@@ -272,7 +272,7 @@ private fun TripCard(
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    if (running) "运行中" else if (trip.enabled) Scheduler.nextTriggerText(trip) else "已暂停",
+                    if (running) "运行中" else if (trip.enabled) Scheduler.nextTriggerText(trip, ctx) else "已暂停",
                     style = MaterialTheme.typography.labelMedium,
                     color = if (running) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.weight(1f),
