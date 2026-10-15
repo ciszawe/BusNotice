@@ -79,7 +79,7 @@ object LiveNotifier {
             val soft = if (v.metro) GREEN_SOFT else BLUE_SOFT
             val style = NotificationCompat.ProgressStyle()
                 .setStyledByProgress(true)
-                .setProgressTrackerIcon(IconCompat.createWithResource(ctx, v.trackerRes))
+                .setProgressTrackerIcon(IconCompat.createWithResource(ctx, badge(v.trackerRes)))
                 .setProgressEndIcon(IconCompat.createWithResource(ctx, v.endRes))
                 .addProgressSegment(NotificationCompat.ProgressStyle.Segment(100).setColor(color))
                 .setProgress(p)
@@ -93,6 +93,13 @@ object LiveNotifier {
             b.setStyle(NotificationCompat.BigTextStyle().bigText(v.text))
         }
         return b.build()
+    }
+
+    /** 进度条上的移动图标换成彩色徽标（绿底地铁 / 蓝底公交） */
+    private fun badge(res: Int) = when (res) {
+        R.drawable.ic_metro -> R.drawable.ic_badge_metro
+        R.drawable.ic_bus -> R.drawable.ic_badge_bus
+        else -> res
     }
 
     fun update(ctx: Context, n: Notification) {
