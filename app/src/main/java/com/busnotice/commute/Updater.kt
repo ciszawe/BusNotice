@@ -8,14 +8,14 @@ import android.provider.Settings
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import org.json.JSONArray
+import org.json.JSONObject
 import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 
 /** 检查 GitHub Release 有没有新版本；仓库公开，无需登录。网络不通就静默跳过 */
 object Updater {
-    private const val API = "https://api.github.com/repos/ciszawe/BusNotice/releases?per_page=10"
+    private const val API = "https://api.github.com/repos/ciszawe/BusNotice/releases/latest"
     private const val CHECK_GAP = 3 * 3600_000L
 
     data class Release(val build: Int, val apkUrl: String, val notes: String)
@@ -36,20 +36,17 @@ object Updater {
             c.setRequestProperty("Accept", "application/vnd.github+json")
             val txt = c.inputStream.bufferedReader().use { it.readText() }
             sp.edit().putLong("last", now).apply()
-            val arr = JSONArray(txt)
-            var best: Release? = null
-            for (i in 0 until arr.length()) {
-                val r = arr.getJSONObject(i)
-                if (r.optBoolean("draft")) continue
-                val n = Regex("""build-(\d+)""").find(r.optString("tag_name"))?.groupValues?.get(1)?.toIntOrNull() ?: continue
-                val assets = r.optJSONArray("assets") ?: continue
-                var url: String? = null
-                for (j in 0 until assets.length()) {
-                    val a = assets.getJSONObject(j)
-                    if (a.optString("name").endsWith(".apk")) { url = a.optString("browser_download_url"); break }
-                }
-                if (url != null && n > (best?.build ?: 0)) best = Release(n, url, r.optString("body").take(300))
+            // releases 列表按标签字符串排序（build-9 排在 build-25 前），所以只看 GitHub 标记的最新版
+            val r = JSONObject(txt)
+            val n = Regex("""build-(\d+)""").find(r.optString("tag_name"))?.groupValues?.get(1)?.toIntOrNull()
+                ?: return@runCatching null
+            val assets = r.optJSONArray("assets") ?: return@runCatching null
+            var url: String? = null
+            for (j in 0 until assets.length()) {
+                val a = assets.getJSONObject(j)
+                if (a.optString("name").endsWith(".apk")) { url = a.optString("browser_download_url"); break }
             }
+            val best = url?.let { Release(n, it, r.optString("body").take(300)) }
             best?.takeIf { it.build > currentBuild(ctx) && it.build != sp.getInt("skip", 0) }
         }.getOrNull()
     }
