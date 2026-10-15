@@ -76,6 +76,7 @@ object Decision {
         val walkSec: Int,                // 走到上车点要多久（换乘时 = 剩余乘车 + 换乘步行）
         val arrivals: List<Arrival>,     // 按 eta 排序；eta<0 表示只知道站数
         val tip: String = "",
+        val located: Boolean = true,     // false = 还没拿到位置，walkSec 不可信，别说「已到」
     )
 
     data class Advice(
@@ -179,20 +180,24 @@ object Decision {
         val o = options.minBy { it.walkSec }
         val hw = o.candidate.headwayMin.takeIf { it > 0 } ?: 7
         val trains = options.flatMap { op -> op.arrivals.map { op to it } }
-            .map { (op, a) -> Triple(op, a, metroEtaSec(a)) }.filter { it.third >= 0 }
+            .map { (op, a) -> Triple(op, a, metroEtaSec(a)) }.filter { it.third >= -DWELL_SEC }
             .sortedBy { it.third }
         val catchable = trains.firstOrNull { it.third >= it.first.walkSec } ?: trains.firstOrNull()
-        val next = catchable?.let { (it.third + 59) / 60 }
+        val next = catchable?.let { (it.third.coerceAtLeast(0) + 59) / 60 }
         val est = catchable?.second?.estimated ?: true
         val tipEst = if (next == null) options.firstNotNullOfOrNull { metroNextMin(it.tip, hw) } else null
         // 不知道方向时两个方向都列出来
         val dirs = trains.filter { it.second.busId.isNotEmpty() }.distinctBy { it.second.busId }
         val nextText = when {
             dirs.size > 1 -> " · " + dirs.joinToString(" · ") { "${it.second.busId} ${eta(it.third, it.second.estimated)}" }
-            next != null -> {
-                val after = trains.firstOrNull { it.third > catchable!!.third }
-                " · 本趟" + eta(catchable!!.third, est).let { if (it.endsWith("进站")) it else "${it}进站" } +
-                    (after?.let { " · 下趟" + eta(it.third, it.second.estimated) } ?: "")
+            trains.isNotEmpty() -> {
+                // 本趟 = 还没开走的第一班（含正在站内停靠的），下趟 = 它后面一班；和高德一样
+                val cur = trains[0]
+                val after = trains.getOrNull(1)
+                val miss = catchable != null && catchable !== cur && catchable.first.located
+                " · 本趟" + eta(cur.third, cur.second.estimated).let { if (it.endsWith("进站") || it.endsWith("站内")) it else "${it}进站" } +
+                    (after?.let { " · 下趟" + eta(it.third, it.second.estimated) } ?: "") +
+                    (if (miss) " · 走过去赶下趟" else "")
             }
             tipEst != null -> " · 下一班约 $tipEst 分钟（估算）"
             options.any { it.tip == END_OF_SERVICE } -> " · 今天末班已过"
@@ -201,10 +206,14 @@ object Decision {
         val mins = next ?: tipEst
         val oo = catchable?.first ?: o
         val head = mins?.let { if (it <= 1) "进站" else if (est || next == null) "约${it}分" else "${it}分" }
-        return if (oo.walkSec == 0) Advice(Mode.METRO, oo, catchable?.second, 0, 0, head ?: "进站",
-            "已到 ${oo.candidate.stopName}$nextText")
-        else Advice(Mode.METRO, oo, catchable?.second, oo.walkSec, 0, head ?: "去地铁",
-            "步行约 ${mins(oo.walkSec)} 分钟到 ${oo.candidate.stopName}$nextText")
+        return when {
+            !oo.located -> Advice(Mode.METRO, oo, catchable?.second, 0, 0, head ?: "定位中",
+                "${oo.candidate.stopName}（定位中）$nextText")
+            oo.walkSec == 0 -> Advice(Mode.METRO, oo, catchable?.second, 0, 0, head ?: "进站",
+                "已到 ${oo.candidate.stopName}$nextText")
+            else -> Advice(Mode.METRO, oo, catchable?.second, oo.walkSec, 0, head ?: "去地铁",
+                "步行约 ${mins(oo.walkSec)} 分钟到 ${oo.candidate.stopName}$nextText")
+        }
     }
 
     const val END_OF_SERVICE = "末班已过"
@@ -258,6 +267,7 @@ object Decision {
     private fun eta(sec: Int, estimated: Boolean): String {
         val m = (sec + 59) / 60
         return when {
+            sec < 0 -> "正在站内"
             m <= 1 -> "即将进站"
             estimated -> "约 $m 分钟"
             else -> "$m 分钟后"
@@ -272,13 +282,16 @@ object Decision {
      * 从首班开始按间隔往后排，算出接下来几班离现在多少秒。
      * 首班前 → 首班；末班后 → 空。时间都是「一天中的秒」。
      */
-    fun metroSchedule(nowSec: Int, firstMin: Int, lastMin: Int, weekday: Boolean, peak: Int, offPeak: Int, n: Int = 2): List<Int> {
+    /** 地铁停站时间：进站后这么多秒内仍算「本趟」 */
+    const val DWELL_SEC = 40
+
+    fun metroSchedule(nowSec: Int, firstMin: Int, lastMin: Int, weekday: Boolean, peak: Int, offPeak: Int, n: Int = 2, graceSec: Int = 0): List<Int> {
         if (firstMin < 0 || peak <= 0 || offPeak <= 0) return emptyList()
         val last = if (lastMin in 0 until firstMin) lastMin + 1440 else lastMin.takeIf { it >= 0 } ?: 1439
         var t = firstMin * 60
         val out = ArrayList<Int>()
         while (t <= last * 60 && out.size < n) {
-            if (t >= nowSec) out += t - nowSec
+            if (t >= nowSec - graceSec) out += t - nowSec
             t += headwayAt((t / 60) % 1440, weekday, peak, offPeak) * 60
         }
         return out
@@ -294,6 +307,7 @@ object Decision {
 
     /** 列车到本站秒数：有 travelTime 用它，没有按每站约 2.5 分钟推 */
     fun metroEtaSec(a: Arrival): Int = when {
+        a.estimated -> a.etaSec            // 推算班次：负数 = 正在站内停靠
         a.etaSec >= 0 -> a.etaSec
         a.stopsAway >= 0 -> a.stopsAway * 150
         else -> -1
