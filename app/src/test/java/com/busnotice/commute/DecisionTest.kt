@@ -143,4 +143,10 @@ class DecisionTest {
         assertEquals(listOf(300, 1200, 2100, 3000), l.map { it.second })
         assertEquals(listOf(false, false, true, true), l.map { it.third })
     }
+
+    @Test fun metroScheduleKeepsDwellingTrain() {
+        // 首班 6:00，平峰 10 分钟；现在 6:10:20 → 6:10 那班还在站内（-20 秒）
+        val l = Decision.metroSchedule(6 * 3600 + 620, 360, 1380, false, 10, 10, 3, Decision.DWELL_SEC)
+        assertEquals(listOf(-20, 580, 1180), l)
+    }
 }
