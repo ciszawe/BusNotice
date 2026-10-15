@@ -75,7 +75,7 @@ class CommuteService : Service() {
         }
     }
 
-    private enum class Power { LOW, HIGH }
+    private enum class Power { OFF, LOW, HIGH }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var loop: Job? = null
@@ -126,13 +126,14 @@ class CommuteService : Service() {
         instance = this
         if (!manual) Diag.mark(this, "已自动启动")
         trip = t
+        stationAt = 0L; metroRideSec.clear()
         legIdx = 0; boardedAt = 0L; nearSince = 0L; fastFixes = 0; alertedKey = null; planDone = false; planAlerted = ""
         maxStops.clear(); maxEta.clear()
         manualRun = manual; riding = false; transferAlerted = false; arriveAlertedAt = 0L
         speeds.clear(); routeHits.clear(); lastGpsFix = null
         power = null; highSince = 0L; coolUntil = 0L
         setPower(Power.HIGH) // 预热：先拿到一个准的位置
-        scope.launch(Dispatchers.IO) { prefetch(t) }
+        scope.launch(Dispatchers.IO) { prefetchMetroStops(t); prefetch(t) }
         loop?.cancel()
         loop = scope.launch { runLoop(deadline(t, manual)) }
         return START_NOT_STICKY
@@ -151,8 +152,49 @@ class CommuteService : Service() {
     }
 
     /** 这段大概坐多久：实测攒够 3 次用实测中位数，否则用手填的 */
-    private fun rideMs(i: Int): Long =
-        (Learn.rideMin(this, trip.id, i) ?: trip.legs[i].rideMin) * 60_000L
+    private fun rideMs(i: Int): Long {
+        Learn.rideMin(this, trip.id, i)?.let { return it * 60_000L }
+        metroRideSec[i]?.let { return it * 1000L }
+        return trip.legs[i].rideMin * 60_000L
+    }
+
+    /** 地铁段按站数估的乘车秒数（每站约 2 分 20 秒，含停站） */
+    private val metroRideSec = java.util.concurrent.ConcurrentHashMap<Int, Int>()
+    private val SEC_PER_STOP = 140
+
+    private fun prefetchMetroStops(t: Trip) {
+        t.legs.forEachIndexed { i, leg ->
+            if (!leg.isMetroOnly() || i >= t.legs.size - 1) return@forEachIndexed
+            val c = leg.candidates.firstOrNull { it.isMetro() } ?: return@forEachIndexed
+            val to = t.legs[i + 1].candidates.firstOrNull() ?: return@forEachIndexed
+            runCatching {
+                val dirs = ChelaileApi.subwayDirs(c.lat, c.lng, c.stopName, c.cityId).filter { ChelaileApi.sameLine(c.name, it) }
+                metroDirs.putIfAbsent("${c.stopName}|${c.name}", dirs)
+                val use = dirs.filter { c.metroDir.isEmpty() || it.dest == c.metroDir }
+                ChelaileApi.metroStops(use, to.lat, to.lng, c.cityId)
+            }.getOrNull()?.let { n ->
+                metroRideSec[i] = n * SEC_PER_STOP + 60
+                Log.i(TAG, "第 ${i + 1} 段地铁约 $n 站")
+            }
+        }
+    }
+
+    /** 进站时刻之后（留 1 分钟走到站台），第一班车几点到；拿不到班次返回 null */
+    private fun nextTrainAfter(leg: Leg, atMillis: Long): Long? {
+        val c = leg.candidates.firstOrNull { it.isMetro() } ?: return null
+        val dirs = metroDirs["${c.stopName}|${c.name}"]?.filter { c.metroDir.isEmpty() || it.dest == c.metroDir } ?: return null
+        val at = java.time.Instant.ofEpochMilli(atMillis + 60_000).atZone(ZoneId.systemDefault())
+        val sec = at.toLocalTime().toSecondOfDay()
+        val weekday = at.dayOfWeek.value <= 5
+        val peak = Decision.headwayAt(sec / 60, weekday, 1, 2) == 1
+        val off = if (c.metroDir.isNotEmpty()) Learn.metroOffsetSec(this, Learn.metroKey(c, peak)) else 0
+        val eta = dirs.mapNotNull { d ->
+            Decision.metroSchedule(sec - off, d.firstMin, d.lastMin, weekday, c.peakHw(), c.offPeakHw(), 1).firstOrNull()
+        }.minOrNull() ?: return null
+        return atMillis + 60_000 + eta * 1000L
+    }
+
+    private var stationAt = 0L     // 推断进站的时刻
 
     /** 地铁段手动点「已上车」= 真实列车时刻，拿来修正推算 */
     private fun learnMetro(leg: Leg) {
@@ -166,9 +208,10 @@ class CommuteService : Service() {
     }
 
     /** 「已上车」按钮或速度判断：进入下一段；最后一段则进入「去下车站」，再按一次结束 */
-    fun onBoarded(manual: Boolean = true) {
+    fun onBoarded(manual: Boolean = true, at: Long = System.currentTimeMillis()) {
         if (!::trip.isInitialized) { finish(); return }
-        val now = System.currentTimeMillis()
+        val now = at
+        stationAt = 0L
         if (manual && !riding && trip.legs[legIdx].isMetroOnly()) runCatching { learnMetro(trip.legs[legIdx]) }
         if (legIdx == 0 && boardedAt == 0L) Learn.record(this, trip.id, now)
         if (legIdx >= trip.legs.size - 1) {
@@ -252,15 +295,20 @@ class CommuteService : Service() {
             now < expectArrive + 5 * 60_000L
         val connectSec = if (connecting) (((expectArrive - now) / 1000).toInt().coerceAtLeast(0) + leg.transferWalkMin * 60) else 0
 
-        // 地铁没有 GPS：到过站附近两分钟后，视为已上车
-        if (leg.isMetroOnly() && nearSince > 0 && now - nearSince > 120_000) {
-            onBoarded(manual = false); return 1_000L
+        // 推断进站：在站口附近待了两分钟，或最后一次卫星定位在站口 500 米内、之后 90 秒没信号。
+        // 进站 ≠ 上车：按进站后第一班赶得上的车算上车时刻，那班车开走了才切到下一段。
+        if (leg.isMetroOnly() && stationAt == 0L) {
+            val g = lastGpsFix
+            stationAt = when {
+                nearSince > 0 && now - nearSince > 120_000 -> nearSince
+                g != null && now - g.time > 90_000 &&
+                    leg.candidates.any { Geo.distanceM(g.latitude, g.longitude, it.lat, it.lng) <= 500 } -> g.time
+                else -> 0L
+            }
         }
-        // 进了地铁站 GPS 就没了：最后一次卫星定位在站口 500 米内、之后 90 秒没信号 → 已进站
-        val g = lastGpsFix
-        if (leg.isMetroOnly() && g != null && now - g.time > 90_000 &&
-            leg.candidates.any { Geo.distanceM(g.latitude, g.longitude, it.lat, it.lng) <= 500 }) {
-            onBoarded(manual = false); return 1_000L
+        if (leg.isMetroOnly() && stationAt > 0) {
+            val train = nextTrainAfter(leg, stationAt) ?: (stationAt + 4 * 60_000L)
+            if (now >= train + Decision.DWELL_SEC * 1000L) { onBoarded(manual = false, at = train); return 1_000L }
         }
 
         val secOfDay = LocalTime.now().toSecondOfDay()
@@ -312,7 +360,9 @@ class CommuteService : Service() {
 
         // 该走了 / 换乘紧张：横幅 + 震动，每班车只提醒一次
         val key = "${a.mode}|${a.option?.candidate?.label()}|${a.arrival?.busId}"
-        if ((a.mode == Decision.Mode.LEAVE_NOW || a.mode == Decision.Mode.HURRY || a.mode == Decision.Mode.CONNECT_MISS) &&
+        // 还在地铁上（离到换乘站超过 5 分钟）：不弹公交的提醒
+        val onMetro = connecting && prev?.isMetroOnly() == true && now < expectArrive - 5 * 60_000L
+        if (!onMetro && (a.mode == Decision.Mode.LEAVE_NOW || a.mode == Decision.Mode.HURRY || a.mode == Decision.Mode.CONNECT_MISS) &&
             alertedKey != key) {
             alertedKey = key
             LiveNotifier.alert(this, "${a.headline} · ${a.option?.candidate?.label() ?: trip.name}", a.detail,
@@ -335,7 +385,13 @@ class CommuteService : Service() {
             Decision.Mode.METRO -> nearest != null && nearest < 200
             else -> nearest != null && nearest < 300
         } || loc == null
-        setPower(if (hot) Power.HIGH else Power.LOW)
+        when {
+            // 坐地铁时地下搜不到卫星：关掉定位只按时间倒计时，快到换乘站前 5 分钟再开
+            onMetro -> setPower(Power.OFF)
+            connecting && prev?.isMetroOnly() == true -> setPower(Power.HIGH)
+            else -> setPower(if (hot) Power.HIGH else Power.LOW)
+        }
+        if (onMetro) return 60_000L
 
         val soonest = a.arrival?.etaSec ?: Int.MAX_VALUE
         return when {
@@ -446,6 +502,7 @@ class CommuteService : Service() {
             progress = p, metro = metro, trackerRes = if (metro) R.drawable.ic_metro else R.drawable.ic_bus)
         LiveNotifier.update(this, LiveNotifier.build(this, v))
         LiveState.snapshot.value = LiveSnapshot(trip.id, trip.name, legIdx, trip.legs.size, leg.title(), short, text, null, p, null)
+        if (metro && boardedAt + total - now > 5 * 60_000L) { setPower(Power.OFF); return 60_000L }
         setPower(if (d != null && d < 1_500) Power.HIGH else Power.LOW)
         return 20_000L
     }
@@ -539,11 +596,13 @@ class CommuteService : Service() {
         power = p
         val m = lm ?: getSystemService(LocationManager::class.java).also { lm = it }
         try { m.removeUpdates(listener) } catch (_: Exception) { }
+        if (p == Power.OFF) { Log.i(TAG, "定位已暂停"); return }
         val providers = m.allProviders.filter {
             when (p) {
                 // GPS + 网络两路就够，不再叠加 fused（它内部也会开 GPS，等于重复）
                 Power.HIGH -> it == LocationManager.GPS_PROVIDER || it == LocationManager.NETWORK_PROVIDER
                 Power.LOW -> it == LocationManager.NETWORK_PROVIDER || it == LocationManager.FUSED_PROVIDER
+                Power.OFF -> false
             }
         }.ifEmpty { listOf(LocationManager.GPS_PROVIDER) }
         val interval = if (p == Power.HIGH) 5_000L else 30_000L
