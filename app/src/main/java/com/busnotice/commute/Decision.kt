@@ -100,18 +100,28 @@ object Decision {
     fun decide(options: List<Option>, connecting: Boolean = false): Advice {
         if (options.isEmpty()) return Advice(Mode.NO_BUS, null, null, 0, 0, "未设置", "这段行程还没有添加线路")
 
-        // 全是地铁：没有实时车辆，用「上一班 X 分钟前过站」+ 发车间隔估下一班
+        // 全是地铁：优先用列车实时位置（和地图 App 一样的「X 分钟后进站」），
+        // 没有实时再用「上一班 X 分钟前过站」+ 发车间隔估；上一班太久以前的数据不可信，不拿来估
         if (options.all { it.candidate.type == Candidate.Type.METRO }) {
             val o = options.minBy { it.walkSec }
             val hw = o.candidate.headwayMin.takeIf { it > 0 } ?: 7
-            val next = options.firstNotNullOfOrNull { metroNextMin(it.tip, hw) }
-            val hwText = " · 约 $hw 分钟一班"
-            val nextText = next?.let { " · 下一班约 $it 分钟" } ?: ""
-            return if (o.walkSec == 0) Advice(Mode.METRO, o, null, 0, 0,
-                next?.let { if (it <= 1) "进站" else "约${it}分" } ?: "进站",
-                "已到 ${o.candidate.stopName}$nextText$hwText")
-            else Advice(Mode.METRO, o, null, o.walkSec, 0, "去地铁",
-                "步行约 ${mins(o.walkSec)} 分钟到 ${o.candidate.stopName}$nextText$hwText")
+            val trains = options.flatMap { op -> op.arrivals.map { op to it } }
+                .map { (op, a) -> Triple(op, a, metroEtaSec(a)) }.filter { it.third >= 0 }
+                .sortedBy { it.third }
+            val catchable = trains.firstOrNull { it.third >= it.first.walkSec } ?: trains.firstOrNull()
+            val live = catchable?.let { (it.third + 59) / 60 }
+            val est = if (live == null) options.firstNotNullOfOrNull { metroNextMin(it.tip, hw) } else null
+            val nextText = when {
+                live != null -> " · 下一班 ${if (live <= 1) "即将" else "$live 分钟后"}进站"
+                est != null -> " · 下一班约 $est 分钟（估算）"
+                else -> " · 约 $hw 分钟一班"
+            }
+            val oo = catchable?.first ?: o
+            return if (oo.walkSec == 0) Advice(Mode.METRO, oo, catchable?.second, 0, 0,
+                (live ?: est)?.let { if (it <= 1) "进站" else if (live != null) "${it}分" else "约${it}分" } ?: "进站",
+                "已到 ${oo.candidate.stopName}$nextText")
+            else Advice(Mode.METRO, oo, catchable?.second, oo.walkSec, 0, live?.let { "${it}分" } ?: "去地铁",
+                "步行约 ${mins(oo.walkSec)} 分钟到 ${oo.candidate.stopName}$nextText")
         }
 
         val all = options.flatMap { o -> o.arrivals.map { o to it } }
@@ -177,12 +187,20 @@ object Decision {
 
     fun mins(sec: Int) = ((sec + 30) / 60).coerceAtLeast(0)
 
+    /** 列车到本站秒数：有 travelTime 用它，没有按每站约 2.5 分钟推 */
+    fun metroEtaSec(a: Arrival): Int = when {
+        a.etaSec >= 0 -> a.etaSec
+        a.stopsAway >= 0 -> a.stopsAway * 150
+        else -> -1
+    }
+
     private val PASSED_RE = Regex("(\\d+)\\s*分钟前")
 
     /** 「上一班10分钟前过站」+ 间隔 7 分钟 → 下一班大约还有几分钟（粗估） */
     fun metroNextMin(tip: String, headwayMin: Int): Int? {
         if (headwayMin <= 0) return null
         val ago = PASSED_RE.find(tip)?.groupValues?.get(1)?.toIntOrNull() ?: return null
+        if (ago > headwayMin * 2) return null // 上一班 20 分钟前才过站 = 数据停了或方向不对，别瞎估
         val r = headwayMin - (ago % headwayMin)
         return if (r == headwayMin && ago > 0) 0 else r
     }
