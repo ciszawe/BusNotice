@@ -119,4 +119,10 @@ class DecisionTest {
         assertEquals(Decision.Mode.METRO, a.mode)
         assertEquals("约3分", a.headline)
     }
+
+    @Test fun metroResidualWrapsToNearestTrain() {
+        // 平峰 10 分钟，首班 06:00：10:02 上车 → 比 10:00 那班晚 120 秒；10:08 → 比 10:10 早 120 秒
+        assertEquals(120, Decision.metroResidual(10 * 3600 + 2 * 60, 360, 1410, false, 5, 10))
+        assertEquals(-120, Decision.metroResidual(10 * 3600 + 8 * 60, 360, 1410, false, 5, 10))
+    }
 }
