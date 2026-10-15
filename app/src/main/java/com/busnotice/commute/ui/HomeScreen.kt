@@ -70,6 +70,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.busnotice.commute.CommuteService
+import com.busnotice.commute.Learn
 import com.busnotice.commute.LiveSnapshot
 import com.busnotice.commute.LiveState
 import com.busnotice.commute.Reverse
@@ -154,6 +155,11 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
                         }
                     },
                     onDelete = { confirmDelete = t },
+                    onApplyLearned = { sg ->
+                        val nt = t.copy(startMinute = sg.start, endMinute = sg.end)
+                        TripStore.upsert(ctx, nt); Scheduler.schedule(ctx, nt); version++
+                        scope.launch { snack.showSnackbar("时间窗改为 ${hhmm(sg.start)}–${hhmm(sg.end)}") }
+                    },
                 )
             }
         }
@@ -233,7 +239,10 @@ private fun PermCard(perms: List<Perm>) {
 private fun TripCard(
     trip: Trip, running: Boolean,
     onToggle: (Boolean) -> Unit, onTest: () -> Unit, onEdit: () -> Unit, onReverse: () -> Unit, onDelete: () -> Unit,
+    onApplyLearned: (Learn.Suggestion) -> Unit,
 ) {
+    val ctx = LocalContext.current
+    val learned = remember(trip) { Learn.suggest(ctx, trip) }
     Card(shape = RoundedCornerShape(24.dp), onClick = onEdit) {
         Column(Modifier.padding(start = 20.dp, end = 12.dp, top = 16.dp, bottom = 8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -253,6 +262,14 @@ private fun TripCard(
                 trip.legs.firstOrNull()?.stopName()?.let { "从 $it 上车" } ?: "",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            learned?.let { sg ->
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("最近 ${sg.n} 次通常 ${hhmm(sg.typical)} 前后上车，建议 ${hhmm(sg.start)}–${hhmm(sg.end)}",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.weight(1f))
+                    TextButton(onClick = { onApplyLearned(sg) }) { Text("应用") }
+                }
+            }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     if (running) "运行中" else if (trip.enabled) Scheduler.nextTriggerText(trip) else "已暂停",
