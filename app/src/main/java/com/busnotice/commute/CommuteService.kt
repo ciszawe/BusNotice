@@ -253,11 +253,13 @@ class CommuteService : Service() {
                         }
                         Candidate.Type.SHUTTLE -> Decision.Option(c, walk, Decision.shuttleArrivals(c, secOfDay))
                         Candidate.Type.METRO -> {
-                            // 车来了里能搜到的地铁线也有「上一班 X 分钟前过站」，拿来估下一班
-                            val tip = if (c.lineId.isEmpty()) "" else runCatching {
-                                ChelaileApi.lineRealtime(c, loc?.latitude ?: c.lat, loc?.longitude ?: c.lng).tip
-                            }.getOrDefault("")
-                            Decision.Option(c, walk, emptyList(), tip)
+                            // 车来了里查得到的地铁线：有列车实时位置就用实时，没有再用「上一班过站」+ 间隔估
+                            val rt = if (c.lineId.isEmpty()) null else runCatching {
+                                ChelaileApi.lineRealtime(c, loc?.latitude ?: c.lat, loc?.longitude ?: c.lng)
+                            }.getOrNull()
+                            Decision.Option(c, walk,
+                                rt?.buses?.map { Decision.Arrival(it.travelSec, it.stopsAway, it.busId) } ?: emptyList(),
+                                rt?.tip ?: "")
                         }
                     }
                 }
