@@ -487,7 +487,7 @@ class CommuteService : Service() {
         val d = loc?.let { Geo.distanceM(it.latitude, it.longitude, dest.first, dest.second) }
         val eta = boardedAt + rideMs(legIdx)
         val near = d != null && d <= 700
-        val timeUp = now >= eta - 90_000 && (d == null || d < 2_500)
+        val timeUp = now >= eta - 90_000 && (d == null || d < 1_500)
         if (arriveAlertedAt == 0L && (near || timeUp)) {
             arriveAlertedAt = now
             LiveNotifier.alert(this, "快到 $name 了", "准备下车", metro = metro, id = 1005)
@@ -496,8 +496,12 @@ class CommuteService : Service() {
             finish(); return 60_000L
         }
         val total = rideMs(legIdx).coerceAtLeast(60_000L)
-        val p = ((now - boardedAt) * 100 / total).toInt().coerceIn(0, 100)
-        val left = ((eta - now) / 60_000L).toInt()
+        // 有定位时以距离为准（时间估短了也不会提前显示「快到了」），没定位才按时间
+        val span = rc?.let { Geo.distanceM(it.lat, it.lng, dest.first, dest.second) }?.takeIf { it > 300 }
+        val p = if (d != null && span != null) ((1 - d / span) * 100).toInt().coerceIn(0, 97)
+            else ((now - boardedAt) * 100 / total).toInt().coerceIn(0, 100)
+        val left = if (d != null && d > 1_500) (d / (if (metro) 550.0 else 350.0)).toInt().coerceAtLeast(1)
+            else ((eta - now) / 60_000L).toInt()
         val short = when {
             arriveAlertedAt > 0 -> "下车"
             d != null && d < 1_500 -> "${d.toInt()}米"
