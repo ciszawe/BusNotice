@@ -20,7 +20,7 @@ object Scheduler {
     private const val TAG = "Scheduler"
     const val EXTRA_PLAN_ID = "tripId"
     const val EXTRA_WATCH = "watch"
-    const val WATCH_EVERY_MS = 4 * 60_000L
+    const val WATCH_EVERY_MS = 2 * 60_000L
 
     fun rescheduleAll(ctx: Context) {
         TripStore.all(ctx).forEach { schedule(ctx, it) }
@@ -134,9 +134,11 @@ class AlarmReceiver : BroadcastReceiver() {
         if (!Scheduler.inWindow(plan, now)) {
             Diag.mark(ctx, "${plan.name}：窗口内一直没离开出发地"); return
         }
-        val loc = withTimeoutOrNull(6_000) { Loc.current(ctx) }
+        // 外层超时要比 Loc.current 里的 8 秒长，否则现取的位置永远拿不到；超过 2 分钟的旧位置不算数
+        val loc = withTimeoutOrNull(12_000) { Loc.current(ctx) }
+            ?.takeIf { System.currentTimeMillis() - it.time < 120_000 }
         val d = loc?.let { Geo.distanceM(it.latitude, it.longitude, plan.leaveLat, plan.leaveLng) }
-        val slack = (loc?.accuracy ?: 0f).coerceAtMost(150f)
+        val slack = (loc?.accuracy ?: 0f).coerceAtMost(50f)
         if (d != null && d > plan.leaveRadiusM + slack) {
             Diag.mark(ctx, "已离开出发地，自动启动")
             withContext(Dispatchers.Main) { start(ctx, plan) }
