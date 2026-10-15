@@ -125,4 +125,22 @@ class DecisionTest {
         assertEquals(120, Decision.metroResidual(10 * 3600 + 2 * 60, 360, 1410, false, 5, 10))
         assertEquals(-120, Decision.metroResidual(10 * 3600 + 8 * 60, 360, 1410, false, 5, 10))
     }
+
+    @Test fun planPicksLatestTrainForEarliestBus() {
+        // 地铁每 5 分钟（0,300,600,...），坐 20 分钟，换乘走 3 分钟；走到地铁站 5 分钟
+        val trains = (0..20).map { it * 300 }
+        val buses = listOf(Triple("32路", 1800, false), Triple("32路", 2700, false))
+        val p = Decision.planDeparture(300, trains, 1200, 180, buses)
+        // 公交 1800 秒：最晚地铁 t+1200+180+60<=1800 → t=300；出发 300-300-60 <0 → 赶不上；下一班 2700 → t=1200，出发 840
+        assertEquals(1, p.size)
+        assertEquals(840, p[0].leaveSec)
+        assertEquals(1200, p[0].trainSec)
+        assertEquals(2700 - (1200 + 1200 + 180), p[0].waitSec)
+    }
+
+    @Test fun extendBusesByObservedGap() {
+        val l = Decision.extendBuses("32路", listOf(300, 1200), 0, horizonSec = 3000)
+        assertEquals(listOf(300, 1200, 2100, 3000), l.map { it.second })
+        assertEquals(listOf(false, false, true, true), l.map { it.third })
+    }
 }
