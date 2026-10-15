@@ -51,6 +51,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.foundation.clickable
 import com.busnotice.commute.ChelaileApi
 import com.busnotice.commute.Learn
+import com.busnotice.commute.MetroRoutes
 import com.busnotice.commute.Loc
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -326,14 +327,15 @@ private fun LegCard(
             }
             // 地铁段：按站数自动估，手填的只在拿不到数据时兜底
             val metro = leg.candidates.firstOrNull { it.isMetro() }.takeIf { leg.isMetroOnly() }
-            var autoStops by remember(metro, nextStop) { mutableStateOf<Int?>(null) }
-            LaunchedEffect(metro, nextStop) {
-                if (metro != null && nextStop != null) autoStops = withContext(Dispatchers.IO) {
-                    runCatching {
-                        val dirs = ChelaileApi.subwayDirs(metro.lat, metro.lng, metro.stopName, metro.cityId)
-                            .filter { ChelaileApi.sameLine(metro.name, it) && (metro.metroDir.isEmpty() || it.dest == metro.metroDir) }
-                        ChelaileApi.metroStops(dirs, nextStop.lat, nextStop.lng, metro.cityId)
-                    }.getOrNull()
+            val ctx = LocalContext.current
+            val target = metro?.let {
+                if (!it.alightLat.isNaN()) Triple(it.alightName.ifEmpty { "下车站" }, it.alightLat, it.alightLng)
+                else nextStop?.let { n -> Triple(it.alightName.ifEmpty { n.stopName }, n.lat, n.lng) }
+            }
+            var route by remember(metro, target) { mutableStateOf<ChelaileApi.MetroRoute?>(null) }
+            LaunchedEffect(metro, target) {
+                if (metro != null && target != null) route = withContext(Dispatchers.IO) {
+                    MetroRoutes.get(ctx, metro, target.first, target.second, target.third)
                 }
             }
             Stepper(if (isLast) "大约坐多久（快到下车站时提醒）" else if (metro != null) "拿不到站数时按这个算" else "这段大约坐多久",
@@ -343,8 +345,9 @@ private fun LegCard(
             when {
                 learnedRide != null -> Text("实测通常坐 $learnedRide 分钟，推算时按实测来", style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.primary)
-                autoStops != null -> Text("自动：共 $autoStops 站，约 ${(autoStops!! * 140 + 60 + 59) / 60} 分钟；坐满 3 次后改用你的实测用时",
-                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                route != null -> Text(route!!.let { r ->
+                    "自动：${r.stations.first().name} → ${r.stations.last().name}，共 ${r.hops} 站，约 ${(r.durSec + 59) / 60} 分钟；坐满 3 次后改用你的实测用时"
+                }, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
             }
         }
     }
