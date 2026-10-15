@@ -52,7 +52,10 @@ object Learn {
     /** 取 10%–90% 分位，前后各放 10 分钟，取整到 5 分钟；样本太少返回 null */
     fun suggest(minutes: List<Int>): Suggestion? {
         if (minutes.size < MIN_SAMPLES) return null
-        val s = minutes.sorted()
+        // 去掉离中位数 90 分钟以外的（手动测试、加班等偶发样本），不让它们把时间窗撑大
+        val med = minutes.sorted()[minutes.size / 2]
+        val s = minutes.filter { kotlin.math.abs(it - med) <= 90 }.sorted()
+        if (s.size < MIN_SAMPLES) return null
         fun q(f: Double) = s[((s.size - 1) * f).toInt()]
         val start = ((q(0.1) - 10) / 5 * 5).coerceAtLeast(0)
         val end = (((q(0.9) + 10) + 4) / 5 * 5).coerceAtMost(23 * 60 + 55)
