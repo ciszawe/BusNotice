@@ -265,7 +265,8 @@ private fun LegCard(
                             "${c.stopName} 上车" + (if (c.alightName.isNotEmpty()) " · ${c.alightName} 下车" else "") +
                                 when (c.type) {
                                     Candidate.Type.SHUTTLE -> " · " + c.departures.sorted().joinToString(" ") { hhmm(it) }
-                                    Candidate.Type.METRO -> if (c.headwayMin > 0) " · 约 ${c.headwayMin} 分钟一班" else ""
+                                    Candidate.Type.METRO -> (if (c.metroDir.isNotEmpty()) " · 往${c.metroDir}" else "") +
+                                        " · 高峰 ${c.peakHw()} / 平峰 ${c.offPeakHw()} 分钟一班"
                                     else -> ""
                                 },
                             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
