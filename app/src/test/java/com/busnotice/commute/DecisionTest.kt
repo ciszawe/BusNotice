@@ -65,4 +65,32 @@ class DecisionTest {
         assertEquals(1, ChelaileApi.parseEnvelope(raw).getInt("x"))
         assertEquals(32, ChelaileApi.sign(linkedMapOf("a" to "1")).length)
     }
+
+    @Test fun metroNextFromTip() {
+        assertEquals(4, Decision.metroNextMin("上一班10分钟前过站", 7))
+        assertEquals(null, Decision.metroNextMin("暂无数据", 7))
+        val m = Candidate(Candidate.Type.METRO, "4号线", "D站", 0.0, 0.0, headwayMin = 7)
+        val a = Decision.decide(listOf(Decision.Option(m, 0, emptyList(), "上一班10分钟前过站")))
+        assertEquals("约4分", a.headline)
+    }
+
+    @Test fun metroNameDetected() {
+        assertTrue(Candidate.looksLikeMetro("4号线"))
+        assertTrue(!Candidate.looksLikeMetro("604"))
+        assertEquals("4号线", Candidate(Candidate.Type.BUS, "4号线", "D站", 0.0, 0.0).label())
+        assertEquals("15路", bus().label())
+    }
+
+    @Test fun motion() {
+        assertEquals(Motion.State.RIDE, Motion.classify(listOf(8f, 9f, 10f), onRoute = true))
+        assertEquals(Motion.State.UNKNOWN, Motion.classify(listOf(8f, 9f, 10f), onRoute = false))
+        assertEquals(Motion.State.WALK, Motion.classify(listOf(1.2f, 1.4f, 1.3f), onRoute = true))
+        assertEquals(Motion.State.STILL, Motion.classify(listOf(0f, 0.1f, 0.2f), onRoute = false))
+    }
+
+    @Test fun learnWindow() {
+        assertEquals(null, Learn.suggest(listOf(1100, 1110)))
+        val s = Learn.suggest(listOf(1080, 1095, 1110, 1140, 1170, 1200, 1230))!!
+        assertTrue(s.start <= 1080 - 5 && s.end >= 1200 && s.start % 5 == 0 && s.end % 5 == 0)
+    }
 }
