@@ -47,7 +47,13 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.res.painterResource
+import androidx.compose.foundation.clickable
+import com.busnotice.commute.ChelaileApi
+import com.busnotice.commute.Learn
 import com.busnotice.commute.Loc
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import androidx.compose.runtime.LaunchedEffect
 import com.busnotice.commute.R
 import kotlinx.coroutines.launch
 import androidx.compose.runtime.setValue
@@ -193,6 +199,7 @@ fun TripEditor(
                     onAddBus = { onAddBus(i) }, onAddMetro = { onAddMetro(i) },
                     onAddShuttle = { onEditShuttle(i, -1) },
                     onEditShuttle = { ci -> onEditShuttle(i, ci) },
+                    learnedRide = remember(trip.id, i) { Learn.rideMin(ctx, trip.id, i) },
                 )
             }
             item {
@@ -236,7 +243,16 @@ private fun LegCard(
     index: Int, leg: Leg, isLast: Boolean,
     onChange: (Leg) -> Unit, onRemove: () -> Unit,
     onAddBus: () -> Unit, onAddMetro: () -> Unit, onAddShuttle: () -> Unit, onEditShuttle: (Int) -> Unit,
+    learnedRide: Int? = null,
 ) {
+    var editing by remember { mutableStateOf<Int?>(null) }
+    editing?.let { ci ->
+        leg.candidates.getOrNull(ci)?.let { c ->
+            CandidateDialog(c, onDismiss = { editing = null }) { nc ->
+                onChange(leg.copy(candidates = leg.candidates.toMutableList().also { it[ci] = nc })); editing = null
+            }
+        }
+    }
     Card(shape = RoundedCornerShape(24.dp)) {
         Column(Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -252,7 +268,11 @@ private fun LegCard(
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             leg.candidates.forEachIndexed { ci, c ->
-                Row(Modifier.padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    Modifier.clickable { if (c.type == Candidate.Type.SHUTTLE) onEditShuttle(ci) else editing = ci }
+                        .padding(vertical = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
                     TransitIcon(c)
                     Spacer(Modifier.width(10.dp))
                     Column(Modifier.weight(1f)) {
@@ -272,7 +292,7 @@ private fun LegCard(
                             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
-                    if (c.type == Candidate.Type.SHUTTLE) TextButton(onClick = { onEditShuttle(ci) }) { Text("编辑") }
+                    TextButton(onClick = { if (c.type == Candidate.Type.SHUTTLE) onEditShuttle(ci) else editing = ci }) { Text("编辑") }
                     IconButton(onClick = {
                         onChange(leg.copy(candidates = leg.candidates.toMutableList().also { it.removeAt(ci) }))
                     }) { Icon(Icons.Default.Close, "移除", Modifier.size(20.dp)) }
@@ -286,8 +306,67 @@ private fun LegCard(
             Stepper(if (isLast) "大约坐多久（快到下车站时提醒）" else "这段大约坐多久", leg.rideMin, 1, 120) {
                 onChange(leg.copy(rideMin = it))
             }
+            learnedRide?.let {
+                Text("实测通常坐 $it 分钟，推算时按实测来", style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary)
+            }
         }
     }
+}
+
+/** 点已添加的公交/地铁弹出来改：地铁改方向和高峰/平峰间隔，两者都能改下车站 */
+@Composable
+fun CandidateDialog(c: Candidate, onDismiss: () -> Unit, onSave: (Candidate) -> Unit) {
+    val ctx = LocalContext.current
+    var alight by remember { mutableStateOf(c.alightName) }
+    var peak by remember { mutableStateOf(c.peakHw()) }
+    var off by remember { mutableStateOf(c.offPeakHw()) }
+    var dir by remember { mutableStateOf(c.metroDir) }
+    var dirs by remember { mutableStateOf<List<ChelaileApi.SubwayDir>>(emptyList()) }
+    if (c.isMetro()) LaunchedEffect(c) {
+        dirs = withContext(Dispatchers.IO) {
+            runCatching { ChelaileApi.subwayDirs(c.lat, c.lng, c.stopName, c.cityId) }.getOrNull()
+        }.orEmpty().filter { ChelaileApi.sameLine(c.name, it) }
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("${c.label()} · ${c.stopName}") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                if (c.isMetro()) {
+                    if (dirs.isNotEmpty()) {
+                        Text("方向", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            dirs.forEach { d ->
+                                FilterChip(selected = dir == d.dest, onClick = { dir = d.dest }, label = { Text("开往 ${d.dest}") })
+                            }
+                        }
+                    }
+                    Stepper("高峰几分钟一班", peak, 1, 30) { peak = it }
+                    Stepper("平峰几分钟一班", off, 1, 30) { off = it }
+                }
+                OutlinedTextField(alight, { alight = it }, label = { Text("下车站") }, singleLine = true,
+                    modifier = Modifier.fillMaxWidth())
+                if (c.isMetro()) Text("在地铁段每次手动点「已上车」，会拿真实上车时间修正推算，越用越准。",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                val changedSchedule = c.isMetro() && (peak != c.peakHw() || off != c.offPeakHw() || dir != c.metroDir)
+                if (changedSchedule) Learn.resetMetro(ctx, c)
+                onSave(c.copy(
+                    alightName = alight.trim(),
+                    alightLat = if (alight.trim() == c.alightName) c.alightLat else Double.NaN,
+                    alightLng = if (alight.trim() == c.alightName) c.alightLng else Double.NaN,
+                    headwayMin = if (c.isMetro()) peak else c.headwayMin,
+                    offPeakHeadwayMin = if (c.isMetro()) off else c.offPeakHeadwayMin,
+                    metroDir = dir,
+                ))
+            }) { Text("保存") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
 }
 
 /** 公交蓝色大巴、地铁绿色 M、通勤车橙色：列表里一眼分开 */
