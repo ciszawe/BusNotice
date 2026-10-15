@@ -9,7 +9,11 @@ import com.busnotice.commute.ui.App
 import com.busnotice.commute.ui.AppTheme
 
 class MainActivity : ComponentActivity() {
-    companion object { const val EXTRA_START_TRIP = "startTrip" }
+    companion object {
+        const val EXTRA_START_TRIP = "startTrip"
+        const val EXTRA_MANUAL = "manual"
+        const val EXTRA_BACKGROUND = "background"
+    }
 
     /** 每次回到前台 +1，让界面重新检查权限、刷新下次预热时间 */
     private val resumeTick = mutableIntStateOf(0)
@@ -32,7 +36,9 @@ class MainActivity : ComponentActivity() {
     private fun handleStart(i: android.content.Intent?) {
         val id = i?.getStringExtra(EXTRA_START_TRIP) ?: return
         i.removeExtra(EXTRA_START_TRIP)
-        runCatching { CommuteService.start(this, id, manual = false) }
+        runCatching { CommuteService.start(this, id, manual = i.getBooleanExtra(EXTRA_MANUAL, false)) }
+        // 从快捷开关点进来：启动完就退到后台，直接看胶囊
+        if (i.getBooleanExtra(EXTRA_BACKGROUND, false)) moveTaskToBack(true)
     }
 
     override fun onResume() {
