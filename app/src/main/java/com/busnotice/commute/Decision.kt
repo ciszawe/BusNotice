@@ -100,14 +100,18 @@ object Decision {
     fun decide(options: List<Option>, connecting: Boolean = false): Advice {
         if (options.isEmpty()) return Advice(Mode.NO_BUS, null, null, 0, 0, "未设置", "这段行程还没有添加线路")
 
-        // 全是地铁：没有实时数据，只提示步行
+        // 全是地铁：没有实时车辆，用「上一班 X 分钟前过站」+ 发车间隔估下一班
         if (options.all { it.candidate.type == Candidate.Type.METRO }) {
             val o = options.minBy { it.walkSec }
-            val hw = o.candidate.headwayMin
-            val hwText = if (hw > 0) " · 约 $hw 分钟一班" else ""
-            return if (o.walkSec == 0) Advice(Mode.METRO, o, null, 0, 0, "进站", "已到 ${o.candidate.stopName}$hwText")
+            val hw = o.candidate.headwayMin.takeIf { it > 0 } ?: 7
+            val next = options.firstNotNullOfOrNull { metroNextMin(it.tip, hw) }
+            val hwText = " · 约 $hw 分钟一班"
+            val nextText = next?.let { " · 下一班约 $it 分钟" } ?: ""
+            return if (o.walkSec == 0) Advice(Mode.METRO, o, null, 0, 0,
+                next?.let { if (it <= 1) "进站" else "约${it}分" } ?: "进站",
+                "已到 ${o.candidate.stopName}$nextText$hwText")
             else Advice(Mode.METRO, o, null, o.walkSec, 0, "去地铁",
-                "步行约 ${mins(o.walkSec)} 分钟到 ${o.candidate.stopName}$hwText")
+                "步行约 ${mins(o.walkSec)} 分钟到 ${o.candidate.stopName}$nextText$hwText")
         }
 
         val all = options.flatMap { o -> o.arrivals.map { o to it } }
@@ -172,4 +176,37 @@ object Decision {
     }
 
     fun mins(sec: Int) = ((sec + 30) / 60).coerceAtLeast(0)
+
+    private val PASSED_RE = Regex("(\\d+)\\s*分钟前")
+
+    /** 「上一班10分钟前过站」+ 间隔 7 分钟 → 下一班大约还有几分钟（粗估） */
+    fun metroNextMin(tip: String, headwayMin: Int): Int? {
+        if (headwayMin <= 0) return null
+        val ago = PASSED_RE.find(tip)?.groupValues?.get(1)?.toIntOrNull() ?: return null
+        val r = headwayMin - (ago % headwayMin)
+        return if (r == headwayMin && ago > 0) 0 else r
+    }
+}
+
+/**
+ * 判断此刻是在车上、在走路还是站着不动。
+ * 用 GPS 的多普勒速度（比两点相减稳），再看是否贴着线路走，避免把骑车/打车当成坐公交。
+ */
+object Motion {
+    enum class State { STILL, WALK, RIDE, UNKNOWN }
+
+    const val RIDE_MPS = 6.0f      // 约 22 km/h
+    const val WALK_MAX_MPS = 2.5f
+
+    /** speeds：最近几次定位的速度（米/秒），旧→新；onRoute：这几次是否都在线路附近 */
+    fun classify(speeds: List<Float>, onRoute: Boolean): State {
+        if (speeds.size < 3) return State.UNKNOWN
+        val last = speeds.takeLast(3)
+        return when {
+            last.all { it >= RIDE_MPS } && onRoute -> State.RIDE
+            last.all { it in 0.6f..WALK_MAX_MPS } -> State.WALK
+            last.all { it < 0.6f } -> State.STILL
+            else -> State.UNKNOWN
+        }
+    }
 }
