@@ -112,6 +112,50 @@ object ChelaileApi {
         return parseStops(d.optJSONArray("nearSts"))
     }
 
+    /** 地铁站某线某方向的首末班（车来了只给这个，没有列车实时位置） */
+    data class SubwayDir(val line: String, val shortName: String, val dest: String, val firstMin: Int, val lastMin: Int)
+
+    private fun hm(t: String): Int {
+        val p = t.split(":", "：")
+        return if (p.size == 2) (p[0].trim().toIntOrNull() ?: return -1) * 60 + (p[1].trim().toIntOrNull() ?: return -1) else -1
+    }
+
+    /** 某个地铁站（按名字，找不到用最近的）各线路各方向的首末班 */
+    fun subwayDirs(lat: Double, lng: Double, stationName: String, cityId: String = CITY_ID): List<SubwayDir> {
+        val d = signedGet(
+            "/api/bus/stop!encryptedHomePage.action",
+            linkedMapOf(
+                "cityId" to cityId, "localCityId" to "undefined",
+                "lat" to "$lat", "lng" to "$lng", "geo_lat" to "$lat", "geo_lng" to "$lng",
+                "type" to "5", "permission" to "0",
+            )
+        )
+        val arr = d.optJSONArray("nearSts") ?: return emptyList()
+        val subs = (0 until arr.length()).map { arr.getJSONObject(it) }.filter { it.optInt("isSubway") == 1 }
+        val st = subs.firstOrNull { it.optString("sn") == stationName } ?: subs.minByOrNull { it.optInt("distance") } ?: return emptyList()
+        val out = mutableListOf<SubwayDir>()
+        val lines = st.optJSONArray("subwayV2Lines") ?: return emptyList()
+        for (i in 0 until lines.length()) {
+            val l = lines.getJSONObject(i)
+            val info = l.optJSONObject("line")
+            val subl = l.optJSONArray("sublines") ?: continue
+            for (k in 0 until subl.length()) {
+                val sl = subl.getJSONObject(k)
+                out += SubwayDir(
+                    line = info?.optString("lineName") ?: "", shortName = info?.optString("shortName") ?: "",
+                    dest = sl.optString("destName"), firstMin = hm(sl.optString("firstTime")), lastMin = hm(sl.optString("lastTime")),
+                )
+            }
+        }
+        return out
+    }
+
+    /** 线路名是否对得上：「4号线」「地铁4号线」都算 */
+    fun sameLine(name: String, d: SubwayDir): Boolean {
+        val n = name.replace("地铁", "").trim()
+        return n.isNotEmpty() && (n == d.shortName || n == d.line || "地铁$n" == d.line)
+    }
+
     /** 按关键字搜索线路和站点 */
     fun search(key: String, cityId: String = CITY_ID): SearchResult {
         val d = signedGet(
