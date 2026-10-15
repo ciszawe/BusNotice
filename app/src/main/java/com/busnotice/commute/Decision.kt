@@ -68,7 +68,7 @@ object Decision {
     enum class Mode { LEAVE_LATER, LEAVE_NOW, HURRY, AT_STOP, NO_BUS, METRO, CONNECT, CONNECT_MISS }
 
     /** 某个选项的一班车：还有多少秒到上车点 */
-    data class Arrival(val etaSec: Int, val stopsAway: Int = -1, val busId: String = "")
+    data class Arrival(val etaSec: Int, val stopsAway: Int = -1, val busId: String = "", val estimated: Boolean = false)
 
     /** 一个选项此刻的状态 */
     data class Option(
@@ -100,28 +100,12 @@ object Decision {
     fun decide(options: List<Option>, connecting: Boolean = false): Advice {
         if (options.isEmpty()) return Advice(Mode.NO_BUS, null, null, 0, 0, "未设置", "这段行程还没有添加线路")
 
-        // 全是地铁：优先用列车实时位置（和地图 App 一样的「X 分钟后进站」），
-        // 没有实时再用「上一班 X 分钟前过站」+ 发车间隔估；上一班太久以前的数据不可信，不拿来估
-        if (options.all { it.candidate.type == Candidate.Type.METRO }) {
-            val o = options.minBy { it.walkSec }
-            val hw = o.candidate.headwayMin.takeIf { it > 0 } ?: 7
-            val trains = options.flatMap { op -> op.arrivals.map { op to it } }
-                .map { (op, a) -> Triple(op, a, metroEtaSec(a)) }.filter { it.third >= 0 }
-                .sortedBy { it.third }
-            val catchable = trains.firstOrNull { it.third >= it.first.walkSec } ?: trains.firstOrNull()
-            val live = catchable?.let { (it.third + 59) / 60 }
-            val est = if (live == null) options.firstNotNullOfOrNull { metroNextMin(it.tip, hw) } else null
-            val nextText = when {
-                live != null -> " · 下一班 ${if (live <= 1) "即将" else "$live 分钟后"}进站"
-                est != null -> " · 下一班约 $est 分钟（估算）"
-                else -> " · 约 $hw 分钟一班"
-            }
-            val oo = catchable?.first ?: o
-            return if (oo.walkSec == 0) Advice(Mode.METRO, oo, catchable?.second, 0, 0,
-                (live ?: est)?.let { if (it <= 1) "进站" else if (live != null) "${it}分" else "约${it}分" } ?: "进站",
-                "已到 ${oo.candidate.stopName}$nextText")
-            else Advice(Mode.METRO, oo, catchable?.second, oo.walkSec, 0, live?.let { "${it}分" } ?: "去地铁",
-                "步行约 ${mins(oo.walkSec)} 分钟到 ${oo.candidate.stopName}$nextText")
+        val metros = options.filter { it.candidate.type == Candidate.Type.METRO }
+        if (metros.size == options.size) return metroAdvice(metros)
+        if (metros.isNotEmpty()) {
+            // 同一段里公交 + 地铁：公交没数据或赶不上时，用地铁的推算，不显示「无车」
+            val bus = decide(options - metros.toSet(), connecting)
+            return if (bus.mode == Mode.NO_BUS || bus.mode == Mode.HURRY) metroAdvice(metros) else bus
         }
 
         val all = options.flatMap { o -> o.arrivals.map { o to it } }
@@ -186,6 +170,69 @@ object Decision {
     }
 
     fun mins(sec: Int) = ((sec + 30) / 60).coerceAtLeast(0)
+
+    /**
+     * 地铁：有列车实时位置就用实时；否则用按首班 + 高峰/平峰间隔推算的班次（estimated）；
+     * 都没有再用「上一班 X 分钟前过站」+ 间隔估。
+     */
+    private fun metroAdvice(options: List<Option>): Advice {
+        val o = options.minBy { it.walkSec }
+        val hw = o.candidate.headwayMin.takeIf { it > 0 } ?: 7
+        val trains = options.flatMap { op -> op.arrivals.map { op to it } }
+            .map { (op, a) -> Triple(op, a, metroEtaSec(a)) }.filter { it.third >= 0 }
+            .sortedBy { it.third }
+        val catchable = trains.firstOrNull { it.third >= it.first.walkSec } ?: trains.firstOrNull()
+        val next = catchable?.let { (it.third + 59) / 60 }
+        val est = catchable?.second?.estimated ?: true
+        val tipEst = if (next == null) options.firstNotNullOfOrNull { metroNextMin(it.tip, hw) } else null
+        // 不知道方向时两个方向都列出来
+        val dirs = trains.filter { it.second.busId.isNotEmpty() }.distinctBy { it.second.busId }
+        val nextText = when {
+            dirs.size > 1 -> " · " + dirs.joinToString(" · ") { "${it.second.busId} ${eta(it.third, it.second.estimated)}" }
+            next != null -> " · 下一班" + eta(catchable!!.third, est).let { if (it.endsWith("进站")) it else "${it}进站" }
+            tipEst != null -> " · 下一班约 $tipEst 分钟（估算）"
+            options.any { it.tip == END_OF_SERVICE } -> " · 今天末班已过"
+            else -> " · 约 $hw 分钟一班"
+        }
+        val mins = next ?: tipEst
+        val oo = catchable?.first ?: o
+        val head = mins?.let { if (it <= 1) "进站" else if (est || next == null) "约${it}分" else "${it}分" }
+        return if (oo.walkSec == 0) Advice(Mode.METRO, oo, catchable?.second, 0, 0, head ?: "进站",
+            "已到 ${oo.candidate.stopName}$nextText")
+        else Advice(Mode.METRO, oo, catchable?.second, oo.walkSec, 0, head ?: "去地铁",
+            "步行约 ${mins(oo.walkSec)} 分钟到 ${oo.candidate.stopName}$nextText")
+    }
+
+    const val END_OF_SERVICE = "末班已过"
+
+    private fun eta(sec: Int, estimated: Boolean): String {
+        val m = (sec + 59) / 60
+        return when {
+            m <= 1 -> "即将进站"
+            estimated -> "约 $m 分钟"
+            else -> "$m 分钟后"
+        }
+    }
+
+    /** 高峰（工作日 7:00–9:00、17:00–19:30）用高峰间隔，其余用平峰间隔 */
+    fun headwayAt(minOfDay: Int, weekday: Boolean, peak: Int, offPeak: Int): Int =
+        if (weekday && (minOfDay in 420 until 540 || minOfDay in 1020 until 1170)) peak else offPeak
+
+    /**
+     * 从首班开始按间隔往后排，算出接下来几班离现在多少秒。
+     * 首班前 → 首班；末班后 → 空。时间都是「一天中的秒」。
+     */
+    fun metroSchedule(nowSec: Int, firstMin: Int, lastMin: Int, weekday: Boolean, peak: Int, offPeak: Int, n: Int = 2): List<Int> {
+        if (firstMin < 0 || peak <= 0 || offPeak <= 0) return emptyList()
+        val last = if (lastMin in 0 until firstMin) lastMin + 1440 else lastMin.takeIf { it >= 0 } ?: 1439
+        var t = firstMin * 60
+        val out = ArrayList<Int>()
+        while (t <= last * 60 && out.size < n) {
+            if (t >= nowSec) out += t - nowSec
+            t += headwayAt((t / 60) % 1440, weekday, peak, offPeak) * 60
+        }
+        return out
+    }
 
     /** 列车到本站秒数：有 travelTime 用它，没有按每站约 2.5 分钟推 */
     fun metroEtaSec(a: Arrival): Int = when {
