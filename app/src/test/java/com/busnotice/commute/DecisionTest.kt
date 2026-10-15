@@ -102,4 +102,21 @@ class DecisionTest {
         assertTrue(a.detail.contains("5 分钟后进站"))
         assertEquals(null, Decision.metroNextMin("上一班20分钟前过站", 7))
     }
+
+    @Test fun metroScheduleFromFirstTrain() {
+        // 首班 06:30：平峰 10 分钟排到 07:00，之后高峰 5 分钟 → 07:00 07:05
+        assertEquals(listOf(300, 600), Decision.metroSchedule(6 * 3600 + 55 * 60, 390, 1410, true, 5, 10))
+        assertEquals(listOf(600), Decision.metroSchedule(6 * 3600 + 20 * 60, 390, 1410, true, 5, 10, n = 1))
+        assertTrue(Decision.metroSchedule(23 * 3600 + 40 * 60, 390, 1410, true, 5, 10).isEmpty())
+    }
+
+    @Test fun mixedLegNeverSaysNoBusWhenMetroKnown() {
+        val m = Candidate(Candidate.Type.METRO, "4号线", "D站", 0.0, 0.0, headwayMin = 5)
+        val a = Decision.decide(listOf(
+            Decision.Option(bus(), 0, emptyList(), "暂无车辆"),
+            Decision.Option(m, 0, listOf(Decision.Arrival(170, estimated = true))),
+        ))
+        assertEquals(Decision.Mode.METRO, a.mode)
+        assertEquals("约3分", a.headline)
+    }
 }
