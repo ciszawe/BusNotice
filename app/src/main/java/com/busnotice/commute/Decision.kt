@@ -189,7 +189,11 @@ object Decision {
         val dirs = trains.filter { it.second.busId.isNotEmpty() }.distinctBy { it.second.busId }
         val nextText = when {
             dirs.size > 1 -> " · " + dirs.joinToString(" · ") { "${it.second.busId} ${eta(it.third, it.second.estimated)}" }
-            next != null -> " · 下一班" + eta(catchable!!.third, est).let { if (it.endsWith("进站")) it else "${it}进站" }
+            next != null -> {
+                val after = trains.firstOrNull { it.third > catchable!!.third }
+                " · 本趟" + eta(catchable!!.third, est).let { if (it.endsWith("进站")) it else "${it}进站" } +
+                    (after?.let { " · 下趟" + eta(it.third, it.second.estimated) } ?: "")
+            }
             tipEst != null -> " · 下一班约 $tipEst 分钟（估算）"
             options.any { it.tip == END_OF_SERVICE } -> " · 今天末班已过"
             else -> " · 约 $hw 分钟一班"
@@ -204,6 +208,52 @@ object Decision {
     }
 
     const val END_OF_SERVICE = "末班已过"
+
+    /** 一个「刚好赶上换乘公交」的出发方案；时间都是距现在的秒数 */
+    data class Plan(
+        val leaveSec: Int,     // 该从现在的位置出发
+        val trainSec: Int,     // 坐上的那班地铁进站
+        val busSec: Int,       // 换乘公交到站
+        val waitSec: Int,      // 到换乘站后要等多久
+        val busLabel: String,
+        val busEstimated: Boolean,
+    )
+
+    /**
+     * 倒推出发时间：对每一班可能的公交，找能赶上它的最晚一班地铁，再减去走到地铁站的时间。
+     * 只要出发时间还没过，就是一个方案；返回最早能赶上的那班公交和它后面一班。
+     * buses：换乘站公交 (线路, 距现在秒数, 是否按间隔推的)。
+     */
+    fun planDeparture(
+        walkToMetroSec: Int, trainsSec: List<Int>, rideSec: Int, transferWalkSec: Int,
+        buses: List<Triple<String, Int, Boolean>>, n: Int = 2,
+    ): List<Plan> {
+        val trains = trainsSec.sorted()
+        val out = ArrayList<Plan>()
+        for ((label, b, est) in buses.sortedBy { it.second }) {
+            val t = trains.lastOrNull { it + rideSec + transferWalkSec + SAFETY_SEC <= b } ?: continue
+            val leave = t - walkToMetroSec - SAFETY_SEC
+            if (leave < 0) continue
+            if (out.any { it.trainSec == t }) continue // 同一班地铁赶前一班公交更好，后面这班不算
+            out += Plan(leave, t, b, b - (t + rideSec + transferWalkSec), label, est)
+            if (out.size >= n) break
+        }
+        return out
+    }
+
+    /** 实时只看得到快来的几辆：按相邻两车的间隔把后面的补出来（标为推算） */
+    fun extendBuses(label: String, realtime: List<Int>, fallbackHwSec: Int, horizonSec: Int = 5400): List<Triple<String, Int, Boolean>> {
+        val rt = realtime.filter { it >= 0 }.sorted()
+        if (rt.isEmpty()) return emptyList()
+        val gaps = rt.zipWithNext { a, b -> b - a }.filter { it in 120..3600 }.sorted()
+        val hw = gaps.getOrNull(gaps.size / 2) ?: fallbackHwSec
+        val out = rt.map { Triple(label, it, false) }.toMutableList()
+        if (hw > 0) {
+            var t = rt.last() + hw
+            while (t <= horizonSec) { out += Triple(label, t, true); t += hw }
+        }
+        return out
+    }
 
     private fun eta(sec: Int, estimated: Boolean): String {
         val m = (sec + 59) / 60
