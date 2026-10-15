@@ -128,7 +128,7 @@ class CommuteService : Service() {
         instance = this
         if (!manual) Diag.mark(this, "已自动启动")
         trip = t
-        stationAt = 0L; metroRideSec.clear(); alightAt = 0L; rideLearned = false; stopAlerted = ""
+        stationAt = 0L; metroRideSec.clear(); metroRoutes.clear(); alightAt = 0L; rideLearned = false; stopAlerted = ""
         legIdx = 0; boardedAt = 0L; nearSince = 0L; fastFixes = 0; alertedKey = null; planDone = false; planAlerted = ""
         maxStops.clear(); maxEta.clear()
         manualRun = manual; riding = false; transferAlerted = false; arriveAlertedAt = 0L
@@ -165,10 +165,21 @@ class CommuteService : Service() {
     private val metroRideSec = java.util.concurrent.ConcurrentHashMap<Int, Int>()
     private val SEC_PER_STOP = 140
 
+    /** 每段地铁途经的站（站名 + 坐标），拿来显示「下一站」 */
+    private val metroRoutes = java.util.concurrent.ConcurrentHashMap<Int, ChelaileApi.MetroRoute>()
+
     private fun prefetchMetroStops(t: Trip) {
         t.legs.forEachIndexed { i, leg ->
-            if (!leg.isMetroOnly() || i >= t.legs.size - 1) return@forEachIndexed
+            if (!leg.isMetroOnly()) return@forEachIndexed
             val c = leg.candidates.firstOrNull { it.isMetro() } ?: return@forEachIndexed
+            MetroRoutes.target(t, i)?.let { (name, la, ln) ->
+                MetroRoutes.get(this, c, name, la, ln)?.let { r ->
+                    metroRoutes[i] = r
+                    metroRideSec[i] = r.durSec
+                    Log.i(TAG, "第 ${i + 1} 段地铁 ${r.hops} 站，约 ${r.durSec / 60} 分钟")
+                }
+            }
+            if (i >= t.legs.size - 1) return@forEachIndexed
             val to = t.legs[i + 1].candidates.firstOrNull() ?: return@forEachIndexed
             runCatching {
                 val dirs = ChelaileApi.subwayDirs(c.lat, c.lng, c.stopName, c.cityId).filter { ChelaileApi.sameLine(c.name, it) }
@@ -176,8 +187,7 @@ class CommuteService : Service() {
                 val use = dirs.filter { c.metroDir.isEmpty() || it.dest == c.metroDir }
                 ChelaileApi.metroStops(use, to.lat, to.lng, c.cityId)
             }.getOrNull()?.let { n ->
-                metroRideSec[i] = n * SEC_PER_STOP + 60
-                Log.i(TAG, "第 ${i + 1} 段地铁约 $n 站")
+                if (metroRideSec.putIfAbsent(i, n * SEC_PER_STOP + 60) == null) Log.i(TAG, "第 ${i + 1} 段地铁约 $n 站")
             }
         }
     }
@@ -574,7 +584,11 @@ class CommuteService : Service() {
             left > 0 -> "约${left}分"
             else -> "快到了"
         }
-        val text = "前往 $name" + (d?.let { " · 还有约 ${"%.1f".format(it / 1000)} 公里" } ?: "")
+        val mr = if (metro) metroRoutes[legIdx] else null
+        val text = if (mr != null && arriveAlertedAt == 0L) {
+            val (next, n) = MetroRoutes.progress(mr, now - boardedAt, total)
+            "下一站 $next · 还有 $n 站到 $name"
+        } else "前往 $name" + (d?.let { " · 还有约 ${"%.1f".format(it / 1000)} 公里" } ?: "")
         val v = LiveNotifier.Visual("$lineTitle · 到 $name", text, short,
             if (trip.legs.size > 1) "${trip.name} · 最后一段" else trip.name,
             progress = p, metro = metro, trackerRes = if (metro) R.drawable.ic_metro else R.drawable.ic_bus, riding = true)
@@ -602,6 +616,14 @@ class CommuteService : Service() {
             val prev = trip.legs[legIdx - 1]
             val total = rideMs(legIdx - 1)
             val p = if (total > 0) (100 - (expectArrive - now) * 100 / total).toInt() else 50
+            val r = metroRoutes[legIdx - 1]
+            if (r != null && now < expectArrive) {
+                val (next, left) = MetroRoutes.progress(r, now - boardedAt, total)
+                val line = prev.candidates.firstOrNull { it.isMetro() }?.label() ?: prev.title()
+                return LiveNotifier.Visual("$line · 下一站 $next", "还有 $left 站到 ${r.stations.last().name} · ${a.detail}",
+                    a.headline, sub, countdownTo = arr?.let { now + it.etaSec * 1000L }, progress = p,
+                    stops = r.hops.coerceAtMost(12), metro = true, trackerRes = R.drawable.ic_metro)
+            }
             return LiveNotifier.Visual(title, a.detail, a.headline, sub,
                 countdownTo = arr?.let { now + it.etaSec * 1000L }, progress = p, stops = 0,
                 urgent = a.mode == Decision.Mode.CONNECT_MISS, metro = metro,
