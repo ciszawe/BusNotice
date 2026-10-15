@@ -93,4 +93,13 @@ class DecisionTest {
         val s = Learn.suggest(listOf(1080, 1095, 1110, 1140, 1170, 1200, 1230))!!
         assertTrue(s.start <= 1080 - 5 && s.end >= 1200 && s.start % 5 == 0 && s.end % 5 == 0)
     }
+
+    @Test fun metroLiveTrains() {
+        val m = Candidate(Candidate.Type.METRO, "4号线", "D站", 0.0, 0.0, headwayMin = 7)
+        val a = Decision.decide(listOf(Decision.Option(m, 0,
+            listOf(Decision.Arrival(250, 2, "t1")), "上一班20分钟前过站")))
+        assertEquals("5分", a.headline)
+        assertTrue(a.detail.contains("5 分钟后进站"))
+        assertEquals(null, Decision.metroNextMin("上一班20分钟前过站", 7))
+    }
 }
