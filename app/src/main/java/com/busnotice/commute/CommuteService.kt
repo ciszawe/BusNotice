@@ -72,6 +72,16 @@ class CommuteService : Service() {
             ctx.startForegroundService(i)
         }
 
+        /** 有没结束的行程但服务不在（被系统杀了）：重新拉起，接着原进度跑 */
+        fun resumeIfNeeded(ctx: Context) {
+            if (instance != null) return
+            val p = ctx.getSharedPreferences("run_state", Context.MODE_PRIVATE)
+            val id = p.getString("trip", null) ?: return
+            if (p.getLong("deadline", 0) <= System.currentTimeMillis()) return
+            runCatching { start(ctx, id, p.getBoolean("manual", false)) }
+                .onSuccess { Diag.mark(ctx, "胶囊不见了，已重新拉起") }
+        }
+
         fun stop(ctx: Context) {
             ctx.stopService(Intent(ctx, CommuteService::class.java))
         }
@@ -879,12 +889,21 @@ class ActionReceiver : BroadcastReceiver() {
     companion object {
         const val ACTION_BOARDED = "com.busnotice.commute.BOARDED"
         const val ACTION_STOP = "com.busnotice.commute.STOP"
+        const val ACTION_DISMISSED = "com.busnotice.commute.DISMISSED"
     }
 
     override fun onReceive(ctx: Context, intent: Intent) {
         val svc = CommuteService.instance
         when {
             intent.action == ACTION_BOARDED && svc != null -> svc.onBoarded()
+            intent.action == ACTION_DISMISSED -> {
+                // 被划掉或被挤掉：行程照常进行，3 秒后把胶囊重新挂上
+                if (svc != null) android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                    if (CommuteService.instance != null) LiveNotifier.last?.let { LiveNotifier.update(ctx, it) }
+                }, 3_000)
+                else CommuteService.resumeIfNeeded(ctx)
+            }
+            intent.action == ACTION_STOP -> CommuteService.stop(ctx)
             else -> CommuteService.stop(ctx)
         }
     }
