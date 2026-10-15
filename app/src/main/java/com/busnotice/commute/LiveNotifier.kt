@@ -25,6 +25,9 @@ object LiveNotifier {
     private const val BLUE_SOFT = 0xFF9DB9FF.toInt()
     private const val ORANGE = 0xFFFF8A3D.toInt()
     private const val WHITE = 0xFFFFFFFF.toInt()
+    // 地铁用绿色、地铁图标，和公交（蓝色、大巴图标）一眼区分
+    const val GREEN = 0xFF1AAE6F.toInt()
+    private const val GREEN_SOFT = 0xFF8FD9B6.toInt()
 
     /** 胶囊要显示的内容 */
     data class Visual(
@@ -38,6 +41,7 @@ object LiveNotifier {
         val urgent: Boolean = false,
         val trackerRes: Int = R.drawable.ic_bus,
         val endRes: Int = R.drawable.ic_stop,
+        val metro: Boolean = false,
     )
 
     fun ensureChannels(ctx: Context) {
@@ -71,7 +75,8 @@ object LiveNotifier {
         }
         if (v.progress != null) {
             val p = v.progress.coerceIn(0, 100)
-            val color = if (v.urgent) ORANGE else BLUE
+            val color = if (v.urgent) ORANGE else if (v.metro) GREEN else BLUE
+            val soft = if (v.metro) GREEN_SOFT else BLUE_SOFT
             val style = NotificationCompat.ProgressStyle()
                 .setStyledByProgress(true)
                 .setProgressTrackerIcon(IconCompat.createWithResource(ctx, v.trackerRes))
@@ -81,7 +86,7 @@ object LiveNotifier {
             val n = v.stops.coerceIn(0, 10)
             for (i in 1 until n) {
                 val pos = i * 100 / n
-                style.addProgressPoint(NotificationCompat.ProgressStyle.Point(pos).setColor(if (pos <= p) WHITE else BLUE_SOFT))
+                style.addProgressPoint(NotificationCompat.ProgressStyle.Point(pos).setColor(if (pos <= p) WHITE else soft))
             }
             b.setStyle(style)
         } else {
@@ -99,10 +104,10 @@ object LiveNotifier {
     }
 
     /** 需要马上出发 / 换乘紧张时，额外弹一条横幅并震动 */
-    fun alert(ctx: Context, title: String, text: String) {
+    fun alert(ctx: Context, title: String, text: String, metro: Boolean = false, id: Int = ALERT_ID) {
         val n = NotificationCompat.Builder(ctx, CHANNEL_ALERT)
-            .setSmallIcon(R.drawable.ic_bus)
-            .setColor(BLUE)
+            .setSmallIcon(if (metro) R.drawable.ic_metro else R.drawable.ic_bus)
+            .setColor(if (metro) GREEN else BLUE)
             .setContentTitle(title)
             .setContentText(text)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
@@ -112,7 +117,7 @@ object LiveNotifier {
             .setContentIntent(openApp(ctx))
             .build()
         try {
-            NotificationManagerCompat.from(ctx).notify(ALERT_ID, n)
+            NotificationManagerCompat.from(ctx).notify(id, n)
         } catch (_: SecurityException) { }
     }
 
@@ -140,8 +145,8 @@ object LiveNotifier {
 
     private fun base(ctx: Context, v: Visual): NotificationCompat.Builder =
         NotificationCompat.Builder(ctx, CHANNEL_LIVE)
-            .setSmallIcon(R.drawable.ic_bus)
-            .setColor(BLUE)
+            .setSmallIcon(if (v.metro) R.drawable.ic_metro else R.drawable.ic_bus)
+            .setColor(if (v.metro) GREEN else BLUE)
             .setContentTitle(v.title)
             .setContentText(v.text)
             .setSubText(v.sub.ifEmpty { null })
