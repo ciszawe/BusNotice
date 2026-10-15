@@ -184,27 +184,30 @@ private fun LiveCard(s: LiveSnapshot) {
     val ctx = LocalContext.current
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
-        shape = RoundedCornerShape(28.dp),
+        shape = RoundedCornerShape(24.dp),
     ) {
-        Column(Modifier.padding(20.dp)) {
+        Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
             Text(
                 if (s.legCount > 1) "${s.tripName} · 第 ${s.legIndex + 1}/${s.legCount} 段 · ${s.legTitle}" else "${s.tripName} · ${s.legTitle}",
-                style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onPrimaryContainer,
+                style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onPrimaryContainer,
                 maxLines = 1, overflow = TextOverflow.Ellipsis,
             )
-            Spacer(Modifier.height(6.dp))
-            Text(s.headline, style = MaterialTheme.typography.displaySmall, fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.onPrimaryContainer)
-            Spacer(Modifier.height(4.dp))
-            Text(s.detail, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onPrimaryContainer)
-            s.progress?.let {
-                Spacer(Modifier.height(14.dp))
-                LinearProgressIndicator(progress = { it.coerceIn(0, 100) / 100f }, modifier = Modifier.fillMaxWidth().height(6.dp))
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(s.headline, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onPrimaryContainer, modifier = Modifier.weight(1f))
+                if (!s.riding) {
+                    FilledTonalButton(onClick = { CommuteService.instance?.onBoarded() },
+                        contentPadding = PaddingValues(horizontal = 14.dp)) { Text("已上车") }
+                    Spacer(Modifier.width(6.dp))
+                }
+                OutlinedButton(onClick = { CommuteService.stop(ctx) },
+                    contentPadding = PaddingValues(horizontal = 14.dp)) { Text("结束") }
             }
-            Spacer(Modifier.height(14.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { CommuteService.instance?.onBoarded() }) { Text("已上车") }
-                OutlinedButton(onClick = { CommuteService.stop(ctx) }) { Text("结束") }
+            Text(s.detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onPrimaryContainer,
+                maxLines = 2, overflow = TextOverflow.Ellipsis)
+            s.progress?.let {
+                Spacer(Modifier.height(8.dp))
+                LinearProgressIndicator(progress = { it.coerceIn(0, 100) / 100f }, modifier = Modifier.fillMaxWidth().height(4.dp))
             }
         }
     }
@@ -302,6 +305,9 @@ private fun missingPerms(ctx: Context, request: (Array<String>) -> Unit): List<P
         out += Perm("后台定位：始终允许", "闹钟在后台叫醒时也能定位") {
             request(arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION))
         }
+    }
+    if (!granted(ctx, Manifest.permission.ACTIVITY_RECOGNITION)) {
+        out += Perm("身体活动（计步）", "判断你下了地铁、开始走路") { request(arrayOf(Manifest.permission.ACTIVITY_RECOGNITION)) }
     }
     if (!granted(ctx, Manifest.permission.POST_NOTIFICATIONS)) {
         out += Perm("通知", "显示流体云胶囊") { request(arrayOf(Manifest.permission.POST_NOTIFICATIONS)) }
