@@ -39,4 +39,46 @@ object Learn {
 
     fun suggest(ctx: Context, trip: Trip): Suggestion? =
         suggest(samples(ctx, trip.id))?.takeIf { it.start != trip.startMinute || it.end != trip.endMinute }
+
+    // ---------- 每段实际坐多久（从上车到走近下一段上车点，减掉换乘步行） ----------
+    private const val RIDE = "learn_ride"
+
+    fun recordRide(ctx: Context, tripId: String, legIdx: Int, minutes: Int) {
+        if (minutes !in 1..180) return
+        val p = ctx.getSharedPreferences(RIDE, Context.MODE_PRIVATE)
+        val k = "$tripId#$legIdx"
+        val list = (p.getString(k, "") ?: "").split(',').filter { it.isNotBlank() } + "$minutes"
+        p.edit().putString(k, list.takeLast(10).joinToString(",")).apply()
+    }
+
+    /** 攒够 3 次后用中位数，否则 null（用行程里手填的） */
+    fun rideMin(ctx: Context, tripId: String, legIdx: Int): Int? {
+        val l = (ctx.getSharedPreferences(RIDE, Context.MODE_PRIVATE).getString("$tripId#$legIdx", "") ?: "")
+            .split(',').mapNotNull { it.trim().toIntOrNull() }
+        return if (l.size < 3) null else l.sorted()[l.size / 2]
+    }
+
+    fun rideSamples(ctx: Context, tripId: String, legIdx: Int): Int =
+        (ctx.getSharedPreferences(RIDE, Context.MODE_PRIVATE).getString("$tripId#$legIdx", "") ?: "")
+            .split(',').count { it.isNotBlank() }
+
+    // ---------- 地铁推算的偏差：每次在地铁段手动点「已上车」，对比推算班次修正 ----------
+    private const val METRO = "learn_metro"
+
+    fun metroKey(c: Candidate, peak: Boolean) = "${c.stopName}|${c.name}|${c.metroDir}|${if (peak) "p" else "o"}"
+
+    fun metroOffsetSec(ctx: Context, key: String): Int =
+        ctx.getSharedPreferences(METRO, Context.MODE_PRIVATE).getInt(key, 0)
+
+    /** residualSec：实际 - 推算（已折到 ±半个间隔）；指数平均，新样本占 30% */
+    fun recordMetro(ctx: Context, key: String, residualSec: Int) {
+        val p = ctx.getSharedPreferences(METRO, Context.MODE_PRIVATE)
+        val old = p.getInt(key, 0)
+        p.edit().putInt(key, (old * 0.7 + residualSec * 0.3).toInt()).apply()
+    }
+
+    fun resetMetro(ctx: Context, c: Candidate) {
+        val p = ctx.getSharedPreferences(METRO, Context.MODE_PRIVATE)
+        p.edit().remove(metroKey(c, true)).remove(metroKey(c, false)).apply()
+    }
 }
