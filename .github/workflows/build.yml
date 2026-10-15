@@ -38,4 +38,5 @@ jobs:
           tag_name: build-${{ github.run_number }}
           name: 通勤胶囊 build ${{ github.run_number }}
           files: CommuteCapsule-${{ github.run_number }}.apk
-          prerelease: true
+          prerelease: false
+          make_latest: true
