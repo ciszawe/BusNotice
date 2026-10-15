@@ -12,28 +12,40 @@ object Learn {
     private const val PREFS = "learn"
     private const val KEEP = 30
     const val MIN_SAMPLES = 6
+    private const val MIN_DAYS = 4
 
+    // v3：每条是「哪天:几点上车」，一天只留一条；旧数据混了大量测试样本，整体作废
+    private fun key(tripId: String) = "v3:$tripId"
+
+    private data class Entry(val day: Long, val minute: Int)
+
+    private fun entries(ctx: Context, tripId: String): List<Entry> =
+        (ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(key(tripId), "") ?: "")
+            .split(',').mapNotNull { e ->
+                val (d, m) = e.split(':').takeIf { it.size == 2 } ?: return@mapNotNull null
+                Entry(d.toLongOrNull() ?: return@mapNotNull null, m.toIntOrNull() ?: return@mapNotNull null)
+            }
+
+    /** 只在「确认是真坐车」后调用（见 CommuteService.commitBoard）；同一天重复记只保留第一次 */
     fun record(ctx: Context, tripId: String, millis: Long) {
         val t = Instant.ofEpochMilli(millis).atZone(ZoneId.systemDefault())
-        val minute = t.hour * 60 + t.minute
-        val p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val list = (p.getString(tripId, "") ?: "").split(',').filter { it.isNotBlank() } + "$minute"
-        val dk = "$tripId@${t.dayOfWeek.value}"
-        val byDay = (p.getString(dk, "") ?: "").split(',').filter { it.isNotBlank() } + "$minute"
-        p.edit().putString(tripId, list.takeLast(KEEP).joinToString(","))
-            .putString(dk, byDay.takeLast(8).joinToString(",")).apply()
+        val day = t.toLocalDate().toEpochDay()
+        val list = entries(ctx, tripId)
+        if (list.any { it.day == day }) return
+        val out = (list + Entry(day, t.hour * 60 + t.minute)).takeLast(KEEP)
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString(key(tripId), out.joinToString(",") { "${it.day}:${it.minute}" }).apply()
     }
 
     /**
-     * 这天通常几点上第一段车：同一个星期几攒够 3 次用它的中位数，
-     * 否则全部记录攒够 5 次用总体中位数；都不够返回 null。
+     * 这天通常几点上第一段车：同一个星期几攒够 3 天用它的中位数，
+     * 否则全部攒够 5 天用总体中位数；都不够返回 null。
      */
     fun typicalBoard(ctx: Context, tripId: String, dow: Int): Int? {
-        val p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val day = (p.getString("$tripId@$dow", "") ?: "").split(',').mapNotNull { it.trim().toIntOrNull() }
+        val all = entries(ctx, tripId)
+        val day = all.filter { java.time.LocalDate.ofEpochDay(it.day).dayOfWeek.value == dow }.map { it.minute }
         if (day.size >= 3) return day.sorted()[day.size / 2]
-        val all = samples(ctx, tripId)
-        return if (all.size >= 5) all.sorted()[all.size / 2] else null
+        return if (all.size >= 5) all.map { it.minute }.sorted()[all.size / 2] else null
     }
 
     /** 按习惯推迟自动弹出：通常上车前 40 分钟弹，但不早于时间窗开始、不晚于结束前 15 分钟 */
@@ -43,16 +55,14 @@ object Learn {
         return s.takeIf { it > trip.startMinute }
     }
 
-    fun samples(ctx: Context, tripId: String): List<Int> =
-        (ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(tripId, "") ?: "")
-            .split(',').mapNotNull { it.trim().toIntOrNull() }
+    fun samples(ctx: Context, tripId: String): List<Int> = entries(ctx, tripId).map { it.minute }
 
     data class Suggestion(val start: Int, val end: Int, val typical: Int, val n: Int)
 
     /** 取 10%–90% 分位，前后各放 10 分钟，取整到 5 分钟；样本太少返回 null */
     fun suggest(minutes: List<Int>): Suggestion? {
         if (minutes.size < MIN_SAMPLES) return null
-        // 去掉离中位数 90 分钟以外的（手动测试、加班等偶发样本），不让它们把时间窗撑大
+        // 去掉离中位数 90 分钟以外的（加班等偶发样本），不让它们把时间窗撑大
         val med = minutes.sorted()[minutes.size / 2]
         val s = minutes.filter { kotlin.math.abs(it - med) <= 90 }.sorted()
         if (s.size < MIN_SAMPLES) return null
@@ -62,8 +72,34 @@ object Learn {
         return Suggestion(start, end, q(0.5), s.size)
     }
 
-    fun suggest(ctx: Context, trip: Trip): Suggestion? =
-        suggest(samples(ctx, trip.id))?.takeIf { it.start != trip.startMinute || it.end != trip.endMinute }
+    fun suggest(ctx: Context, trip: Trip): Suggestion? {
+        val e = entries(ctx, trip.id)
+        if (e.map { it.day }.distinct().size < MIN_DAYS) return null
+        return suggest(e.map { it.minute })?.takeIf { it.start != trip.startMinute || it.end != trip.endMinute }
+    }
+
+    /**
+     * 后台无感调整时间窗：样本够了就直接改，不弹建议。
+     * 每次最多挪 30 分钟，避免一两次异常把窗口一下拉走。返回改过的行程或 null。
+     */
+    fun autoAdjust(ctx: Context, trip: Trip): Trip? {
+        val trip = TripStore.get(ctx, trip.id) ?: trip
+        val sg = suggest(ctx, trip) ?: return null
+        fun step(from: Int, to: Int) = from + (to - from).coerceIn(-30, 30)
+        val ns = step(trip.startMinute, sg.start)
+        val ne = step(trip.endMinute, sg.end).coerceAtLeast(ns + 30)
+        if (ns == trip.startMinute && ne == trip.endMinute) return null
+        val nt = trip.copy(startMinute = ns, endMinute = ne)
+        TripStore.upsert(ctx, nt)
+        val t = java.time.LocalDate.now()
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString("adj:${trip.id}", "${t.monthValue}/${t.dayOfMonth} 按习惯调整为 %02d:%02d–%02d:%02d"
+                .format(ns / 60, ns % 60, ne / 60, ne % 60)).apply()
+        return nt
+    }
+
+    fun lastAdjust(ctx: Context, tripId: String): String? =
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("adj:$tripId", null)
 
     // ---------- 每段实际坐多久（从上车到走近下一段上车点，减掉换乘步行） ----------
     private const val RIDE = "learn_ride2"  // v2：旧样本的上车时刻记早了，作废
