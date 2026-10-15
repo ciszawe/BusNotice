@@ -18,7 +18,29 @@ object Learn {
         val minute = t.hour * 60 + t.minute
         val p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val list = (p.getString(tripId, "") ?: "").split(',').filter { it.isNotBlank() } + "$minute"
-        p.edit().putString(tripId, list.takeLast(KEEP).joinToString(",")).apply()
+        val dk = "$tripId@${t.dayOfWeek.value}"
+        val byDay = (p.getString(dk, "") ?: "").split(',').filter { it.isNotBlank() } + "$minute"
+        p.edit().putString(tripId, list.takeLast(KEEP).joinToString(","))
+            .putString(dk, byDay.takeLast(8).joinToString(",")).apply()
+    }
+
+    /**
+     * 这天通常几点上第一段车：同一个星期几攒够 3 次用它的中位数，
+     * 否则全部记录攒够 5 次用总体中位数；都不够返回 null。
+     */
+    fun typicalBoard(ctx: Context, tripId: String, dow: Int): Int? {
+        val p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val day = (p.getString("$tripId@$dow", "") ?: "").split(',').mapNotNull { it.trim().toIntOrNull() }
+        if (day.size >= 3) return day.sorted()[day.size / 2]
+        val all = samples(ctx, tripId)
+        return if (all.size >= 5) all.sorted()[all.size / 2] else null
+    }
+
+    /** 按习惯推迟自动弹出：通常上车前 40 分钟弹，但不早于时间窗开始、不晚于结束前 15 分钟 */
+    fun learnedStart(ctx: Context, trip: Trip, dow: Int): Int? {
+        val b = typicalBoard(ctx, trip.id, dow) ?: return null
+        val s = (b - 40).coerceAtMost(trip.endMinute - 15)
+        return s.takeIf { it > trip.startMinute }
     }
 
     fun samples(ctx: Context, tripId: String): List<Int> =
