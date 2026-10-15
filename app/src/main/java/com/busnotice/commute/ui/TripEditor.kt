@@ -44,6 +44,12 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.painterResource
+import com.busnotice.commute.Loc
+import com.busnotice.commute.R
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -72,6 +78,8 @@ fun TripEditor(
 ) {
     val ctx = LocalContext.current
     var pickTime by remember { mutableStateOf<Int?>(null) } // 0=开始 1=结束
+    var locating by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
     fun updateLeg(i: Int, leg: Leg) = onChange(trip.copy(legs = trip.legs.toMutableList().also { it[i] = leg }))
 
@@ -130,6 +138,50 @@ fun TripEditor(
                             FilterChip(selected = trip.warmupMin == m, onClick = { onChange(trip.copy(warmupMin = m)) },
                                 label = { Text("$m 分钟") })
                         }
+                    }
+                }
+            }
+            item {
+                Section("什么时候弹出胶囊") {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FilterChip(selected = !trip.leaveMode(), onClick = { onChange(trip.copy(leaveRadiusM = 0)) },
+                            label = { Text("到点就弹") })
+                        FilterChip(selected = trip.leaveMode(), onClick = {
+                            if (!trip.leaveLat.isNaN()) onChange(trip.copy(leaveRadiusM = trip.leaveRadiusM.takeIf { it > 0 } ?: 300))
+                            else if (!locating) {
+                                locating = true
+                                scope.launch {
+                                    val l = Loc.current(ctx); locating = false
+                                    if (l == null) Toast.makeText(ctx, "定位失败，到出发地再试", Toast.LENGTH_SHORT).show()
+                                    else onChange(trip.copy(leaveLat = l.latitude, leaveLng = l.longitude, leaveRadiusM = 300))
+                                }
+                            }
+                        }, label = { Text(if (locating) "定位中…" else "离开出发地才弹") })
+                    }
+                    Spacer(Modifier.height(6.dp))
+                    if (trip.leaveMode()) {
+                        Text("时间窗内每 4 分钟粗定位一次，走出这个范围就自动弹出。适合下班时间不固定：时间窗可以放宽，比如 17:30 到 22:00。",
+                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.height(6.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                            listOf(200, 300, 500).forEach { r ->
+                                FilterChip(selected = trip.leaveRadiusM == r, onClick = { onChange(trip.copy(leaveRadiusM = r)) },
+                                    label = { Text("$r 米") })
+                            }
+                        }
+                        TextButton(onClick = {
+                            if (!locating) {
+                                locating = true
+                                scope.launch {
+                                    val l = Loc.current(ctx); locating = false
+                                    if (l == null) Toast.makeText(ctx, "定位失败", Toast.LENGTH_SHORT).show()
+                                    else { onChange(trip.copy(leaveLat = l.latitude, leaveLng = l.longitude)); Toast.makeText(ctx, "已把这里设为出发地", Toast.LENGTH_SHORT).show() }
+                                }
+                            }
+                        }) { Text("把我现在的位置设为出发地") }
+                    } else {
+                        Text("下班时间不固定的话，选「离开出发地才弹」，在公司里设一次就行。也可以在下拉快捷开关里加「通勤胶囊」，出门点一下。",
+                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
             }
@@ -201,6 +253,8 @@ private fun LegCard(
             }
             leg.candidates.forEachIndexed { ci, c ->
                 Row(Modifier.padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    TransitIcon(c)
+                    Spacer(Modifier.width(10.dp))
                     Column(Modifier.weight(1f)) {
                         Text(c.label() + when (c.type) {
                             Candidate.Type.BUS -> "  开往 ${c.endSn}"
@@ -228,11 +282,22 @@ private fun LegCard(
                 AssistChip(onClick = onAddShuttle, label = { Text("+ 通勤车") })
                 AssistChip(onClick = onAddMetro, label = { Text("+ 地铁") })
             }
-            if (!isLast) {
-                Stepper("这段大约坐多久", leg.rideMin, 1, 120) { onChange(leg.copy(rideMin = it)) }
+            Stepper(if (isLast) "大约坐多久（快到下车站时提醒）" else "这段大约坐多久", leg.rideMin, 1, 120) {
+                onChange(leg.copy(rideMin = it))
             }
         }
     }
+}
+
+/** 公交蓝色大巴、地铁绿色 M、通勤车橙色：列表里一眼分开 */
+@Composable
+fun TransitIcon(c: Candidate) {
+    val (res, color) = when (c.type) {
+        Candidate.Type.METRO -> R.drawable.ic_metro to Color(0xFF1AAE6F)
+        Candidate.Type.SHUTTLE -> R.drawable.ic_bus to Color(0xFFFF8A3D)
+        Candidate.Type.BUS -> R.drawable.ic_bus to Color(0xFF3D7BFF)
+    }
+    Icon(painterResource(res), null, tint = color, modifier = Modifier.size(22.dp))
 }
 
 @Composable
