@@ -245,8 +245,6 @@ private fun TripCard(
     onApplyLearned: (Learn.Suggestion) -> Unit,
 ) {
     val ctx = LocalContext.current
-    val adjusted = remember(trip) { Learn.lastAdjust(ctx, trip.id) }
-    val learnedDays = remember(trip) { Learn.samples(ctx, trip.id).size }
     Card(shape = RoundedCornerShape(24.dp), onClick = onEdit) {
         Column(Modifier.padding(start = 20.dp, end = 12.dp, top = 16.dp, bottom = 8.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -265,10 +263,6 @@ private fun TripCard(
             Text(
                 trip.legs.firstOrNull()?.stopName()?.let { "从 $it 上车" } ?: "",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Text(
-                adjusted ?: if (learnedDays < Learn.MIN_SAMPLES) "习惯学习中：已记 $learnedDays 天真实乘车" else "时间窗已贴合你的习惯",
-                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary,
             )
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
