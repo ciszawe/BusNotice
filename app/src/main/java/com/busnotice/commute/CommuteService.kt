@@ -126,7 +126,7 @@ class CommuteService : Service() {
         instance = this
         if (!manual) Diag.mark(this, "已自动启动")
         trip = t
-        legIdx = 0; boardedAt = 0L; nearSince = 0L; fastFixes = 0; alertedKey = null
+        legIdx = 0; boardedAt = 0L; nearSince = 0L; fastFixes = 0; alertedKey = null; planDone = false; planAlerted = ""
         maxStops.clear(); maxEta.clear()
         manualRun = manual; riding = false; transferAlerted = false; arriveAlertedAt = 0L
         speeds.clear(); routeHits.clear(); lastGpsFix = null
@@ -215,8 +215,11 @@ class CommuteService : Service() {
         return pts.any { Geo.distanceM(loc.latitude, loc.longitude, it.first, it.second) <= 400 }
     }
 
+    private var deadlineAt = 0L
+
     private suspend fun runLoop(deadline: Long) {
-        while (scope.isActive && System.currentTimeMillis() < deadline) {
+        deadlineAt = deadline
+        while (scope.isActive && System.currentTimeMillis() < deadlineAt) {
             val wait = try { tick() } catch (e: Exception) {
                 Log.w(TAG, "刷新失败", e); 20_000L
             }
@@ -295,6 +298,10 @@ class CommuteService : Service() {
             }.awaitAll()
         }
         val a = Decision.decide(options, connecting)
+        // 先坐地铁再换公交、还没出发：倒推「最晚几点走，到换乘站刚好赶上公交」
+        val plan = if (!planDone && legIdx == 0 && boardedAt == 0L && nearSince == 0L && leg.isMetroOnly())
+            runCatching { planTransfer(leg, options, secOfDay, loc) }.getOrNull() else null
+        if (plan != null) return planTick(plan, leg, a, now)
         val v = visual(a, leg, connecting, expectArrive, now)
         LiveNotifier.update(this, LiveNotifier.build(this, v))
         LiveState.snapshot.value = LiveSnapshot(
@@ -334,6 +341,72 @@ class CommuteService : Service() {
             hot || soonest < 600 -> 20_000L
             else -> 40_000L
         }
+    }
+
+    private var planAlerted = ""
+    private var planDone = false   // 提醒过「该走了」就不再倒推，改回正常的地铁进站显示
+
+    /** 第一段地铁 + 第二段有公交时，算出发方案；条件不满足返回 null（照常显示地铁） */
+    private suspend fun planTransfer(leg: Leg, options: List<Decision.Option>, secOfDay: Int, loc: Location?): List<Decision.Plan>? {
+        val next = trip.legs.getOrNull(1) ?: return null
+        val buses = next.candidates.filter { it.type == Candidate.Type.BUS }
+        if (buses.isEmpty()) return null
+        val c = leg.candidates.first()
+        val dirs = metroDirs["${c.stopName}|${c.name}"]?.filter { c.metroDir.isEmpty() || it.dest == c.metroDir } ?: return null
+        if (dirs.size != 1) return null // 方向不确定就不推，免得算错
+        val d = dirs.first()
+        val weekday = LocalDate.now().dayOfWeek.value <= 5
+        val peakNow = Decision.headwayAt(secOfDay / 60, weekday, 1, 2) == 1
+        val off = Learn.metroOffsetSec(this, Learn.metroKey(c, peakNow))
+        val trains = Decision.metroSchedule(secOfDay - off, d.firstMin, d.lastMin, weekday, c.peakHw(), c.offPeakHw(), 30)
+        val busArr = withContext(Dispatchers.IO) {
+            buses.map { b ->
+                async {
+                    val rt = runCatching { ChelaileApi.lineRealtime(b, b.lat, b.lng) }.getOrNull()
+                    Decision.extendBuses(b.label(), rt?.buses?.map { it.travelSec } ?: emptyList(), b.headwayMin * 60)
+                }
+            }.awaitAll().flatten()
+        }
+        if (busArr.isEmpty()) return null
+        val walk = options.minOfOrNull { it.walkSec } ?: 0
+        val plans = Decision.planDeparture(walk, trains, (rideMs(0) / 1000).toInt(), next.transferWalkMin * 60, busArr)
+        return plans.ifEmpty { null }
+    }
+
+    private fun clock(nowMs: Long, sec: Int): String =
+        java.time.Instant.ofEpochMilli(nowMs + sec * 1000L).atZone(java.time.ZoneId.systemDefault()).toLocalTime()
+            .let { "%02d:%02d".format(it.hour, it.minute) }
+
+    /** 显示「还能待多久」：倒计时到出发时间，10 分钟前和该走时各提醒一次 */
+    private fun planTick(plans: List<Decision.Plan>, leg: Leg, a: Decision.Advice, now: Long): Long {
+        val p = plans.first()
+        val c = leg.candidates.first()
+        val stay = Decision.mins(p.leaveSec)
+        val est = if (p.busEstimated) "约" else ""
+        val text = "${clock(now, p.leaveSec)} 出发 → ${c.label()} ${clock(now, p.trainSec)} → " +
+            "${p.busLabel} $est${clock(now, p.busSec)}（换乘等约 ${Decision.mins(p.waitSec)} 分）" +
+            (plans.getOrNull(1)?.let { " · 晚一班：${clock(now, it.leaveSec)} 走，赶 ${it.busLabel}" } ?: "")
+        val short = if (p.leaveSec <= 60) "该走了" else "待${stay}分"
+        val title = if (p.leaveSec <= 60) "该出发了 · ${c.stopName}" else "还能待 $stay 分钟"
+        val v = LiveNotifier.Visual(title, text, short, trip.name,
+            countdownTo = now + p.leaveSec * 1000L, metro = true, trackerRes = R.drawable.ic_metro)
+        LiveNotifier.update(this, LiveNotifier.build(this, v))
+        LiveState.snapshot.value = LiveSnapshot(
+            trip.id, trip.name, legIdx, trip.legs.size, leg.title(), short, text, a.mode, null, v.countdownTo,
+        )
+        val key = "${p.busLabel}@${(now / 1000 + p.trainSec) / 300}"
+        if (p.leaveSec in 0..660 && planAlerted != "$key|10" && planAlerted != "$key|0" && p.leaveSec > 120) {
+            planAlerted = "$key|10"
+            LiveNotifier.alert(this, "${Decision.mins(p.leaveSec)} 分钟后出发", text, metro = true)
+        } else if (p.leaveSec <= 120 && planAlerted != "$key|0") {
+            planAlerted = "$key|0"; planDone = true
+            LiveNotifier.alert(this, "该走了 · 去${c.stopName}", text, metro = true)
+        }
+        // 在公司多待一会：胶囊别在出发前就到期收起
+        val need = now + p.leaveSec * 1000L + trip.legs.sumOf { it.rideMin + it.transferWalkMin + 10 } * 60_000L
+        if (need > deadlineAt) deadlineAt = need
+        setPower(if (p.leaveSec < 300) Power.HIGH else Power.LOW)
+        return if (p.leaveSec < 600) 20_000L else 45_000L
     }
 
     /** 最后一段车上：快到下车站时提醒一次，到了就收起 */
