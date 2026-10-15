@@ -23,7 +23,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         LiveNotifier.ensureChannels(this)
         Scheduler.rescheduleAll(this)
-        setContent { AppTheme { App(resumeTick.intValue) } }
+        setContent { AppTheme { App(resumeTick.intValue); com.busnotice.commute.ui.UpdateDialog(resumeTick.intValue) } }
         handleStart(intent)
     }
 
