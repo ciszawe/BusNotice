@@ -149,17 +149,33 @@ class CommuteService : Service() {
         return end.plusMinutes(extra.toLong()).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
     }
 
+    /** 这段大概坐多久：实测攒够 3 次用实测中位数，否则用手填的 */
+    private fun rideMs(i: Int): Long =
+        (Learn.rideMin(this, trip.id, i) ?: trip.legs[i].rideMin) * 60_000L
+
+    /** 地铁段手动点「已上车」= 真实列车时刻，拿来修正推算 */
+    private fun learnMetro(leg: Leg) {
+        val c = leg.candidates.firstOrNull { it.isMetro() && it.metroDir.isNotEmpty() } ?: return
+        val d = metroDirs["${c.stopName}|${c.name}"]?.firstOrNull { it.dest == c.metroDir } ?: return
+        val nowSec = LocalTime.now().toSecondOfDay()
+        val weekday = LocalDate.now().dayOfWeek.value <= 5
+        val r = Decision.metroResidual(nowSec - 30, d.firstMin, d.lastMin, weekday, c.peakHw(), c.offPeakHw()) ?: return
+        val peak = Decision.headwayAt(nowSec / 60, weekday, 1, 2) == 1
+        Learn.recordMetro(this, Learn.metroKey(c, peak), r)
+    }
+
     /** 「已上车」按钮或速度判断：进入下一段；最后一段则进入「去下车站」，再按一次结束 */
-    fun onBoarded() {
+    fun onBoarded(manual: Boolean = true) {
         if (!::trip.isInitialized) { finish(); return }
         val now = System.currentTimeMillis()
+        if (manual && !riding && trip.legs[legIdx].isMetroOnly()) runCatching { learnMetro(trip.legs[legIdx]) }
         if (legIdx == 0 && boardedAt == 0L) Learn.record(this, trip.id, now)
         if (legIdx >= trip.legs.size - 1) {
             if (riding || alight == null) { finish(); return }
             riding = true; boardedAt = now; arriveAlertedAt = 0L
             speeds.clear(); routeHits.clear()
             loop?.cancel()
-            loop = scope.launch { runLoop(now + (trip.legs.last().rideMin + 20) * 60_000L) }
+            loop = scope.launch { runLoop(now + rideMs(trip.legs.size - 1) + 20 * 60_000L) }
             return
         }
         boardedAt = now
@@ -219,23 +235,28 @@ class CommuteService : Service() {
 
         val dists = leg.candidates.map { c -> loc?.let { Geo.distanceM(it.latitude, it.longitude, c.lat, c.lng) } }
         val nearest = dists.filterNotNull().minOrNull()
-        if (nearest != null && nearest <= NEAR_STOP_M && nearSince == 0L) nearSince = now
+        if (nearest != null && nearest <= NEAR_STOP_M && nearSince == 0L) {
+            nearSince = now
+            // 换乘到了：记下上一段实际坐了多久，下次推算换乘更准
+            if (prev != null && boardedAt > 0)
+                Learn.recordRide(this, trip.id, legIdx - 1, ((now - boardedAt) / 60_000L).toInt() - prev.transferWalkMin)
+        }
 
         // 换乘中：还在上一段车上，按「剩余乘车 + 换乘步行」估算到下一站的时间
-        val expectArrive = if (boardedAt > 0 && prev != null) boardedAt + prev.rideMin * 60_000L else 0L
+        val expectArrive = if (boardedAt > 0 && prev != null) boardedAt + rideMs(legIdx - 1) else 0L
         val connecting = expectArrive > 0 && nearSince == 0L && (nearest == null || nearest > 300) &&
             now < expectArrive + 5 * 60_000L
         val connectSec = if (connecting) (((expectArrive - now) / 1000).toInt().coerceAtLeast(0) + leg.transferWalkMin * 60) else 0
 
         // 地铁没有 GPS：到过站附近两分钟后，视为已上车
         if (leg.isMetroOnly() && nearSince > 0 && now - nearSince > 120_000) {
-            onBoarded(); return 1_000L
+            onBoarded(manual = false); return 1_000L
         }
         // 进了地铁站 GPS 就没了：最后一次卫星定位在站口 500 米内、之后 90 秒没信号 → 已进站
         val g = lastGpsFix
         if (leg.isMetroOnly() && g != null && now - g.time > 90_000 &&
             leg.candidates.any { Geo.distanceM(g.latitude, g.longitude, it.lat, it.lng) <= 500 }) {
-            onBoarded(); return 1_000L
+            onBoarded(manual = false); return 1_000L
         }
 
         val secOfDay = LocalTime.now().toSecondOfDay()
@@ -260,8 +281,10 @@ class CommuteService : Service() {
                                     ?.filter { ChelaileApi.sameLine(c.name, it) } ?: return@async Decision.Option(c, walk, emptyList())
                             }.filter { c.metroDir.isEmpty() || it.dest == c.metroDir }
                             val weekday = LocalDate.now().dayOfWeek.value <= 5
+                            val peakNow = Decision.headwayAt(secOfDay / 60, weekday, 1, 2) == 1
+                            val off = if (c.metroDir.isNotEmpty()) Learn.metroOffsetSec(this@CommuteService, Learn.metroKey(c, peakNow)) else 0
                             val arr = dirs.flatMap { d ->
-                                Decision.metroSchedule(secOfDay, d.firstMin, d.lastMin, weekday, c.peakHw(), c.offPeakHw())
+                                Decision.metroSchedule(secOfDay - off, d.firstMin, d.lastMin, weekday, c.peakHw(), c.offPeakHw())
                                     .map { Decision.Arrival(it, -1, if (dirs.size > 1) "往${d.dest}" else "", estimated = true) }
                             }
                             Decision.Option(c, walk, arr,
@@ -288,7 +311,7 @@ class CommuteService : Service() {
         }
         // 到换乘点：离下一段上车点 500 米内，或按乘车时间快到了，弹一次
         if (legIdx > 0 && boardedAt > 0 && !transferAlerted &&
-            ((nearest != null && nearest <= 500) || (connecting && now >= expectArrive - 90_000))) {
+            ((nearest != null && nearest <= 500) || (connecting && now >= expectArrive - 180_000))) {
             transferAlerted = true
             val c = a.option?.candidate
             LiveNotifier.alert(this, "快到换乘点 · 换${c?.label() ?: leg.title()}", a.detail,
@@ -319,7 +342,7 @@ class CommuteService : Service() {
         val metro = leg.isMetroOnly()
         val name = leg.candidates.firstOrNull { it.alightName.isNotEmpty() }?.alightName ?: "下车站"
         val d = loc?.let { Geo.distanceM(it.latitude, it.longitude, dest.first, dest.second) }
-        val eta = boardedAt + leg.rideMin * 60_000L
+        val eta = boardedAt + rideMs(legIdx)
         val near = d != null && d <= 700
         val timeUp = now >= eta - 90_000 && (d == null || d < 2_500)
         if (arriveAlertedAt == 0L && (near || timeUp)) {
@@ -329,7 +352,7 @@ class CommuteService : Service() {
         if (arriveAlertedAt > 0 && ((d != null && d <= 150) || now - arriveAlertedAt > 5 * 60_000L)) {
             finish(); return 60_000L
         }
-        val total = (leg.rideMin * 60_000L).coerceAtLeast(60_000L)
+        val total = rideMs(legIdx).coerceAtLeast(60_000L)
         val p = ((now - boardedAt) * 100 / total).toInt().coerceIn(0, 100)
         val left = ((eta - now) / 60_000L).toInt()
         val short = when {
@@ -362,7 +385,7 @@ class CommuteService : Service() {
 
         if (connecting) {
             val prev = trip.legs[legIdx - 1]
-            val total = prev.rideMin * 60_000L
+            val total = rideMs(legIdx - 1)
             val p = if (total > 0) (100 - (expectArrive - now) * 100 / total).toInt() else 50
             return LiveNotifier.Visual(title, a.detail, a.headline, sub,
                 countdownTo = arr?.let { now + it.etaSec * 1000L }, progress = p, stops = 0,
@@ -450,14 +473,14 @@ class CommuteService : Service() {
             if (nearSince == 0L && boardedAt == 0L && !trip.legs[legIdx].isMetroOnly() &&
                 Motion.classify(speeds.toList(), onLine) == Motion.State.RIDE) {
                 speeds.clear(); routeHits.clear()
-                onBoarded(); return
+                onBoarded(manual = false); return
             }
         }
 
         // 到过上车点、现在速度很快 → 大概率上车了
         if (nearSince > 0 && loc.hasSpeed() && loc.speed > 6f) {
             fastFixes++
-            if (fastFixes >= 3) onBoarded()
+            if (fastFixes >= 3) onBoarded(manual = false)
         } else if (loc.hasSpeed()) {
             fastFixes = 0
         }
