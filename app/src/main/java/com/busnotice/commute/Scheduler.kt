@@ -35,7 +35,7 @@ object Scheduler {
         if (plan.leaveMode() && inWindow(plan, LocalDateTime.now())) {
             scheduleWatch(ctx, plan, System.currentTimeMillis() + 60_000L)
         }
-        val at = nextTrigger(plan, LocalDateTime.now()) ?: return
+        val at = nextTrigger(plan, LocalDateTime.now(), ctx) ?: return
         val millis = at.atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
         if (am.canScheduleExactAlarms()) {
             am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, millis, pi)
@@ -72,20 +72,22 @@ object Scheduler {
         )
 
     /** 下一次「时间窗开始 - 预热」的时刻；如果此刻正处于窗口内，返回 null 由调用方立即启动 */
-    fun nextTrigger(plan: Trip, now: LocalDateTime): LocalDateTime? {
+    fun nextTrigger(plan: Trip, now: LocalDateTime, ctx: Context? = null): LocalDateTime? {
         for (d in 0..7) {
             val day: LocalDate = now.toLocalDate().plusDays(d.toLong())
             val bit = 1 shl (day.dayOfWeek.value - 1) // 周一=bit0
             if (plan.dayMask and bit == 0) continue
             val warm = if (plan.leaveMode()) 0 else plan.warmupMin
-            val t = day.atStartOfDay().plusMinutes((plan.startMinute - warm).toLong())
+            // 学到了这天通常几点走：晚点再弹，不在公司白挂着胶囊
+            val learned = if (ctx != null && !plan.leaveMode()) Learn.learnedStart(ctx, plan, day.dayOfWeek.value) else null
+            val t = day.atStartOfDay().plusMinutes((learned ?: (plan.startMinute - warm)).toLong())
             if (t.isAfter(now)) return t
         }
         return null
     }
 
-    fun nextTriggerText(plan: Trip): String {
-        val t = nextTrigger(plan, LocalDateTime.now()) ?: return "未安排"
+    fun nextTriggerText(plan: Trip, ctx: Context? = null): String {
+        val t = nextTrigger(plan, LocalDateTime.now(), ctx) ?: return "未安排"
         val days = arrayOf("周一", "周二", "周三", "周四", "周五", "周六", "周日")
         val today = LocalDate.now()
         val dayText = when (t.toLocalDate()) {
@@ -97,7 +99,8 @@ object Scheduler {
             if (inWindow(plan, LocalDateTime.now())) return "正在留意你离开出发地"
             return "$dayText %02d:%02d 起留意离开出发地".format(t.hour, t.minute)
         }
-        return "$dayText %02d:%02d 预热".format(t.hour, t.minute)
+        val learned = ctx != null && Learn.learnedStart(ctx, plan, t.dayOfWeek.value) != null
+        return "$dayText %02d:%02d ${if (learned) "按你的习惯弹出" else "预热"}".format(t.hour, t.minute)
     }
 
     private fun alarmIntent(ctx: Context, planId: String): PendingIntent =
