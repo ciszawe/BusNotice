@@ -23,11 +23,16 @@ data class Candidate(
     val departures: List<Int> = emptyList(),
     // 地铁：发车间隔（分钟）
     val headwayMin: Int = 0,
+    // 下车站坐标（WGS-84，用于到站提醒；NaN 表示运行时再查）
+    val alightLat: Double = Double.NaN,
+    val alightLng: Double = Double.NaN,
 ) {
     enum class Type { BUS, SHUTTLE, METRO }
 
+    fun isMetro() = type == Type.METRO
+
     fun label() = when (type) {
-        Type.BUS -> "${name}路"
+        Type.BUS -> if (looksLikeMetro(name) || name.endsWith("线")) name else "${name}路"
         Type.SHUTTLE -> name
         Type.METRO -> name.ifEmpty { "地铁" }
     }
@@ -37,9 +42,22 @@ data class Candidate(
         .put("lat", lat).put("lng", lng).put("cityId", cityId).put("lineId", lineId)
         .put("stationId", stationId).put("endSn", endSn).put("targetOrder", targetOrder)
         .put("alightName", alightName).put("departures", JSONArray(departures)).put("headwayMin", headwayMin)
+        .apply { if (!alightLat.isNaN() && !alightLng.isNaN()) put("alightLat", alightLat).put("alightLng", alightLng) }
 
     companion object {
-        fun fromJson(o: JSONObject): Candidate {
+        private val METRO_RE = Regex("^(地铁)?\\s*\\d+\\s*号线|地铁|机场线|城际")
+
+        /** 车来了把地铁也当线路返回，名字像「4号线」 */
+        fun looksLikeMetro(name: String) = METRO_RE.containsMatchIn(name)
+
+        fun fromJson(o: JSONObject): Candidate = normalize(parse(o))
+
+        /** 旧数据里被当成公交加进来的地铁线，自动改成地铁 */
+        fun normalize(c: Candidate): Candidate =
+            if (c.type == Type.BUS && looksLikeMetro(c.name)) c.copy(type = Type.METRO, headwayMin = c.headwayMin.takeIf { it > 0 } ?: 7)
+            else c
+
+        private fun parse(o: JSONObject): Candidate {
             val deps = o.optJSONArray("departures")
             return Candidate(
                 type = runCatching { Type.valueOf(o.getString("type")) }.getOrDefault(Type.BUS),
@@ -50,6 +68,7 @@ data class Candidate(
                 targetOrder = o.optInt("targetOrder", -1), alightName = o.optString("alightName"),
                 departures = if (deps == null) emptyList() else (0 until deps.length()).map { deps.getInt(it) },
                 headwayMin = o.optInt("headwayMin"),
+                alightLat = o.optDouble("alightLat"), alightLng = o.optDouble("alightLng"),
             )
         }
     }
@@ -90,7 +109,13 @@ data class Trip(
     val endMinute: Int = 8 * 60 + 30,
     val warmupMin: Int = 10,
     val enabled: Boolean = true,
+    // 「离开这里才弹」：时间窗内每几分钟粗定位一次，走出这个范围才启动胶囊；半径 0 = 不用
+    val leaveLat: Double = Double.NaN,
+    val leaveLng: Double = Double.NaN,
+    val leaveRadiusM: Int = 0,
 ) {
+    fun leaveMode() = leaveRadiusM > 0 && !leaveLat.isNaN() && !leaveLng.isNaN()
+
     fun timeText() = "%02d:%02d–%02d:%02d".format(startMinute / 60, startMinute % 60, endMinute / 60, endMinute % 60)
     fun daysText(): String {
         if (dayMask == 0b0011111) return "工作日"
@@ -105,6 +130,8 @@ data class Trip(
         .put("legs", JSONArray().apply { legs.forEach { put(it.toJson()) } })
         .put("dayMask", dayMask).put("startMinute", startMinute).put("endMinute", endMinute)
         .put("warmupMin", warmupMin).put("enabled", enabled)
+        .put("leaveRadiusM", leaveRadiusM)
+        .apply { if (!leaveLat.isNaN() && !leaveLng.isNaN()) put("leaveLat", leaveLat).put("leaveLng", leaveLng) }
 
     companion object {
         fun fromJson(o: JSONObject): Trip {
@@ -115,6 +142,8 @@ data class Trip(
                 dayMask = o.optInt("dayMask", 0b0011111),
                 startMinute = o.optInt("startMinute", 480), endMinute = o.optInt("endMinute", 510),
                 warmupMin = o.optInt("warmupMin", 10), enabled = o.optBoolean("enabled", true),
+                leaveLat = o.optDouble("leaveLat"), leaveLng = o.optDouble("leaveLng"),
+                leaveRadiusM = o.optInt("leaveRadiusM", 0),
             )
         }
     }
