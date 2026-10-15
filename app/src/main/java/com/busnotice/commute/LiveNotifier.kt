@@ -42,6 +42,7 @@ object LiveNotifier {
         val trackerRes: Int = R.drawable.ic_bus,
         val endRes: Int = R.drawable.ic_stop,
         val metro: Boolean = false,
+        val riding: Boolean = false,        // 已在车上：不再显示「已上车」
     )
 
     fun ensureChannels(ctx: Context) {
@@ -165,8 +166,8 @@ object LiveNotifier {
             .setCategory(NotificationCompat.CATEGORY_NAVIGATION)
             .setContentIntent(openApp(ctx))
             .setDeleteIntent(actionIntent(ctx, ActionReceiver.ACTION_STOP)) // 划走 = 关闭
-            .addAction(0, "已上车", actionIntent(ctx, ActionReceiver.ACTION_BOARDED))
-            .addAction(0, "关闭", actionIntent(ctx, ActionReceiver.ACTION_STOP))
+            .apply { if (!v.riding) addAction(0, "已上车", actionIntent(ctx, ActionReceiver.ACTION_BOARDED)) }
+            .addAction(0, if (v.riding) "结束" else "关闭", actionIntent(ctx, ActionReceiver.ACTION_STOP))
 
     private fun openApp(ctx: Context) = PendingIntent.getActivity(
         ctx, 0, Intent(ctx, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
