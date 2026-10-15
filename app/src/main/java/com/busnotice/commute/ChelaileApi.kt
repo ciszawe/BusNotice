@@ -187,6 +187,52 @@ object ChelaileApi {
         return null
     }
 
+    data class MetroStation(val name: String, val lat: Double, val lng: Double)   // WGS-84
+    data class MetroRoute(val stations: List<MetroStation>, val durSec: Int) {
+        val hops get() = stations.size - 1
+    }
+
+    /**
+     * 地铁这段途经哪些站：用换乘规划接口，取第一段就是这条地铁的方案，
+     * 返回上车站、途经站、下车站（含坐标）和预计乘车秒数。拿不到返回 null。
+     */
+    fun metroRoute(c: Candidate, toName: String, toLat: Double, toLng: Double): MetroRoute? {
+        val (oLat, oLng) = Geo.wgsToGcj(c.lat, c.lng)
+        val (dLat, dLng) = Geo.wgsToGcj(toLat, toLng)
+        val d = signedGet(
+            "/api/transfer/transit!integrate.action",
+            linkedMapOf(
+                "cityId" to c.cityId, "localCityId" to c.cityId,
+                "origin_name" to c.stopName, "origin_lat" to "%.6f".format(oLat), "origin_lng" to "%.6f".format(oLng),
+                "dest_name" to toName, "dest_lat" to "%.6f".format(dLat), "dest_lng" to "%.6f".format(dLng),
+                "gpstype" to "gcj", "geo_type" to "gcj", "strategy" to "0", "isSelectTime" to "0",
+                "departure_time" to System.currentTimeMillis().toString(),
+            )
+        )
+        val plans = d.optJSONObject("route")?.optJSONArray("transits") ?: return null
+        val want = c.name.replace("地铁", "").trim()
+        fun pt(o: JSONObject?): MetroStation? {
+            val loc = o?.optString("location")?.split(",") ?: return null
+            if (loc.size != 2) return null
+            val (la, ln) = Geo.gcjToWgs(loc[1].toDouble(), loc[0].toDouble())
+            return MetroStation(o.optString("name"), la, ln)
+        }
+        for (pi in 0 until plans.length()) {
+            val segs = plans.getJSONObject(pi).optJSONArray("segments") ?: continue
+            val rides = (0 until segs.length()).mapNotNull { segs.getJSONObject(it).optJSONObject("bus")?.optJSONArray("buslines")?.optJSONObject(0) }
+            val l = rides.singleOrNull() ?: continue            // 只要「一趟地铁直达」的方案
+            if (l.optInt("lineType") != 1 || !l.optString("name").replace("地铁", "").contains(want)) continue
+            val list = mutableListOf<MetroStation>()
+            pt(l.optJSONObject("departure_stop"))?.let { list += it } ?: continue
+            val via = l.optJSONArray("via_stops")
+            if (via != null) for (k in 0 until via.length()) pt(via.optJSONObject(k))?.let { list += it }
+            pt(l.optJSONObject("arrival_stop"))?.let { list += it } ?: continue
+            val dur = l.optString("duration").toIntOrNull() ?: continue
+            if (list.size >= 2) return MetroRoute(list, dur)
+        }
+        return null
+    }
+
     /** 线路名是否对得上：「4号线」「地铁4号线」都算 */
     fun sameLine(name: String, d: SubwayDir): Boolean {
         val n = name.replace("地铁", "").trim()
