@@ -30,6 +30,7 @@ object Scheduler {
         val am = ctx.getSystemService(AlarmManager::class.java)
         val pi = alarmIntent(ctx, plan.id)
         am.cancel(pi)
+        GeoWatch.register(ctx, plan)
         if (!plan.enabled || plan.dayMask == 0 || plan.legs.isEmpty()) return
         // 「离开某地才弹」：保存时正好在窗口里，一分钟后就开始留意
         if (plan.leaveMode() && inWindow(plan, LocalDateTime.now())) {
@@ -48,6 +49,7 @@ object Scheduler {
     fun cancel(ctx: Context, planId: String) {
         val am = ctx.getSystemService(AlarmManager::class.java)
         am.cancel(alarmIntent(ctx, planId)); am.cancel(watchIntent(ctx, planId))
+        GeoWatch.unregister(ctx, planId)
     }
 
     fun inWindow(plan: Trip, now: LocalDateTime): Boolean {
