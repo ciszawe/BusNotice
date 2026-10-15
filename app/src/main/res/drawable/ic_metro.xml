@@ -1,7 +1,9 @@
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="24dp" android:height="24dp"
-    android:viewportWidth="24" android:viewportHeight="24">
-    <!-- 圆形里镂空一个 M：地铁标志，和公交的大巴剪影明显不同 -->
-    <path android:fillColor="#FFFFFFFF" android:fillType="evenOdd"
-        android:pathData="M12,1.5a10.5,10.5 0,1 0,0.01 0zM6.5,17.5V6.5h2.3L12,11.4l3.2,-4.9h2.3v11h-2.2v-7.2L12,15.1l-3.3,-4.8v7.2z" />
+    android:viewportWidth="960" android:viewportHeight="960">
+    <!-- Material Symbols「subway」（Apache-2.0）：隧道里的列车，和公交大巴剪影区分 -->
+    <group android:translateY="960">
+        <path android:fillColor="#FFFFFFFF"
+            android:pathData="M80,-160v-446q0,-85 44,-147.5T248,-848q54,-21 115,-26.5t117,-5.5q56,0 117,5.5T712,-848q80,32 124,94.5T880,-606v446q0,33 -23.5,56.5T800,-80H160q-33,0 -56.5,-23.5T80,-160Zm220,-280v-160h360v160H300Zm320,140q-17,0 -28.5,-11.5T580,-340q0,-17 11.5,-28.5T620,-380q17,0 28.5,11.5T660,-340q0,17 -11.5,28.5T620,-300Zm-280,0q-17,0 -28.5,-11.5T300,-340q0,-17 11.5,-28.5T340,-380q17,0 28.5,11.5T380,-340q0,17 -11.5,28.5T340,-300Zm84,80h110l51,51q5,5 10.5,7t11.5,2q20,0 27.5,-19t-6.5,-33l-10,-10q44,-6 73,-39.5t29,-78.5v-260q0,-78 -70,-99t-170,-21q-91,0 -165.5,21T240,-600v260q0,45 29,78.5t73,39.5l-11,11q-14,14 -6.5,32.5T352,-160q6,0 11,-2t10,-7l51,-51Z" />
+    </group>
 </vector>
