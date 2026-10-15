@@ -166,11 +166,11 @@ fun TripEditor(
                     }
                     Spacer(Modifier.height(6.dp))
                     if (trip.leaveMode()) {
-                        Text("时间窗内每 4 分钟粗定位一次，走出这个范围就自动弹出。适合下班时间不固定：时间窗可以放宽，比如 17:30 到 22:00。",
+                        Text("时间窗内每 2 分钟粗定位一次，走出这个范围就自动弹出。适合下班时间不固定：时间窗可以放宽，比如 17:30 到 22:00。",
                             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                         Spacer(Modifier.height(6.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
-                            listOf(200, 300, 500).forEach { r ->
+                            listOf(100, 150, 200, 300).forEach { r ->
                                 FilterChip(selected = trip.leaveRadiusM == r, onClick = { onChange(trip.copy(leaveRadiusM = r)) },
                                     label = { Text("$r 米") })
                             }
