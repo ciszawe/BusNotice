@@ -108,7 +108,8 @@ class CommuteService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val id = intent?.getStringExtra(EXTRA_TRIP_ID)
+        // intent 为空 = 被系统杀掉后自动拉起：接着跑中断前那趟
+        val id = intent?.getStringExtra(EXTRA_TRIP_ID) ?: savedRunTrip()
         val t = id?.let { TripStore.get(this, it) }
         LiveNotifier.ensureChannels(this)
         try {
@@ -122,7 +123,7 @@ class CommuteService : Service() {
             stopSelf(); return START_NOT_STICKY
         }
         if (t == null || t.legs.isEmpty()) { finish(); return START_NOT_STICKY }
-        val manual = intent.getBooleanExtra(EXTRA_MANUAL, false)
+        val manual = intent?.getBooleanExtra(EXTRA_MANUAL, false) ?: false
 
         instance = this
         if (!manual) Diag.mark(this, "已自动启动")
@@ -136,8 +137,9 @@ class CommuteService : Service() {
         setPower(Power.HIGH) // 预热：先拿到一个准的位置
         scope.launch(Dispatchers.IO) { prefetchMetroStops(t); prefetch(t) }
         loop?.cancel()
-        loop = scope.launch { runLoop(deadline(t, manual)) }
-        return START_NOT_STICKY
+        val resumedDl = restoreRun(t)
+        loop = scope.launch { runLoop(resumedDl ?: deadline(t, manual)) }
+        return START_STICKY
     }
 
     private fun deadline(t: Trip, manual: Boolean): Long {
@@ -239,7 +241,8 @@ class CommuteService : Service() {
         val now = at
         stationAt = 0L
         if (manual && !riding && trip.legs[legIdx].isMetroOnly()) runCatching { learnMetro(trip.legs[legIdx]) }
-        if (legIdx == 0 && boardedAt == 0L) Learn.record(this, trip.id, now)
+        // 只学自动启动的行程：手动点开测试的不算习惯
+        if (legIdx == 0 && boardedAt == 0L && !manualRun) Learn.record(this, trip.id, now)
         if (legIdx >= trip.legs.size - 1) {
             if (riding) return            // 已经在车上：重复点「已上车」不做任何事
             if (alight == null) { finish(); return }
@@ -248,7 +251,9 @@ class CommuteService : Service() {
             ridingCand = l.candidates.firstOrNull { it.isMetro() }.takeIf { l.isMetroOnly() } ?: lastCand ?: l.candidates.firstOrNull()
             speeds.clear(); routeHits.clear()
             loop?.cancel()
-            loop = scope.launch { runLoop(now + rideMs(trip.legs.size - 1) + 20 * 60_000L) }
+            val dl = now + rideMs(trip.legs.size - 1) + 20 * 60_000L
+            loop = scope.launch { runLoop(dl) }
+            saveRun(dl)
             return
         }
         boardedAt = now
@@ -257,7 +262,9 @@ class CommuteService : Service() {
         alightAt = 0L; rideLearned = false; stopAlerted = ""; stepSensor(false)
         maxStops.clear(); maxEta.clear(); speeds.clear(); routeHits.clear()
         loop?.cancel()
-        loop = scope.launch { runLoop(deadline(trip, false).coerceAtLeast(now + 20 * 60_000L)) }
+        val dl = deadline(trip, false).coerceAtLeast(now + 20 * 60_000L)
+        loop = scope.launch { runLoop(dl) }
+        saveRun(dl)
     }
 
     /** 后台预取：沿线站点（判断是否在车上）和最后一段的下车站坐标（到站提醒） */
@@ -336,7 +343,7 @@ class CommuteService : Service() {
                 else -> null
             }
             if (by != null) {
-                alightAt = now; stepSensor(false)
+                alightAt = now; stepSensor(false); saveRun(deadlineAt)
                 Log.i(TAG, "判断已下地铁：$by")
                 if (by != "time" && !rideLearned) {
                     rideLearned = true
@@ -714,7 +721,45 @@ class CommuteService : Service() {
         }
     }
 
+    // ---------- 中断恢复：把进行到哪一段存下来，App 被杀/重开后接着跑 ----------
+    private fun runPrefs() = getSharedPreferences("run_state", MODE_PRIVATE)
+
+    private fun saveRun(deadline: Long) {
+        runPrefs().edit()
+            .putString("trip", trip.id).putInt("leg", legIdx).putLong("boardedAt", boardedAt)
+            .putBoolean("riding", riding).putLong("alightAt", alightAt).putLong("deadline", deadline)
+            .putString("ridingCand", ridingCand?.let { "${it.name}|${it.stopName}" } ?: "")
+            .putBoolean("manual", manualRun).apply()
+    }
+
+    private fun clearRun() = runPrefs().edit().clear().apply()
+
+    private fun savedRunTrip(): String? = runPrefs().let { p ->
+        p.getString("trip", null)?.takeIf { p.getLong("deadline", 0) > System.currentTimeMillis() }
+    }
+
+    /** 有同一趟行程的未结束进度就恢复，返回原来的截止时间；没有返回 null */
+    private fun restoreRun(t: Trip): Long? {
+        val p = runPrefs()
+        val dl = p.getLong("deadline", 0)
+        if (p.getString("trip", null) != t.id || dl <= System.currentTimeMillis()) { clearRun(); return null }
+        val leg = p.getInt("leg", 0)
+        if (leg !in t.legs.indices || p.getLong("boardedAt", 0) <= 0) { clearRun(); return null }
+        legIdx = leg
+        boardedAt = p.getLong("boardedAt", 0)
+        riding = p.getBoolean("riding", false)
+        alightAt = p.getLong("alightAt", 0)
+        manualRun = p.getBoolean("manual", manualRun)
+        rideLearned = true // 中断过的这趟不再学乘车时长，免得样本不准
+        val rc = p.getString("ridingCand", "") ?: ""
+        ridingCand = t.legs[leg].candidates.firstOrNull { "${it.name}|${it.stopName}" == rc }
+            ?: if (riding) t.legs[leg].candidates.firstOrNull() else null
+        Diag.mark(this, "已恢复中断前的行程：第 ${leg + 1} 段${if (riding) "（车上）" else ""}")
+        return dl
+    }
+
     private fun finish() {
+        clearRun()
         try { lm?.removeUpdates(listener) } catch (_: Exception) { }
         stepSensor(false)
         power = null; highSince = 0L; coolUntil = 0L
