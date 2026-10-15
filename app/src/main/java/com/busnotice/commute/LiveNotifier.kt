@@ -103,7 +103,10 @@ object LiveNotifier {
         else -> res
     }
 
+    @Volatile var last: Notification? = null
+
     fun update(ctx: Context, n: Notification) {
+        last = n
         if (NotificationManagerCompat.from(ctx).areNotificationsEnabled()) {
             try {
                 NotificationManagerCompat.from(ctx).notify(LIVE_ID, n)
@@ -165,7 +168,8 @@ object LiveNotifier {
             .setRequestPromotedOngoing(true)
             .setCategory(NotificationCompat.CATEGORY_NAVIGATION)
             .setContentIntent(openApp(ctx))
-            .setDeleteIntent(actionIntent(ctx, ActionReceiver.ACTION_STOP)) // 划走 = 关闭
+            // 划走不等于结束：系统或别的应用的流体云把它挤掉时也会走这里，几秒后重新挂上；要结束请点「结束/关闭」
+            .setDeleteIntent(actionIntent(ctx, ActionReceiver.ACTION_DISMISSED))
             .apply { if (!v.riding) addAction(0, "已上车", actionIntent(ctx, ActionReceiver.ACTION_BOARDED)) }
             .addAction(0, if (v.riding) "结束" else "关闭", actionIntent(ctx, ActionReceiver.ACTION_STOP))
 
