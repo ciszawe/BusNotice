@@ -333,7 +333,8 @@ fun MetroPicker(onBack: () -> Unit, onPicked: (Candidate) -> Unit) {
     var searching by remember { mutableStateOf(false) }
     var chosen by remember { mutableStateOf<ChelaileApi.SearchStation?>(null) }
     var lineName by remember { mutableStateOf("") }
-    var headway by remember { mutableStateOf(6) }
+    var headway by remember { mutableStateOf(5) }
+    var offPeak by remember { mutableStateOf(8) }
     var alight by remember { mutableStateOf("") }
 
     LaunchedEffect(query) {
@@ -366,18 +367,50 @@ fun MetroPicker(onBack: () -> Unit, onPicked: (Candidate) -> Unit) {
             }
         }
     } else {
+        var dirs by remember(c) { mutableStateOf<List<ChelaileApi.SubwayDir>?>(null) }
+        var dir by remember(c) { mutableStateOf("") }
+        LaunchedEffect(c) {
+            dirs = withContext(Dispatchers.IO) { runCatching { ChelaileApi.subwayDirs(c.lat, c.lng, c.name) }.getOrNull() } ?: emptyList()
+        }
         PickerScaffold("${c.name} 上车", { chosen = null }) {
             item {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    OutlinedTextField(lineName, { lineName = it }, label = { Text("线路，如 2号线") }, singleLine = true,
+                    val ds = dirs
+                    val lines = ds?.map { it.shortName.ifEmpty { it.line } }?.distinct().orEmpty()
+                    if (lines.isNotEmpty()) {
+                        Text("线路", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            lines.forEach { l ->
+                                FilterChip(selected = lineName == l, onClick = { lineName = l; dir = "" }, label = { Text(l) })
+                            }
+                        }
+                    } else {
+                        OutlinedTextField(lineName, { lineName = it }, label = { Text("线路，如 2号线") }, singleLine = true,
+                            modifier = Modifier.fillMaxWidth())
+                    }
+                    val lineDirs = ds.orEmpty().filter { ChelaileApi.sameLine(lineName, it) }
+                    if (lineDirs.isNotEmpty()) {
+                        Text("方向", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.primary)
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            lineDirs.forEach { d ->
+                                FilterChip(selected = dir == d.dest, onClick = { dir = d.dest },
+                                    label = { Text("开往 ${d.dest}") })
+                            }
+                        }
+                        Text("本站首班 " + lineDirs.joinToString("，") { "往${it.dest} ${hhmm(it.firstMin.coerceAtLeast(0))}" },
+                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    OutlinedTextField(alight, { alight = it }, label = { Text("下车站（可选，用于到站提醒和回程）") }, singleLine = true,
                         modifier = Modifier.fillMaxWidth())
-                    OutlinedTextField(alight, { alight = it }, label = { Text("下车站（可选，用于生成回程）") }, singleLine = true,
-                        modifier = Modifier.fillMaxWidth())
-                    Stepper("大约几分钟一班", headway, 1, 30) { headway = it }
+                    Stepper("高峰几分钟一班", headway, 1, 30) { headway = it }
+                    Stepper("平峰几分钟一班", offPeak, 1, 30) { offPeak = it }
+                    Text("车来了没有地铁实时位置，按本站首班 + 间隔推算，显示为「约 X 分」。高峰指工作日 7–9 点、17–19:30。",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Button(onClick = {
                         onPicked(Candidate(
                             type = Candidate.Type.METRO, name = lineName.trim().ifEmpty { "地铁" },
-                            stopName = c.name, lat = c.lat, lng = c.lng, headwayMin = headway, alightName = alight.trim(),
+                            stopName = c.name, lat = c.lat, lng = c.lng, headwayMin = headway, offPeakHeadwayMin = offPeak,
+                            metroDir = dir, alightName = alight.trim(),
                         ))
                     }, modifier = Modifier.fillMaxWidth()) { Text("添加") }
                 }
