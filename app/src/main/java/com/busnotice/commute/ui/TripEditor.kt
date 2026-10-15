@@ -201,6 +201,7 @@ fun TripEditor(
                     onAddShuttle = { onEditShuttle(i, -1) },
                     onEditShuttle = { ci -> onEditShuttle(i, ci) },
                     learnedRide = remember(trip.id, i) { Learn.rideMin(ctx, trip.id, i) },
+                    nextStop = trip.legs.getOrNull(i + 1)?.candidates?.firstOrNull(),
                     onSplit = {
                         // 一段里上车站不同的几条线 → 按上车站拆成先后几段（地铁在前）
                         val groups = leg.candidates.groupBy { it.stopName }.values
@@ -249,6 +250,7 @@ private fun Section(title: String, content: @Composable () -> Unit) {
 @Composable
 private fun LegCard(
     onSplit: () -> Unit = {},
+    nextStop: Candidate? = null,
     index: Int, leg: Leg, isLast: Boolean,
     onChange: (Leg) -> Unit, onRemove: () -> Unit,
     onAddBus: () -> Unit, onAddMetro: () -> Unit, onAddShuttle: () -> Unit, onEditShuttle: (Int) -> Unit,
@@ -322,12 +324,27 @@ private fun LegCard(
                 AssistChip(onClick = onAddShuttle, label = { Text("+ 通勤车") })
                 AssistChip(onClick = onAddMetro, label = { Text("+ 地铁") })
             }
-            Stepper(if (isLast) "大约坐多久（快到下车站时提醒）" else "这段大约坐多久", leg.rideMin, 1, 120) {
+            // 地铁段：按站数自动估，手填的只在拿不到数据时兜底
+            val metro = leg.candidates.firstOrNull { it.isMetro() }.takeIf { leg.isMetroOnly() }
+            var autoStops by remember(metro, nextStop) { mutableStateOf<Int?>(null) }
+            LaunchedEffect(metro, nextStop) {
+                if (metro != null && nextStop != null) autoStops = withContext(Dispatchers.IO) {
+                    runCatching {
+                        val dirs = ChelaileApi.subwayDirs(metro.lat, metro.lng, metro.stopName, metro.cityId)
+                            .filter { ChelaileApi.sameLine(metro.name, it) && (metro.metroDir.isEmpty() || it.dest == metro.metroDir) }
+                        ChelaileApi.metroStops(dirs, nextStop.lat, nextStop.lng, metro.cityId)
+                    }.getOrNull()
+                }
+            }
+            Stepper(if (isLast) "大约坐多久（快到下车站时提醒）" else if (metro != null) "拿不到站数时按这个算" else "这段大约坐多久",
+                leg.rideMin, 1, 120) {
                 onChange(leg.copy(rideMin = it))
             }
-            learnedRide?.let {
-                Text("实测通常坐 $it 分钟，推算时按实测来", style = MaterialTheme.typography.bodySmall,
+            when {
+                learnedRide != null -> Text("实测通常坐 $learnedRide 分钟，推算时按实测来", style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.primary)
+                autoStops != null -> Text("自动：共 $autoStops 站，约 ${(autoStops!! * 140 + 60 + 59) / 60} 分钟；坐满 3 次后改用你的实测用时",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
             }
         }
     }
