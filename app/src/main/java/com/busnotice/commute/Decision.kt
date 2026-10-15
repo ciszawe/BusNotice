@@ -21,6 +21,11 @@ object Geo {
     private const val A = 6378245.0
     private const val EE = 0.00669342162296594323
 
+    fun wgsToGcj(lat: Double, lng: Double): Pair<Double, Double> {
+        val (dLat, dLng) = delta(lat, lng)
+        return Pair(lat + dLat, lng + dLng)
+    }
+
     fun gcjToWgs(lat: Double, lng: Double): Pair<Double, Double> {
         val (dLat, dLng) = delta(lat, lng)
         return Pair(lat - dLat, lng - dLng)
