@@ -104,9 +104,12 @@ object LiveNotifier {
     }
 
     @Volatile var last: Notification? = null
+    /** 用户划掉了胶囊：行程照常在后台跑，但先不显示，等下一次提醒（到站、该出发、换乘）或打开 App 再出来 */
+    @Volatile var hidden = false
 
     fun update(ctx: Context, n: Notification) {
         last = n
+        if (hidden) return
         if (NotificationManagerCompat.from(ctx).areNotificationsEnabled()) {
             try {
                 NotificationManagerCompat.from(ctx).notify(LIVE_ID, n)
@@ -116,6 +119,7 @@ object LiveNotifier {
 
     /** 需要马上出发 / 换乘紧张时，额外弹一条横幅并震动 */
     fun alert(ctx: Context, title: String, text: String, metro: Boolean = false, id: Int = ALERT_ID) {
+        unhide(ctx)
         val n = NotificationCompat.Builder(ctx, CHANNEL_ALERT)
             .setSmallIcon(if (metro) R.drawable.ic_metro else R.drawable.ic_bus)
             .setColor(if (metro) GREEN else BLUE)
@@ -130,6 +134,13 @@ object LiveNotifier {
         try {
             NotificationManagerCompat.from(ctx).notify(id, n)
         } catch (_: SecurityException) { }
+    }
+
+    /** 重新显示胶囊（有提醒或打开 App 时） */
+    fun unhide(ctx: Context) {
+        if (!hidden) return
+        hidden = false
+        last?.let { update(ctx, it) }
     }
 
     /** 后台启动被系统拦截时的兜底：普通提醒，点一下在前台启动 */
@@ -168,7 +179,7 @@ object LiveNotifier {
             .setRequestPromotedOngoing(true)
             .setCategory(NotificationCompat.CATEGORY_NAVIGATION)
             .setContentIntent(openApp(ctx))
-            // 划走不等于结束：系统或别的应用的流体云把它挤掉时也会走这里，几秒后重新挂上；要结束请点「结束/关闭」
+            // 划走不等于结束：先隐藏，下次提醒再出来；要结束请点「结束/关闭」
             .setDeleteIntent(actionIntent(ctx, ActionReceiver.ACTION_DISMISSED))
             .apply { if (!v.riding) addAction(0, "已上车", actionIntent(ctx, ActionReceiver.ACTION_BOARDED)) }
             .addAction(0, if (v.riding) "结束" else "关闭", actionIntent(ctx, ActionReceiver.ACTION_STOP))
