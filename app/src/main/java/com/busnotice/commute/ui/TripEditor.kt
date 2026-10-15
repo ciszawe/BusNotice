@@ -27,6 +27,7 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
@@ -200,6 +201,13 @@ fun TripEditor(
                     onAddShuttle = { onEditShuttle(i, -1) },
                     onEditShuttle = { ci -> onEditShuttle(i, ci) },
                     learnedRide = remember(trip.id, i) { Learn.rideMin(ctx, trip.id, i) },
+                    onSplit = {
+                        // 一段里上车站不同的几条线 → 按上车站拆成先后几段（地铁在前）
+                        val groups = leg.candidates.groupBy { it.stopName }.values
+                            .sortedBy { g -> if (g.any { it.type == Candidate.Type.METRO }) 0 else 1 }
+                        val parts = groups.mapIndexed { k, g -> Leg(g, rideMin = leg.rideMin, transferWalkMin = if (k == 0) leg.transferWalkMin else 3) }
+                        onChange(trip.copy(legs = trip.legs.toMutableList().also { l -> l.removeAt(i); l.addAll(i, parts) }))
+                    },
                 )
             }
             item {
@@ -240,6 +248,7 @@ private fun Section(title: String, content: @Composable () -> Unit) {
 
 @Composable
 private fun LegCard(
+    onSplit: () -> Unit = {},
     index: Int, leg: Leg, isLast: Boolean,
     onChange: (Leg) -> Unit, onRemove: () -> Unit,
     onAddBus: () -> Unit, onAddMetro: () -> Unit, onAddShuttle: () -> Unit, onEditShuttle: (Int) -> Unit,
@@ -264,8 +273,18 @@ private fun LegCard(
                 Stepper("从上一段下车走过来", leg.transferWalkMin, 0, 30) { onChange(leg.copy(transferWalkMin = it)) }
             }
             if (leg.candidates.isEmpty()) {
-                Text("同一处上车的几种车都可以加进来，哪个先到提示哪个", style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("同一处上车的几种车都可以加进来，哪个先到提示哪个；先坐 A 再换 B 请用下面的「添加一段（换乘）」",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            if (leg.candidates.map { it.stopName }.distinct().size > 1) {
+                Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp)) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text("这一段里的线路是「二选一」：哪个先到提示哪个。它们上车站不同，如果你是先坐一个再换另一个，应该拆成两段。",
+                            style = MaterialTheme.typography.bodySmall)
+                        TextButton(onClick = onSplit) { Text("拆成换乘（按上车站分段）") }
+                    }
+                }
             }
             leg.candidates.forEachIndexed { ci, c ->
                 Row(
