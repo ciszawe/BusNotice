@@ -64,6 +64,13 @@ import kotlinx.coroutines.withContext
 
 // ------------------------------------------------------------------ 公共小部件
 
+/** 公交加「路」，地铁线（车来了里也能查到）标出「地铁」 */
+fun lineText(name: String) = when {
+    Candidate.looksLikeMetro(name) -> "$name · 地铁"
+    name.endsWith("线") -> name
+    else -> "${name}路"
+}
+
 @Composable
 private fun PickerScaffold(title: String, onBack: () -> Unit, content: LazyListScope.() -> Unit) {
     Scaffold(
@@ -162,12 +169,16 @@ fun BusPicker(onBack: () -> Unit, onPicked: (Candidate) -> Unit) {
         }
     }
 
-    fun finish(d: ChelaileApi.LineDetail, b: ChelaileApi.StopPoint, alight: String) = onPicked(
-        Candidate(
-            type = Candidate.Type.BUS, name = d.name, stopName = b.name, lat = b.lat, lng = b.lng,
-            lineId = d.lineId, stationId = b.sId, endSn = d.endSn, targetOrder = b.order, alightName = alight,
-        )
-    )
+    fun finish(d: ChelaileApi.LineDetail, b: ChelaileApi.StopPoint, alight: String): Unit {
+        val a = d.stations.firstOrNull { it.name == alight && it.order > b.order }
+        onPicked(Candidate.normalize(
+            Candidate(
+                type = Candidate.Type.BUS, name = d.name, stopName = b.name, lat = b.lat, lng = b.lng,
+                lineId = d.lineId, stationId = b.sId, endSn = d.endSn, targetOrder = b.order, alightName = alight,
+                alightLat = a?.lat ?: Double.NaN, alightLng = a?.lng ?: Double.NaN,
+            )
+        ))
+    }
 
     when (val s = stage) {
         BusStage.Search -> PickerScaffold("添加公交", onBack) {
@@ -206,7 +217,7 @@ fun BusPicker(onBack: () -> Unit, onPicked: (Candidate) -> Unit) {
                         if (lines.isNotEmpty()) header("线路")
                         items(lines) { l ->
                             ListItem(
-                                headlineContent = { Text("${l.name}路", fontWeight = FontWeight.SemiBold) },
+                                headlineContent = { Text(lineText(l.name), fontWeight = FontWeight.SemiBold) },
                                 supportingContent = { Text(l.dirs.first().let { "${it.startSn} ⇄ ${it.endSn}" }) },
                                 modifier = Modifier.clickable { stage = BusStage.Line(l.name, l.dirs, 0) },
                             )
@@ -246,7 +257,7 @@ fun BusPicker(onBack: () -> Unit, onPicked: (Candidate) -> Unit) {
                         header(if (ps.size > 1) "站台 ${i + 1}" else "经过的线路")
                         items(p.lines) { l ->
                             ListItem(
-                                headlineContent = { Text("${l.name}路", fontWeight = FontWeight.SemiBold) },
+                                headlineContent = { Text(lineText(l.name), fontWeight = FontWeight.SemiBold) },
                                 supportingContent = { Text("开往 ${l.endSn}") },
                                 modifier = Modifier.clickable { board(l.lineId, l.targetOrder, p.sId) },
                             )
@@ -264,7 +275,7 @@ fun BusPicker(onBack: () -> Unit, onPicked: (Candidate) -> Unit) {
                 detail = withContext(Dispatchers.IO) { runCatching { ChelaileApi.lineDetail(dir.lineId) }.getOrNull() }
                 failed = detail == null
             }
-            PickerScaffold("${s.name}路 · 选上车站", { stage = BusStage.Search }) {
+            PickerScaffold("${lineText(s.name)} · 选上车站", { stage = BusStage.Search }) {
                 if (s.dirs.size > 1) item {
                     FlowRow(Modifier.padding(horizontal = 16.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         s.dirs.forEachIndexed { i, d ->
@@ -291,7 +302,7 @@ fun BusPicker(onBack: () -> Unit, onPicked: (Candidate) -> Unit) {
         is BusStage.Alight -> PickerScaffold("在哪下车？", { stage = BusStage.Search }) {
             item {
                 Column(Modifier.padding(16.dp)) {
-                    Text("${s.detail.name}路 · ${s.board.name} 上车 · 开往 ${s.detail.endSn}",
+                    Text("${lineText(s.detail.name)} · ${s.board.name} 上车 · 开往 ${s.detail.endSn}",
                         style = MaterialTheme.typography.titleMedium)
                     Spacer(Modifier.height(4.dp))
                     Text("选了下车站就能一键生成回程，也可以跳过", style = MaterialTheme.typography.bodySmall,
