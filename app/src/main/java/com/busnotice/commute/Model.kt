@@ -21,8 +21,10 @@ data class Candidate(
     val alightName: String = "", // 下车站（可选，用于生成回程）
     // 通勤车：一天中的发车分钟数
     val departures: List<Int> = emptyList(),
-    // 地铁：发车间隔（分钟）
+    // 地铁：高峰发车间隔（分钟）、平峰间隔（0 = 按高峰 ×1.5）、方向（终点站名，空 = 不分方向）
     val headwayMin: Int = 0,
+    val offPeakHeadwayMin: Int = 0,
+    val metroDir: String = "",
     // 下车站坐标（WGS-84，用于到站提醒；NaN 表示运行时再查）
     val alightLat: Double = Double.NaN,
     val alightLng: Double = Double.NaN,
@@ -30,6 +32,8 @@ data class Candidate(
     enum class Type { BUS, SHUTTLE, METRO }
 
     fun isMetro() = type == Type.METRO
+    fun peakHw() = headwayMin.takeIf { it > 0 } ?: 6
+    fun offPeakHw() = offPeakHeadwayMin.takeIf { it > 0 } ?: ((peakHw() * 3 + 1) / 2)
 
     fun label() = when (type) {
         Type.BUS -> if (looksLikeMetro(name) || name.endsWith("线")) name else "${name}路"
@@ -42,6 +46,7 @@ data class Candidate(
         .put("lat", lat).put("lng", lng).put("cityId", cityId).put("lineId", lineId)
         .put("stationId", stationId).put("endSn", endSn).put("targetOrder", targetOrder)
         .put("alightName", alightName).put("departures", JSONArray(departures)).put("headwayMin", headwayMin)
+        .put("offPeakHeadwayMin", offPeakHeadwayMin).put("metroDir", metroDir)
         .apply { if (!alightLat.isNaN() && !alightLng.isNaN()) put("alightLat", alightLat).put("alightLng", alightLng) }
 
     companion object {
@@ -68,6 +73,7 @@ data class Candidate(
                 targetOrder = o.optInt("targetOrder", -1), alightName = o.optString("alightName"),
                 departures = if (deps == null) emptyList() else (0 until deps.length()).map { deps.getInt(it) },
                 headwayMin = o.optInt("headwayMin"),
+                offPeakHeadwayMin = o.optInt("offPeakHeadwayMin"), metroDir = o.optString("metroDir"),
                 alightLat = o.optDouble("alightLat"), alightLng = o.optDouble("alightLng"),
             )
         }
