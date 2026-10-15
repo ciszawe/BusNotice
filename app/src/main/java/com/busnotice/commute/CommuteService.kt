@@ -96,6 +96,7 @@ class CommuteService : Service() {
     private var transferAlerted = false
     private var arriveAlertedAt = 0L
     @Volatile private var alight: Pair<Double, Double>? = null
+    private val metroDirs = java.util.concurrent.ConcurrentHashMap<String, List<ChelaileApi.SubwayDir>>()
     private val routes = java.util.concurrent.ConcurrentHashMap<String, List<Pair<Double, Double>>>() // lineId → 沿线站点
     private val speeds = ArrayDeque<Float>()
     private val routeHits = ArrayDeque<Boolean>()
@@ -253,13 +254,18 @@ class CommuteService : Service() {
                         }
                         Candidate.Type.SHUTTLE -> Decision.Option(c, walk, Decision.shuttleArrivals(c, secOfDay))
                         Candidate.Type.METRO -> {
-                            // 车来了里查得到的地铁线：有列车实时位置就用实时，没有再用「上一班过站」+ 间隔估
-                            val rt = if (c.lineId.isEmpty()) null else runCatching {
-                                ChelaileApi.lineRealtime(c, loc?.latitude ?: c.lat, loc?.longitude ?: c.lng)
-                            }.getOrNull()
-                            Decision.Option(c, walk,
-                                rt?.buses?.map { Decision.Arrival(it.travelSec, it.stopsAway, it.busId) } ?: emptyList(),
-                                rt?.tip ?: "")
+                            // 车来了没有地铁列车实时位置：按本站该方向首末班 + 高峰/平峰间隔推算
+                            val dirs = metroDirs.getOrPut("${c.stopName}|${c.name}") {
+                                runCatching { ChelaileApi.subwayDirs(c.lat, c.lng, c.stopName, c.cityId) }.getOrNull()
+                                    ?.filter { ChelaileApi.sameLine(c.name, it) } ?: return@async Decision.Option(c, walk, emptyList())
+                            }.filter { c.metroDir.isEmpty() || it.dest == c.metroDir }
+                            val weekday = LocalDate.now().dayOfWeek.value <= 5
+                            val arr = dirs.flatMap { d ->
+                                Decision.metroSchedule(secOfDay, d.firstMin, d.lastMin, weekday, c.peakHw(), c.offPeakHw())
+                                    .map { Decision.Arrival(it, -1, if (dirs.size > 1) "往${d.dest}" else "", estimated = true) }
+                            }
+                            Decision.Option(c, walk, arr,
+                                if (dirs.isNotEmpty() && arr.isEmpty()) Decision.END_OF_SERVICE else "")
                         }
                     }
                 }
