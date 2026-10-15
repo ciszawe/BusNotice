@@ -63,7 +63,7 @@ object Learn {
         suggest(samples(ctx, trip.id))?.takeIf { it.start != trip.startMinute || it.end != trip.endMinute }
 
     // ---------- 每段实际坐多久（从上车到走近下一段上车点，减掉换乘步行） ----------
-    private const val RIDE = "learn_ride"
+    private const val RIDE = "learn_ride2"  // v2：旧样本的上车时刻记早了，作废
 
     fun recordRide(ctx: Context, tripId: String, legIdx: Int, minutes: Int) {
         if (minutes !in 1..180) return
