@@ -82,7 +82,11 @@ class CommuteService : Service() {
                 .onSuccess { Diag.mark(ctx, "胶囊不见了，已重新拉起") }
         }
 
+        /** 用户主动结束：清掉进度，不再恢复 */
         fun stop(ctx: Context) {
+            val svc = instance
+            if (svc != null) { svc.userFinish(); return }
+            ctx.getSharedPreferences("run_state", Context.MODE_PRIVATE).edit().clear().apply()
             ctx.stopService(Intent(ctx, CommuteService::class.java))
         }
     }
@@ -137,7 +141,9 @@ class CommuteService : Service() {
         val manual = intent?.getBooleanExtra(EXTRA_MANUAL, false) ?: false
 
         instance = this
-        if (!manual) Diag.mark(this, "已自动启动")
+        LiveNotifier.hidden = false
+        if (intent == null) Diag.mark(this, "服务被系统杀掉后自动重启")
+        else if (!manual) Diag.mark(this, "已自动启动")
         trip = t
         stationAt = 0L; metroRideSec.clear(); metroRoutes.clear(); alightAt = 0L; fenceFixes.clear(); stillSince = 0L; lastFastAt = 0L; rideLearned = false; stopAlerted = ""
         legIdx = 0; boardedAt = 0L; nearSince = 0L; fastFixes = 0; alertedKey = null; planDone = false; planAlerted = ""
@@ -866,7 +872,12 @@ class CommuteService : Service() {
         return dl
     }
 
+    private var finishing = false
+
+    fun userFinish() { scope.launch(Dispatchers.Main) { loop?.cancel(); finish() } }
+
     private fun finish() {
+        finishing = true
         clearRun()
         try { lm?.removeUpdates(listener) } catch (_: Exception) { }
         stepSensor(false)
@@ -876,7 +887,13 @@ class CommuteService : Service() {
         stopSelf()
     }
 
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        Diag.mark(this, "App 从最近任务里被划掉（服务应继续）")
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
+        if (!finishing) Diag.mark(this, "服务被系统停止（非主动结束）")
         try { lm?.removeUpdates(listener) } catch (_: Exception) { }
         if (instance === this) instance = null
         LiveState.snapshot.value = null
@@ -897,11 +914,9 @@ class ActionReceiver : BroadcastReceiver() {
         when {
             intent.action == ACTION_BOARDED && svc != null -> svc.onBoarded()
             intent.action == ACTION_DISMISSED -> {
-                // 被划掉或被挤掉：行程照常进行，3 秒后把胶囊重新挂上
-                if (svc != null) android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                    if (CommuteService.instance != null) LiveNotifier.last?.let { LiveNotifier.update(ctx, it) }
-                }, 3_000)
-                else CommuteService.resumeIfNeeded(ctx)
+                // 被划掉（或被系统移除）：行程照常进行，胶囊先隐藏，等下一次提醒或打开 App 再出来
+                Diag.mark(ctx, "胶囊被移除（划掉或系统移除），行程继续在后台")
+                if (svc != null) LiveNotifier.hidden = true
             }
             intent.action == ACTION_STOP -> CommuteService.stop(ctx)
             else -> CommuteService.stop(ctx)
