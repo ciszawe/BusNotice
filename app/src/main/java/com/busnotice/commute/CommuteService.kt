@@ -146,6 +146,8 @@ class CommuteService : Service() {
         else if (!manual) Diag.mark(this, "已自动启动")
         trip = t
         startedAt = System.currentTimeMillis()
+        runCatching { TraceLog.start(this, t.id, t.name) }
+        TraceLog.event("run", "manual" to manual, "restart" to (intent == null))
         stationAt = 0L; metroRideSec.clear(); metroRoutes.clear(); alightAt = 0L; fenceFixes.clear(); stillSince = 0L; lastFastAt = 0L; rideLearned = false; stopAlerted = ""
         legIdx = 0; boardedAt = 0L; nearSince = 0L; fastFixes = 0; alertedKey = null; planDone = false; planAlerted = ""
         maxStops.clear(); maxEta.clear()
@@ -307,6 +309,7 @@ class CommuteService : Service() {
     fun onBoarded(manual: Boolean = true, at: Long = System.currentTimeMillis()) {
         if (!::trip.isInitialized) { finish(); return }
         val now = at
+        TraceLog.event("boarded", "leg" to legIdx, "manual" to manual, "at" to at, "riding" to riding)
         stationAt = 0L
         if (manual && !riding && trip.legs[legIdx].isMetroOnly()) runCatching { learnMetro(trip.legs[legIdx]) }
         // 只学自动启动的行程：手动点开测试的不算习惯；先挂起，确认真的坐了一段才记（commitBoard）
@@ -447,6 +450,7 @@ class CommuteService : Service() {
             if (by != null) {
                 alightAt = now; stepSensor(false); saveRun(deadlineAt)
                 Log.i(TAG, "判断已下地铁：$by")
+                TraceLog.event("alight_detect", "leg" to legIdx - 1, "by" to by)
                 if (by != "time" && !rideLearned) {
                     rideLearned = true
                     Learn.recordRide(this, trip.id, legIdx - 1, ((now - boardedAt) / 60_000L).toInt())
@@ -855,6 +859,7 @@ class CommuteService : Service() {
     }
 
     private fun onLocation(loc: Location) {
+        TraceLog.loc(loc)
         val spd = speedOf(loc)
         val cur = best
         val fresher = cur == null || loc.time - cur.time > 15_000
@@ -950,9 +955,15 @@ class CommuteService : Service() {
         }
     }
 
-    fun userFinish() { scope.launch(Dispatchers.Main) { loop?.cancel(); finish() } }
+    /** 用户点「结束」：这是真实到站/放弃的时刻，记录下来作为对照 */
+    fun userFinish() {
+        TraceLog.event("user_end", "leg" to legIdx, "riding" to riding)
+        scope.launch(Dispatchers.Main) { loop?.cancel(); finish() }
+    }
 
     private fun finish() {
+        TraceLog.event("finish", "leg" to legIdx, "riding" to riding)
+        TraceLog.stop()
         finishing = true
         clearRun()
         try { lm?.removeUpdates(listener) } catch (_: Exception) { }
@@ -969,7 +980,7 @@ class CommuteService : Service() {
     }
 
     override fun onDestroy() {
-        if (!finishing) Diag.mark(this, "服务被系统停止（非主动结束）")
+        if (!finishing) { Diag.mark(this, "服务被系统停止（非主动结束）"); TraceLog.stop() }
         try { lm?.removeUpdates(listener) } catch (_: Exception) { }
         if (instance === this) instance = null
         LiveState.snapshot.value = null
