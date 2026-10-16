@@ -387,6 +387,9 @@ class CommuteService : Service() {
         val loc = best?.takeIf { it.accuracy < 200 && now - it.time < 120_000 }
         if (riding) return rideTick(leg, loc, now)
 
+        // 按位置纠正进度：人已经在后面某一段的上车站附近、离当前这段的站很远，说明前面几段已经坐完了（没识别到上车）
+        if (loc != null && loc.accuracy < 150) jumpByLocation(loc, now)?.let { return it }
+
         val dists = leg.candidates.map { c -> loc?.let { Geo.distanceM(it.latitude, it.longitude, c.lat, c.lng) } }
         val nearest = dists.filterNotNull().minOrNull()
         if (nearest != null && nearest <= NEAR_STOP_M && nearSince == 0L) {
@@ -565,6 +568,22 @@ class CommuteService : Service() {
             hot || soonest < 600 -> 20_000L
             else -> 40_000L
         }
+    }
+
+    /** 后面哪一段的上车站离现在位置 250 米内、当前段的站都在 600 米外，就直接跳到那一段；跳了返回下一次 tick 间隔 */
+    private fun jumpByLocation(loc: Location, now: Long): Long? {
+        fun near(l: Leg) = l.candidates.filter { !it.lat.isNaN() }
+            .minOfOrNull { Geo.distanceM(loc.latitude, loc.longitude, it.lat, it.lng) } ?: Double.MAX_VALUE
+        if (near(trip.legs[legIdx]) < 600) return null
+        val k = (legIdx + 1 until trip.legs.size).firstOrNull { near(trip.legs[it]) <= 250 } ?: return null
+        Diag.mark(this, "定位显示已到第 ${k + 1} 段上车站附近，跳过前面的段")
+        // 第一段上车时间按「现在 - 这段通常乘车时长」估，供学习用；中间段直接过
+        val firstAt = if (legIdx == 0 && boardedAt == 0L) now - rideMs(0) else now
+        onBoarded(manual = false, at = firstAt)
+        while (legIdx < k) onBoarded(manual = false, at = now)
+        // 已经下车站在换乘点：不再按乘车时间倒数
+        boardedAt = now - rideMs(k - 1); alightAt = now; rideLearned = true
+        return 1_000L
     }
 
     private var planAlerted = ""
@@ -800,7 +819,21 @@ class CommuteService : Service() {
         Log.i(TAG, "定位档位 $p: $providers")
     }
 
+    private var lastFixForSpeed: Location? = null
+
+    /** 网络/融合定位常常不带速度：用前后两次定位自己算 */
+    private fun speedOf(loc: Location): Float? {
+        if (loc.hasSpeed()) return loc.speed
+        val p = lastFixForSpeed
+        if (loc.accuracy < 100) lastFixForSpeed = Location(loc)
+        if (p == null || loc.accuracy >= 100) return null
+        val dt = (loc.time - p.time) / 1000.0
+        if (dt < 5 || dt > 120) return null
+        return (Geo.distanceM(p.latitude, p.longitude, loc.latitude, loc.longitude) / dt).toFloat()
+    }
+
     private fun onLocation(loc: Location) {
+        val spd = speedOf(loc)
         val cur = best
         val fresher = cur == null || loc.time - cur.time > 15_000
         if (fresher || loc.accuracy <= cur!!.accuracy) best = loc
@@ -808,8 +841,8 @@ class CommuteService : Service() {
         if (!::trip.isInitialized || riding) return
 
         // 中途才打开：还没到过上车点、但速度像坐车且贴着这条线走 → 说明已经在车上了
-        if (loc.hasSpeed()) {
-            speeds.addLast(loc.speed); if (speeds.size > 5) speeds.removeFirst()
+        if (spd != null) {
+            speeds.addLast(spd); if (speeds.size > 5) speeds.removeFirst()
             routeHits.addLast(onRoute(loc, trip.legs[legIdx])); if (routeHits.size > 5) routeHits.removeFirst()
             val onLine = routeHits.size >= 3 && routeHits.toList().takeLast(3).all { it }
             if (nearSince == 0L && boardedAt == 0L && !trip.legs[legIdx].isMetroOnly() &&
@@ -820,10 +853,10 @@ class CommuteService : Service() {
         }
 
         // 到过上车点、现在速度很快 → 大概率上车了
-        if (nearSince > 0 && loc.hasSpeed() && loc.speed > 6f) {
+        if (nearSince > 0 && spd != null && spd > 6f) {
             fastFixes++
             if (fastFixes >= 3) onBoarded(manual = false)
-        } else if (loc.hasSpeed()) {
+        } else if (spd != null) {
             fastFixes = 0
         }
     }
@@ -873,6 +906,26 @@ class CommuteService : Service() {
     }
 
     private var finishing = false
+
+    /** 打开 App：马上定一次位，按最新位置重算一遍（纠正段落、刷新胶囊） */
+    @SuppressLint("MissingPermission")
+    fun relocate() {
+        val m = lm ?: getSystemService(LocationManager::class.java).also { lm = it } ?: return
+        var kicked = false
+        listOf(LocationManager.NETWORK_PROVIDER, LocationManager.GPS_PROVIDER).forEach { pr ->
+            runCatching {
+                if (!m.isProviderEnabled(pr)) return@runCatching
+                m.getCurrentLocation(pr, null, mainExecutor) { l ->
+                    if (l == null || !::trip.isInitialized) return@getCurrentLocation
+                    onLocation(l)
+                    if (!kicked || pr == LocationManager.GPS_PROVIDER) {
+                        kicked = true
+                        loop?.cancel(); loop = scope.launch { runLoop(deadlineAt) }
+                    }
+                }
+            }
+        }
+    }
 
     fun userFinish() { scope.launch(Dispatchers.Main) { loop?.cancel(); finish() } }
 
