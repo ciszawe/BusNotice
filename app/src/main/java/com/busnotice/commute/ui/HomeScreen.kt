@@ -2,6 +2,8 @@
 
 package com.busnotice.commute.ui
 
+import androidx.compose.foundation.clickable
+
 import android.Manifest
 import android.app.AlarmManager
 import android.app.NotificationManager
@@ -116,9 +118,15 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
             if (perms.isNotEmpty()) item { PermCard(perms) }
             com.busnotice.commute.Diag.last(ctx)?.let { d ->
                 item {
-                    Text("最近一次自动启动：$d", style = MaterialTheme.typography.bodySmall,
+                    Text("最近状态：$d", style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(horizontal = 4.dp))
                 }
+            }
+            item(key = "ver") {
+                Text("build-${com.busnotice.commute.Updater.currentBuild(ctx)} · 检查更新",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(horizontal = 4.dp)
+                        .clickable { com.busnotice.commute.Updater.force.intValue++ })
             }
             if (trips.isEmpty()) item {
                 Column(Modifier.fillMaxWidth().padding(vertical = 48.dp), horizontalAlignment = Alignment.CenterHorizontally) {
