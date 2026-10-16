@@ -150,6 +150,7 @@ class CommuteService : Service() {
         runCatching { TraceLog.start(this, t.id, t.name) }
         TraceLog.event("run", "manual" to manual, "restart" to (intent == null))
         stationAt = 0L; metroRideSec.clear(); metroRoutes.clear(); alightAt = 0L; fenceFixes.clear(); stillSince = 0L; lastFastAt = 0L; rideLearned = false; stopAlerted = ""
+        stationByTap = false; arriveAnchorAt = 0L
         legIdx = 0; boardedAt = 0L; nearSince = 0L; fastFixes = 0; alertedKey = null; planDone = false; planAlerted = ""
         maxStops.clear(); maxEta.clear()
         manualRun = manual; pendingBoardAt = 0L; pendingBoardLoc = null; boardCommitted = false; riding = false; transferAlerted = false; arriveAlertedAt = 0L
@@ -326,7 +327,8 @@ class CommuteService : Service() {
             ridingCand = l.candidates.firstOrNull { it.isMetro() }.takeIf { l.isMetroOnly() } ?: lastCand ?: l.candidates.firstOrNull()
             speeds.clear(); routeHits.clear()
             loop?.cancel()
-            val dl = now + rideMs(trip.legs.size - 1) + 20 * 60_000L
+            val dl = maxOf(at, System.currentTimeMillis()) + rideMs(trip.legs.size - 1) + 20 * 60_000L
+            deadlineAt = dl   // 先同步更新，紧接着的 kick()/saveRun() 才不会用旧截止时间
             loop = scope.launch { runLoop(dl) }
             saveRun(dl)
             return
@@ -335,6 +337,7 @@ class CommuteService : Service() {
         legIdx++
         nearSince = 0L; fastFixes = 0; alertedKey = null; transferAlerted = false
         alightAt = 0L; rideLearned = false; stopAlerted = ""; stepSensor(false)
+        stationByTap = false; arriveAnchorAt = 0L
         fenceFixes.clear(); stillSince = 0L; lastFastAt = 0L
         maxStops.clear(); maxEta.clear(); speeds.clear(); routeHits.clear()
         loop?.cancel()
@@ -410,7 +413,7 @@ class CommuteService : Service() {
         }
 
         // 换乘中：还在上一段车上，按「剩余乘车 + 换乘步行」估算到下一站的时间
-        val expectArrive = if (boardedAt > 0 && prev != null) boardedAt + rideMs(legIdx - 1) else 0L
+        val expectArrive = if (boardedAt > 0 && prev != null) (anchoredArrive(legIdx - 1) ?: (boardedAt + rideMs(legIdx - 1))) else 0L
         val fromMetro = prev?.isMetroOnly() == true
         // 判断下了地铁：地理围栏（换乘站附近）+ 移动速度 + 计步，三者配合
         if (fromMetro && expectArrive > 0 && alightAt == 0L) {
@@ -687,7 +690,7 @@ class CommuteService : Service() {
             ?: leg.candidates.firstOrNull { it.alightName.isNotEmpty() }?.alightName ?: "下车站"
         val lineTitle = rc?.label() ?: leg.title()
         val d = if (dest == null) null else loc?.let { Geo.distanceM(it.latitude, it.longitude, dest.first, dest.second) }
-        val eta = boardedAt + rideMs(legIdx)
+        val eta = anchoredArrive(legIdx) ?: (boardedAt + rideMs(legIdx))
         val near = d != null && d <= 700 && (loc?.accuracy ?: 9999f) < 400
         // 地铁段还没拿到站数（服务刚恢复、预取没完成）时，手填的乘车时间不可靠，先不按时间提醒下车
         val etaKnown = !metro || metroRideSec[legIdx] != null || Learn.rideMin(this, trip.id, legIdx) != null
@@ -749,7 +752,8 @@ class CommuteService : Service() {
             val p = if (total > 0) (100 - (expectArrive - now) * 100 / total).toInt() else 50
             val r = metroRoutes[legIdx - 1]
             if (r != null && now < expectArrive) {
-                val (next, left) = MetroRoutes.progress(r, now - boardedAt, total)
+                val (next, left) = if (arriveAnchorAt > 0) r.stations.last().name to 1
+                    else MetroRoutes.progress(r, now - boardedAt, total)
                 val line = prev.candidates.firstOrNull { it.isMetro() }?.label() ?: prev.title()
                 return LiveNotifier.Visual("$line · 下一站 $next", "还有 $left 站到 ${r.stations.last().name} · ${a.detail}",
                     a.headline, sub, countdownTo = arr?.let { now + it.etaSec * 1000L }, progress = p,
@@ -895,7 +899,7 @@ class CommuteService : Service() {
     private fun saveRun(deadline: Long) {
         runPrefs().edit()
             .putString("trip", trip.id).putInt("leg", legIdx).putLong("boardedAt", boardedAt)
-            .putBoolean("riding", riding).putLong("alightAt", alightAt).putLong("deadline", deadline)
+            .putBoolean("riding", riding).putLong("alightAt", alightAt).putLong("deadline", deadline).putLong("anchorAt", arriveAnchorAt)
             .putString("ridingCand", ridingCand?.let { "${it.name}|${it.stopName}" } ?: "")
             .putBoolean("manual", manualRun)
             .putLong("pendBoard", pendingBoardAt).putBoolean("boardDone", boardCommitted)
@@ -919,6 +923,7 @@ class CommuteService : Service() {
         boardedAt = p.getLong("boardedAt", 0)
         riding = p.getBoolean("riding", false)
         alightAt = p.getLong("alightAt", 0)
+        arriveAnchorAt = p.getLong("anchorAt", 0)
         manualRun = p.getBoolean("manual", manualRun)
         pendingBoardAt = p.getLong("pendBoard", 0L); boardCommitted = p.getBoolean("boardDone", false)
         pendingBoardLoc = (p.getString("pendLoc", "") ?: "").split(',').takeIf { it.size == 2 }?.let { (a, b) ->
@@ -958,6 +963,20 @@ class CommuteService : Service() {
     }
 
     private var restored = false
+    private var stationByTap = false   // 进站时刻来自刷卡（比定位推断准）
+    private var arriveAnchorAt = 0L    // 收到「准备下车」：列车刚离开下车站的前一站
+
+    /** 最后一站间大概要跑多久：按两站距离估，查不到按 2 分钟 */
+    private fun lastHopMs(i: Int): Long {
+        val st = metroRoutes[i]?.stations
+        if (st == null || st.size < 2) return 120_000L
+        val a = st[st.size - 2]; val b = st.last()
+        val d = Geo.distanceM(a.lat, a.lng, b.lat, b.lng)
+        return (60_000L + (d / 16.7 * 1000).toLong()).coerceIn(90_000L, 300_000L)
+    }
+
+    /** 有「准备下车」锚点时，预计开门时刻；没有返回 null */
+    private fun anchoredArrive(i: Int): Long? = arriveAnchorAt.takeIf { it > 0 }?.let { it + lastHopMs(i) }
 
     /** 别的 App 的出行通知（NFC 刷卡进/出站、系统到站提醒）：比定位和时间推算都准，直接校准进度 */
     fun onTransitSignal(kind: TransitSignal.Kind, text: String, at: Long) {
@@ -975,7 +994,8 @@ class CommuteService : Service() {
         when (kind) {
             TransitSignal.Kind.ENTER -> {
                 if (riding) return
-                if (trip.legs[legIdx].isMetroOnly() && stationAt > 0 && at - stationAt < 10 * 60_000L) return
+                // 已经按刷卡进过站：同一次进站的重复通知不算；之前只是定位推断的，用刷卡时刻覆盖
+                if (trip.legs[legIdx].isMetroOnly() && stationByTap && stationAt > 0 && at - stationAt < 10 * 60_000L) return
                 if (!trip.legs[legIdx].isMetroOnly()) {
                     val k = (legIdx + 1..last).firstOrNull { trip.legs[it].isMetroOnly() } ?: return
                     val firstAt = if (legIdx == 0 && boardedAt == 0L) at - rideMs(0) else at
@@ -983,7 +1003,7 @@ class CommuteService : Service() {
                     while (legIdx < k) onBoarded(manual = false, at = at)
                     boardedAt = at - rideMs(k - 1); alightAt = at; rideLearned = true
                 }
-                stationAt = at   // 刷卡时刻就是进站时刻，按它之后第一班车算上车
+                stationAt = at; stationByTap = true   // 刷卡时刻就是进站时刻，按它之后第一班车算上车
                 Diag.mark(this, "刷卡进站，切到地铁段")
                 kick()
             }
@@ -1007,12 +1027,30 @@ class CommuteService : Service() {
                 }
                 kick()
             }
+            TransitSignal.Kind.APPROACH -> Unit
             TransitSignal.Kind.ARRIVE -> {
-                if (!riding || arriveAlertedAt > 0L) return
-                val name = trip.legs[legIdx].candidates.firstOrNull { it.alightName.isNotEmpty() }?.alightName ?: return
-                if (!text.contains(name.removeSuffix("站"))) return
-                arriveAlertedAt = System.currentTimeMillis()
-                LiveNotifier.alert(this, "快到 $name 了", "准备下车", metro = trip.legs[legIdx].isMetroOnly(), id = 1005)
+                // 「准备下车」= 列车刚离开前一站、快到下车站了；只当锚点，不当下车
+                if (arriveAnchorAt > 0 && at - arriveAnchorAt < 10 * 60_000L) return
+                fun alightName(i: Int) = trip.legs[i].candidates.firstOrNull { it.alightName.isNotEmpty() }?.alightName
+                fun matches(i: Int) = alightName(i)?.let { text.contains(it.removeSuffix("站")) } == true
+                val cur = trip.legs[legIdx]
+                // 我们还以为在站台等车：说明其实已经上车了，先按进站后第一班车切过去
+                if (cur.isMetroOnly() && !riding && stationAt > 0 && matches(legIdx)) {
+                    onBoarded(manual = false, at = nextTrainAfter(cur, stationAt) ?: stationAt)
+                }
+                val metroIdx = when {
+                    riding && trip.legs[legIdx].isMetroOnly() && matches(legIdx) -> legIdx
+                    !riding && legIdx > 0 && trip.legs[legIdx - 1].isMetroOnly() && alightAt == 0L && matches(legIdx - 1) -> legIdx - 1
+                    else -> return
+                }
+                arriveAnchorAt = at
+                TraceLog.event("arrive_anchor", "leg" to metroIdx, "expect" to (at + lastHopMs(metroIdx)))
+                Diag.mark(this, "快到${alightName(metroIdx)}，按播报校准")
+                if (metroIdx == legIdx && arriveAlertedAt == 0L) {
+                    arriveAlertedAt = System.currentTimeMillis()
+                    LiveNotifier.alert(this, "快到 ${alightName(legIdx)} 了", "准备下车", metro = true, id = 1005)
+                }
+                saveRun(deadlineAt)
                 kick()
             }
         }
