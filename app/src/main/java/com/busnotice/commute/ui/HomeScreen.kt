@@ -326,6 +326,11 @@ private fun missingPerms(ctx: Context, request: (Array<String>) -> Unit): List<P
             open(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
         }
     }
+    if (!com.busnotice.commute.TransitA11y.enabled(ctx)) {
+        out += Perm("出行识别（可选）", "无障碍：行程中读系统出行胶囊、交通卡弹窗的文字，只记在本机") {
+            open(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        }
+    }
     if (!ctx.getSystemService(AlarmManager::class.java).canScheduleExactAlarms()) {
         out += Perm("精确闹钟", "准时预热") { open(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, pkg)) }
     }
