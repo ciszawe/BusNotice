@@ -35,6 +35,14 @@ fun UpdateDialog(tick: Int) {
     var waitPerm by remember { mutableStateOf(false) }
 
     LaunchedEffect(tick) { if (rel == null) rel = Updater.check(ctx) }
+    val forced = Updater.force.intValue
+    LaunchedEffect(forced) {
+        if (forced == 0) return@LaunchedEffect
+        rel = Updater.check(ctx, force = true)
+        if (rel == null) android.widget.Toast.makeText(ctx,
+            if (Updater.lastOk) "已经是最新版 build-${Updater.currentBuild(ctx)}" else "连不上 GitHub，稍后再试",
+            android.widget.Toast.LENGTH_SHORT).show()
+    }
     // 去设置里打开「安装未知应用」后回来，自动接着安装
     LaunchedEffect(tick) { if (waitPerm) file?.let { waitPerm = !Updater.install(ctx, it) } }
 
