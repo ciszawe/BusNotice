@@ -123,6 +123,23 @@ object Learn {
         (ctx.getSharedPreferences(RIDE, Context.MODE_PRIVATE).getString("$tripId#$legIdx", "") ?: "")
             .split(',').count { it.isNotBlank() }
 
+    // ---------- 公交沿线平均车速（米/分钟，含停站）：每次按定位到了下车站，按沿线距离 / 用时更新 ----------
+    private const val BUS_SPEED = "learn_bus_speed"
+
+    fun busSpeed(ctx: Context, tripId: String, legIdx: Int): Double? =
+        ctx.getSharedPreferences(BUS_SPEED, Context.MODE_PRIVATE).getFloat("$tripId#$legIdx", 0f)
+            .takeIf { it > 0f }?.toDouble()
+
+    /** 指数平均，新样本占 30%；离谱的样本（太慢/太快）不要 */
+    fun recordBusSpeed(ctx: Context, tripId: String, legIdx: Int, mPerMin: Double) {
+        if (mPerMin.isNaN() || mPerMin !in 80.0..700.0) return
+        val p = ctx.getSharedPreferences(BUS_SPEED, Context.MODE_PRIVATE)
+        val k = "$tripId#$legIdx"
+        val old = p.getFloat(k, 0f)
+        val v = if (old <= 0f) mPerMin else old * 0.7 + mPerMin * 0.3
+        p.edit().putFloat(k, v.toFloat()).apply()
+    }
+
     // ---------- 地铁推算的偏差：每次在地铁段手动点「已上车」，对比推算班次修正 ----------
     private const val METRO = "learn_metro"
 
