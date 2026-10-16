@@ -145,6 +145,7 @@ class CommuteService : Service() {
         if (intent == null) Diag.mark(this, "服务被系统杀掉后自动重启")
         else if (!manual) Diag.mark(this, "已自动启动")
         trip = t
+        restored = false
         startedAt = System.currentTimeMillis()
         runCatching { TraceLog.start(this, t.id, t.name) }
         TraceLog.event("run", "manual" to manual, "restart" to (intent == null))
@@ -925,6 +926,7 @@ class CommuteService : Service() {
             if (la == null || lo == null) null else Location("saved").apply { latitude = la; longitude = lo }
         }
         rideLearned = true // 中断过的这趟不再学乘车时长，免得样本不准
+        restored = true
         val rc = p.getString("ridingCand", "") ?: ""
         ridingCand = t.legs[leg].candidates.firstOrNull { "${it.name}|${it.stopName}" == rc }
             ?: if (riding) t.legs[leg].candidates.firstOrNull() else null
@@ -953,6 +955,78 @@ class CommuteService : Service() {
                 }
             }
         }
+    }
+
+    private var restored = false
+
+    /** 别的 App 的出行通知（NFC 刷卡进/出站、系统到站提醒）：比定位和时间推算都准，直接校准进度 */
+    fun onTransitSignal(kind: TransitSignal.Kind, text: String, at: Long) {
+        scope.launch(Dispatchers.Main) { runCatching { applyTransit(kind, text, at) }.onFailure { Log.w(TAG, "出行通知处理失败", it) } }
+    }
+
+    private fun kick() {
+        if (finishing || deadlineAt <= System.currentTimeMillis()) return
+        loop?.cancel(); loop = scope.launch { runLoop(deadlineAt) }
+    }
+
+    private fun applyTransit(kind: TransitSignal.Kind, text: String, at: Long) {
+        if (!::trip.isInitialized) return
+        val last = trip.legs.size - 1
+        when (kind) {
+            TransitSignal.Kind.ENTER -> {
+                if (riding) return
+                if (trip.legs[legIdx].isMetroOnly() && stationAt > 0 && at - stationAt < 10 * 60_000L) return
+                if (!trip.legs[legIdx].isMetroOnly()) {
+                    val k = (legIdx + 1..last).firstOrNull { trip.legs[it].isMetroOnly() } ?: return
+                    val firstAt = if (legIdx == 0 && boardedAt == 0L) at - rideMs(0) else at
+                    onBoarded(manual = false, at = firstAt)
+                    while (legIdx < k) onBoarded(manual = false, at = at)
+                    boardedAt = at - rideMs(k - 1); alightAt = at; rideLearned = true
+                }
+                stationAt = at   // 刷卡时刻就是进站时刻，按它之后第一班车算上车
+                Diag.mark(this, "刷卡进站，切到地铁段")
+                kick()
+            }
+            TransitSignal.Kind.EXIT -> {
+                val cur = trip.legs[legIdx]
+                val prevMetro = legIdx > 0 && trip.legs[legIdx - 1].isMetroOnly()
+                when {
+                    // 最后一段地铁：出站 = 到了
+                    cur.isMetroOnly() && legIdx == last && (riding || stationAt > 0) -> {
+                        if (riding && !restored && boardedAt > 0) Learn.recordRide(this, trip.id, legIdx, ((at - boardedAt) / 60_000L).toInt())
+                        Diag.mark(this, "刷卡出站，行程结束")
+                        finish()
+                        return
+                    }
+                    // 中间一段地铁还没切走就出站了：先切到下一段，再按出站时刻算换乘
+                    cur.isMetroOnly() && legIdx < last && stationAt > 0 -> {
+                        onBoarded(manual = false, at = nextTrainAfter(cur, stationAt) ?: stationAt)
+                        markAlight(at)
+                    }
+                    prevMetro && alightAt == 0L -> markAlight(at)
+                }
+                kick()
+            }
+            TransitSignal.Kind.ARRIVE -> {
+                if (!riding || arriveAlertedAt > 0L) return
+                val name = trip.legs[legIdx].candidates.firstOrNull { it.alightName.isNotEmpty() }?.alightName ?: return
+                if (!text.contains(name.removeSuffix("站"))) return
+                arriveAlertedAt = System.currentTimeMillis()
+                LiveNotifier.alert(this, "快到 $name 了", "准备下车", metro = trip.legs[legIdx].isMetroOnly(), id = 1005)
+                kick()
+            }
+        }
+    }
+
+    /** 换乘段：出站时刻就是下地铁时刻，顺便学这段地铁实际坐了多久 */
+    private fun markAlight(at: Long) {
+        alightAt = at; stepSensor(false)
+        if (!rideLearned && !restored && boardedAt > 0) {
+            rideLearned = true
+            Learn.recordRide(this, trip.id, legIdx - 1, ((at - boardedAt) / 60_000L).toInt())
+        }
+        Diag.mark(this, "刷卡出站，开始换乘")
+        saveRun(deadlineAt)
     }
 
     /** 用户点「结束」：这是真实到站/放弃的时刻，记录下来作为对照 */
