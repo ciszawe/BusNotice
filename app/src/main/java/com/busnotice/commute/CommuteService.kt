@@ -145,6 +145,7 @@ class CommuteService : Service() {
         if (intent == null) Diag.mark(this, "服务被系统杀掉后自动重启")
         else if (!manual) Diag.mark(this, "已自动启动")
         trip = t
+        startedAt = System.currentTimeMillis()
         stationAt = 0L; metroRideSec.clear(); metroRoutes.clear(); alightAt = 0L; fenceFixes.clear(); stillSince = 0L; lastFastAt = 0L; rideLearned = false; stopAlerted = ""
         legIdx = 0; boardedAt = 0L; nearSince = 0L; fastFixes = 0; alertedKey = null; planDone = false; planAlerted = ""
         maxStops.clear(); maxEta.clear()
@@ -230,6 +231,7 @@ class CommuteService : Service() {
         return atMillis + 60_000 + eta * 1000L
     }
 
+    private var startedAt = 0L
     private var stationAt = 0L     // 推断进站的时刻
     private var alightAt = 0L      // 推断下了上一段地铁的时刻
     private val fenceFixes = ArrayDeque<android.location.Location>()
@@ -313,7 +315,8 @@ class CommuteService : Service() {
         }
         if (legIdx >= trip.legs.size - 1) {
             if (riding) return            // 已经在车上：重复点「已上车」不做任何事
-            if (alight == null) { finish(); return }
+            // 下车站坐标还在后台取（刚启动/刚恢复）时别结束；整趟根本没填下车站才结束
+            if (alight == null && trip.legs[legIdx].candidates.none { it.alightName.isNotEmpty() || !it.alightLat.isNaN() }) { finish(); return }
             riding = true; boardedAt = now; arriveAlertedAt = 0L
             val l = trip.legs[legIdx]
             ridingCand = l.candidates.firstOrNull { it.isMetro() }.takeIf { l.isMetroOnly() } ?: lastCand ?: l.candidates.firstOrNull()
@@ -459,7 +462,7 @@ class CommuteService : Service() {
             val g = lastGpsFix
             stationAt = when {
                 nearSince > 0 && now - nearSince > 120_000 -> nearSince
-                g != null && now - g.time > 90_000 &&
+                g != null && g.time >= startedAt - 30_000 && now - g.time > 90_000 &&
                     leg.candidates.any { Geo.distanceM(g.latitude, g.longitude, it.lat, it.lng) <= 500 } -> g.time
                 else -> 0L
             }
@@ -576,7 +579,8 @@ class CommuteService : Service() {
      * 2. 地下没信号：最后一次定位在后面某段地铁站 500 米内，之后 90 秒以上没有新定位 → 进站了。
      */
     private fun jumpByLocation(now: Long): Long? {
-        val last = best?.takeIf { it.accuracy < 300 } ?: return null
+        // 只认这趟行程开始之后拿到的定位：系统缓存的旧位置（比如上次进地铁时）会让刚启动就误跳段
+        val last = best?.takeIf { it.accuracy < 300 && it.time >= startedAt - 30_000 } ?: return null
         fun near(l: Leg) = l.candidates.filter { !it.lat.isNaN() }
             .minOfOrNull { Geo.distanceM(last.latitude, last.longitude, it.lat, it.lng) } ?: Double.MAX_VALUE
         val age = now - last.time
@@ -669,13 +673,13 @@ class CommuteService : Service() {
 
     /** 最后一段车上：快到下车站时提醒一次，到了就收起 */
     private fun rideTick(leg: Leg, loc: Location?, now: Long): Long {
-        val dest = alight ?: run { finish(); return 60_000L }
+        val dest = alight
         val rc = ridingCand
         val metro = rc?.isMetro() ?: leg.isMetroOnly()
         val name = rc?.alightName?.takeIf { it.isNotEmpty() }
             ?: leg.candidates.firstOrNull { it.alightName.isNotEmpty() }?.alightName ?: "下车站"
         val lineTitle = rc?.label() ?: leg.title()
-        val d = loc?.let { Geo.distanceM(it.latitude, it.longitude, dest.first, dest.second) }
+        val d = if (dest == null) null else loc?.let { Geo.distanceM(it.latitude, it.longitude, dest.first, dest.second) }
         val eta = boardedAt + rideMs(legIdx)
         val near = d != null && d <= 700
         // 地铁段还没拿到站数（服务刚恢复、预取没完成）时，手填的乘车时间不可靠，先不按时间提醒下车
@@ -692,7 +696,7 @@ class CommuteService : Service() {
         }
         val total = rideMs(legIdx).coerceAtLeast(60_000L)
         // 有定位时以距离为准（时间估短了也不会提前显示「快到了」），没定位才按时间
-        val span = rc?.let { Geo.distanceM(it.lat, it.lng, dest.first, dest.second) }?.takeIf { it > 300 }
+        val span = if (dest == null) null else rc?.let { Geo.distanceM(it.lat, it.lng, dest.first, dest.second) }?.takeIf { it > 300 }
         val p = if (d != null && span != null) ((1 - d / span) * 100).toInt().coerceIn(0, 97)
             else ((now - boardedAt) * 100 / total).toInt().coerceIn(0, 100)
         val left = if (d != null && d > 1_500) (d / (if (metro) 550.0 else 350.0)).toInt().coerceAtLeast(1)
