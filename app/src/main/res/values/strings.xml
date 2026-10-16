@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="a11y_label">出行识别（可选）</string>
+    <string name="a11y_desc">只在通勤胶囊有行程运行时，读取系统出行胶囊和交通卡刷卡弹窗上的文字（进出站、到站、余额），记在本机行程记录里，用来改进进出站判断。不读其他内容，不上传，也不会替你点击任何东西。</string>
+</resources>
