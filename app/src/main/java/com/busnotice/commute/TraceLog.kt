@@ -10,6 +10,7 @@ import android.hardware.SensorManager
 import android.location.Location
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import android.telephony.CellInfo
 import android.telephony.CellInfoGsm
 import android.telephony.CellInfoLte
@@ -29,12 +30,13 @@ import kotlin.math.sqrt
 
 /**
  * 行程记录（只存手机本地，不上传）：为以后做「轨迹匹配 / 地下停站计数 / 基站序列匹配」攒真实数据。
- * 现在只记录，不参与任何判断。
+ * 大部分只记录；加速度窗口另外留最近几分钟在内存里，给下地铁判断当佐证（AccMotion）。
  *
  * 每趟行程一个文件 traces/日期_行程.jsonl，每行一条：
  *  loc   定位点：lat lng acc provider spd
  *  cell  服务基站变化：type id tac pci dbm（只在换了基站时记）
- *  acc   加速度：每 2 秒一条，线性加速度幅值的均值 m 和标准差 sd（看列车启停）
+ *  acc   加速度：每 2 秒一条，线性加速度幅值的均值 m 和标准差 sd（看列车启停），
+ *        三轴均值 ax ay az、重力向量均值 gx gy gz（离线投影到水平面看加减速），ts = 按传感器时间戳算的窗口结束时刻
  *  ev    状态：上车、换段、判断下车、提醒、手动结束等
  * 保留最近 30 天。
  */
@@ -49,8 +51,17 @@ object TraceLog {
     private var lastCell = ""
     private var app: Context? = null
 
-    // 2 秒窗口内的加速度统计
-    private var n = 0; private var sum = 0.0; private var sumSq = 0.0; private var winStart = 0L
+    // 2 秒窗口内的加速度统计（时间按传感器事件时间戳，批量上报时也不会挤成一个窗口）
+    private var n = 0; private var sum = 0.0; private var sumSq = 0.0; private var winStart = 0L; private var lastT = 0L
+    private var sx = 0.0; private var sy = 0.0; private var sz = 0.0
+    private var gn = 0; private var gx = 0.0; private var gy = 0.0; private var gz = 0.0
+    private const val LATENCY_US = 10_000_000   // 允许传感器攒 10 秒再报：息屏 doze 时数据也能到
+
+    // 最近约 5 分钟的窗口，给下车判断用
+    private val recent = ArrayDeque<AccMotion.Win>()
+    private const val RECENT_MAX = 150
+
+    fun recentWindows(): List<AccMotion.Win> = synchronized(recent) { recent.toList() }
 
     private fun dir(ctx: Context) = File(ctx.filesDir, "traces").apply { mkdirs() }
 
@@ -67,9 +78,13 @@ object TraceLog {
         write("ev", JSONObject().put("e", "start").put("trip", tripName))
         h?.post(cellPoll)
         sm = c.getSystemService(SensorManager::class.java)
-        val s = sm?.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION) ?: sm?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-        n = 0; sum = 0.0; sumSq = 0.0; winStart = 0L
-        if (s != null) sm?.registerListener(accel, s, SensorManager.SENSOR_DELAY_NORMAL, h)
+        // 优先用唤醒型传感器：息屏后也会按批量延迟把数据送上来（不另外持有唤醒锁）
+        fun pick(type: Int) = sm?.getDefaultSensor(type, true) ?: sm?.getDefaultSensor(type)
+        val s = pick(Sensor.TYPE_LINEAR_ACCELERATION) ?: pick(Sensor.TYPE_ACCELEROMETER)
+        val g = pick(Sensor.TYPE_GRAVITY)
+        resetWin(); synchronized(recent) { recent.clear() }
+        if (s != null) sm?.registerListener(accel, s, SensorManager.SENSOR_DELAY_NORMAL, LATENCY_US, h)
+        if (g != null) sm?.registerListener(accel, g, SensorManager.SENSOR_DELAY_NORMAL, LATENCY_US, h)
     }
 
     @Synchronized
@@ -109,21 +124,51 @@ object TraceLog {
         }
     }
 
+    private fun resetWin() {
+        n = 0; sum = 0.0; sumSq = 0.0; winStart = 0L; lastT = 0L
+        sx = 0.0; sy = 0.0; sz = 0.0
+        gn = 0; gx = 0.0; gy = 0.0; gz = 0.0
+    }
+
+    /** 传感器时间戳（开机以来纳秒）换成墙钟毫秒；对不上就用现在 */
+    private fun evTime(ts: Long): Long {
+        val now = System.currentTimeMillis()
+        val t = now - (SystemClock.elapsedRealtimeNanos() - ts) / 1_000_000
+        return if (t > now + 5_000 || t < now - 10 * 60_000L) now else t
+    }
+
+    /** 收掉当前窗口：写一条 acc，并放进内存里的最近窗口 */
+    private fun flush(end: Long) {
+        if (n == 0) return
+        val mean = sum / n
+        val sd = sqrt((sumSq / n - mean * mean).coerceAtLeast(0.0))
+        val o = JSONObject().put("m", r(mean, 1000.0)).put("sd", r(sd, 1000.0)).put("n", n)
+            .put("ax", r(sx / n, 1000.0)).put("ay", r(sy / n, 1000.0)).put("az", r(sz / n, 1000.0))
+            .put("ts", end)
+        if (gn > 0) o.put("gx", r(gx / gn, 1000.0)).put("gy", r(gy / gn, 1000.0)).put("gz", r(gz / gn, 1000.0))
+        write("acc", o)
+        synchronized(recent) {
+            recent.addLast(AccMotion.Win(end, mean, sd))
+            while (recent.size > RECENT_MAX) recent.removeFirst()
+        }
+        resetWin()
+    }
+
     private val accel = object : SensorEventListener {
         override fun onSensorChanged(e: SensorEvent) {
-            val linear = e.sensor.type == Sensor.TYPE_LINEAR_ACCELERATION
             val x = e.values[0].toDouble(); val y = e.values[1].toDouble(); val z = e.values[2].toDouble()
+            if (e.sensor.type == Sensor.TYPE_GRAVITY) { gn++; gx += x; gy += y; gz += z; return }
+            val linear = e.sensor.type == Sensor.TYPE_LINEAR_ACCELERATION
             var m = sqrt(x * x + y * y + z * z)
             if (!linear) m -= SensorManager.GRAVITY_EARTH
-            val now = System.currentTimeMillis()
-            if (winStart == 0L) winStart = now
+            val t = evTime(e.timestamp)
+            // 传感器断档（息屏被挂起）：先把断档前的窗口收掉，别把空白算进一个窗口
+            if (n > 0 && t - lastT > 4_000) flush(lastT)
+            if (n == 0) winStart = t
             n++; sum += m; sumSq += m * m
-            if (now - winStart >= 2_000 && n > 0) {
-                val mean = sum / n
-                val sd = sqrt((sumSq / n - mean * mean).coerceAtLeast(0.0))
-                write("acc", JSONObject().put("m", r(mean, 1000.0)).put("sd", r(sd, 1000.0)).put("n", n))
-                n = 0; sum = 0.0; sumSq = 0.0; winStart = now
-            }
+            sx += x; sy += y; sz += z
+            lastT = t
+            if (t - winStart >= 2_000) flush(t)
         }
         override fun onAccuracyChanged(s: Sensor?, a: Int) {}
     }
