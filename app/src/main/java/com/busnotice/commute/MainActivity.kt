@@ -47,5 +47,6 @@ class MainActivity : ComponentActivity() {
         // 进 App 时如果行程还没结束、胶囊却没了，重新拉起
         CommuteService.resumeIfNeeded(this)
         LiveNotifier.unhide(this)
+        CommuteService.instance?.relocate()
     }
 }
