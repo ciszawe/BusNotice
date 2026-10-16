@@ -120,12 +120,13 @@ object Decision {
             val b = all.minByOrNull { if (it.second.stopsAway < 0) Int.MAX_VALUE else it.second.stopsAway }
             val tip = options.map { it.tip }.firstOrNull { it.isNotEmpty() } ?: ""
             val detail = when {
-                b != null && b.second.stopsAway >= 0 -> "${b.first.candidate.label()} 最近一班还有 ${b.second.stopsAway} 站" +
+                b != null && b.second.stopsAway >= 0 -> "${b.first.candidate.label()} 最近一班" +
+                    (if (b.second.stopsAway == 0) "已到站" else "还有 ${b.second.stopsAway} 站") +
                     if (tip.isNotEmpty()) " · $tip" else ""
                 tip.isNotEmpty() -> tip
                 else -> "暂无车辆信息"
             }
-            val head = if (b != null && b.second.stopsAway >= 0) "${b.second.stopsAway}站" else "无车"
+            val head = if (b != null && b.second.stopsAway >= 0) (if (b.second.stopsAway == 0) "已到站" else "${b.second.stopsAway}站") else "无车"
             return Advice(Mode.NO_BUS, b?.first ?: options.first(), b?.second, options.first().walkSec, 0, head, detail)
         }
 
@@ -138,36 +139,43 @@ object Decision {
 
         if (connecting) {
             if (catchable == null) {
-                val first = known.first()
-                return Advice(Mode.CONNECT_MISS, first.first, first.second, first.first.walkSec, 0, "换乘紧",
-                    "约 ${mins(first.first.walkSec)} 分钟到 ${first.first.candidate.stopName}，" +
-                        "${first.first.candidate.label()} ${mins(first.second.etaSec)} 分钟到，可能赶不上")
+                // 不留余量也来得及的那班（到站时刻 ≥ 赶到换乘站的时间）才提「可能赶不上」；
+                // 都早于你到站就别拿一班根本赶不上的车说事
+                val tight = known.firstOrNull { it.second.etaSec >= it.first.walkSec }
+                if (tight != null) {
+                    val (o, a) = tight
+                    return Advice(Mode.CONNECT_MISS, o, a, o.walkSec, 0, "换乘紧",
+                        "${walkTo(o)}，${o.candidate.label()} ${arriveText(a.etaSec)}，可能赶不上")
+                }
+                val o = known.first().first
+                return Advice(Mode.CONNECT_MISS, o, null, o.walkSec, 0, "赶不上",
+                    "${walkTo(o)}，暂无赶得上的车" + (nextCatchable(known, o.walkSec)?.let { "，下一班约 ${mins(it).coerceAtLeast(1)} 分钟" } ?: ""))
             }
             val (o, a) = catchable
             val wait = a.etaSec - o.walkSec
             return Advice(Mode.CONNECT, o, a, o.walkSec, 0, "换${o.candidate.label()}",
-                "约 ${mins(o.walkSec)} 分钟到 ${o.candidate.stopName} · ${o.candidate.label()} " +
-                    "${mins(a.etaSec)} 分钟到，等约 ${mins(wait)} 分钟", nextAfter(catchable))
+                "${walkTo(o)} · ${o.candidate.label()} " +
+                    "${arriveText(a.etaSec)}，" + (if (mins(wait) == 0) "几乎不用等" else "等约 ${mins(wait)} 分钟"), nextAfter(catchable))
         }
 
         if (catchable == null) {
             val first = known.first()
             return Advice(Mode.HURRY, first.first, first.second, first.first.walkSec, 0, "快跑",
-                "${first.first.candidate.label()} ${mins(first.second.etaSec)} 分钟到站，" +
-                    "步行要 ${mins(first.first.walkSec)} 分钟，有点悬")
+                "${first.first.candidate.label()} ${arriveText(first.second.etaSec, "到站")}，" +
+                    "步行要 ${mins(first.first.walkSec).coerceAtLeast(1)} 分钟，有点悬")
         }
 
         val (o, a) = catchable
         val next = nextAfter(catchable)
-        val nextText = next?.let { " · 下一班 ${it.first.candidate.label()} ${mins(it.second.etaSec)} 分" } ?: ""
+        val nextText = next?.let { " · 下一班 ${it.first.candidate.label()} ${minShort(it.second.etaSec)}" } ?: ""
         val stopsText = if (a.stopsAway >= 0) " · 还有 ${a.stopsAway} 站" else ""
         if (o.walkSec == 0) {
             return Advice(Mode.AT_STOP, o, a, 0, 0,
                 if (a.etaSec < 60) "进站" else "${mins(a.etaSec)}分",
-                "${o.candidate.label()} 约 ${mins(a.etaSec)} 分钟到$stopsText$nextText", next)
+                "${o.candidate.label()} ${if (a.etaSec < 60) arriveText(a.etaSec) else "约 " + arriveText(a.etaSec)}$stopsText$nextText", next)
         }
         val leaveIn = a.etaSec - o.walkSec - SAFETY_SEC
-        val base = "${o.candidate.label()} ${mins(a.etaSec)} 分钟到$stopsText · 步行 ${mins(o.walkSec)} 分钟$nextText"
+        val base = "${o.candidate.label()} ${arriveText(a.etaSec)}$stopsText · 步行 ${mins(o.walkSec)} 分钟$nextText"
         return if (leaveIn <= 60) {
             Advice(Mode.LEAVE_NOW, o, a, o.walkSec, leaveIn.coerceAtLeast(0), "现在走", base, next)
         } else {
@@ -176,6 +184,34 @@ object Decision {
     }
 
     fun mins(sec: Int) = ((sec + 30) / 60).coerceAtLeast(0)
+
+    /** 「X 分钟到」：不到 1 分钟说「即将到站」，已经到了（≤0）说「已到站」，别显示「0 分钟到」 */
+    fun arriveText(sec: Int, tail: String = "到"): String = when {
+        sec <= 0 -> "已到站"
+        sec < 60 -> "即将到站"
+        else -> "${mins(sec)} 分钟$tail"
+    }
+
+    /** 紧凑版：「X分」/「即将到」/「已到站」 */
+    fun minShort(sec: Int): String = when {
+        sec <= 0 -> "已到站"
+        sec < 60 -> "即将到"
+        else -> "${mins(sec)}分"
+    }
+
+    /** 换乘时「约 X 分钟到某站」；不到 1 分钟说「即将到」 */
+    private fun walkTo(o: Option) =
+        if (o.walkSec < 60) "即将到 ${o.candidate.stopName}" else "约 ${mins(o.walkSec)} 分钟到 ${o.candidate.stopName}"
+
+    /** 已知班次都赶不上：按发车间隔往后推，第一班赶得上的大约还有多少秒；不知道间隔返回 null */
+    private fun nextCatchable(known: List<Pair<Option, Arrival>>, needSec: Int): Int? {
+        val last = known.maxByOrNull { it.second.etaSec } ?: return null
+        val hw = last.first.candidate.headwayMin * 60
+        if (hw <= 0) return null
+        var t = last.second.etaSec
+        while (t < needSec + SAFETY_SEC) t += hw
+        return t
+    }
 
     /**
      * 地铁：有列车实时位置就用实时；否则用按首班 + 高峰/平峰间隔推算的班次（estimated）；
@@ -217,7 +253,7 @@ object Decision {
             oo.walkSec == 0 -> Advice(Mode.METRO, oo, catchable?.second, 0, 0, head ?: "进站",
                 "已到 ${oo.candidate.stopName}$nextText")
             else -> Advice(Mode.METRO, oo, catchable?.second, oo.walkSec, 0, head ?: "去地铁",
-                "步行约 ${mins(oo.walkSec)} 分钟到 ${oo.candidate.stopName}$nextText")
+                "步行约 ${mins(oo.walkSec).coerceAtLeast(1)} 分钟到 ${oo.candidate.stopName}$nextText")
         }
     }
 
