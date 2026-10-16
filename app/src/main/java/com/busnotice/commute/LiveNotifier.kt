@@ -120,6 +120,7 @@ object LiveNotifier {
     /** 需要马上出发 / 换乘紧张时，额外弹一条横幅并震动 */
     fun alert(ctx: Context, title: String, text: String, metro: Boolean = false, id: Int = ALERT_ID) {
         unhide(ctx)
+        TraceLog.event("alert", "title" to title, "text" to text)
         val n = NotificationCompat.Builder(ctx, CHANNEL_ALERT)
             .setSmallIcon(if (metro) R.drawable.ic_metro else R.drawable.ic_bus)
             .setColor(if (metro) GREEN else BLUE)
