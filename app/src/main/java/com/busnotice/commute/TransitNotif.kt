@@ -1,0 +1,68 @@
+package com.busnotice.commute
+
+import android.app.Notification
+import android.content.ComponentName
+import android.content.Context
+import android.provider.Settings
+import android.service.notification.NotificationListenerService
+import android.service.notification.StatusBarNotification
+
+/**
+ * 读别的 App 的出行通知（需要用户在系统里给「通知使用权」）：
+ *  - NFC 交通卡刷卡：进站 / 出站，时间最准；
+ *  - 系统自己的地铁到站、下车提醒。
+ * 只看带出行关键词的通知，其余（聊天、短信等）一律不读不存。
+ * 只把「进站 / 出站 / 到站」这类结论和原文存在本机，用来校准行程。
+ */
+class TransitNotif : NotificationListenerService() {
+
+    override fun onNotificationPosted(sbn: StatusBarNotification) {
+        if (sbn.packageName == packageName) return
+        val ex = sbn.notification?.extras ?: return
+        val title = ex.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
+        val text = listOfNotNull(
+            ex.getCharSequence(Notification.EXTRA_TEXT),
+            ex.getCharSequence(Notification.EXTRA_BIG_TEXT),
+            ex.getCharSequence(Notification.EXTRA_SUB_TEXT),
+        ).joinToString(" ").trim()
+        val all = "$title $text"
+        val kind = TransitSignal.classify(all) ?: return
+        TransitSignal.post(this, kind, all.take(120), sbn.packageName, sbn.postTime)
+    }
+
+    companion object {
+        fun enabled(ctx: Context): Boolean {
+            val flat = Settings.Secure.getString(ctx.contentResolver, "enabled_notification_listeners") ?: return false
+            val me = ComponentName(ctx, TransitNotif::class.java).flattenToString()
+            return flat.split(':').any { it == me }
+        }
+    }
+}
+
+object TransitSignal {
+    enum class Kind { ENTER, EXIT, ARRIVE }
+
+    private const val PREFS = "transit_signal"
+    private val TRAVEL = Regex("进站|出站|交通卡|地铁|下车|到站|乘车")
+
+    fun classify(s: String): Kind? {
+        if (!TRAVEL.containsMatchIn(s)) return null
+        return when {
+            s.contains("出站") -> Kind.EXIT
+            s.contains("进站") -> Kind.ENTER
+            s.contains("下车") || s.contains("到站") || s.contains("即将到达") -> Kind.ARRIVE
+            else -> null
+        }
+    }
+
+    fun post(ctx: Context, kind: Kind, text: String, pkg: String, at: Long) {
+        // 同一条通知会反复更新：同类信号 30 秒内只算一次
+        val p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        if (p.getString("kind", null) == kind.name && at - p.getLong("at", 0) < 30_000) return
+        p.edit().putString("kind", kind.name).putLong("at", at).putString("text", text).putString("pkg", pkg).apply()
+        TraceLog.event("transit", "kind" to kind.name, "text" to text, "pkg" to pkg, "at" to at)
+        val label = when (kind) { Kind.ENTER -> "进站"; Kind.EXIT -> "出站"; Kind.ARRIVE -> "到站提醒" }
+        Diag.mark(ctx, "收到$label 通知：${text.take(30)}")
+        CommuteService.instance?.onTransitSignal(kind, text, at)
+    }
+}
