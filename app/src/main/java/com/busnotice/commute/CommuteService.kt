@@ -388,7 +388,8 @@ class CommuteService : Service() {
         val prev = trip.legs.getOrNull(legIdx - 1)
         val now = System.currentTimeMillis()
         val loc = best?.takeIf { it.accuracy < 200 && now - it.time < 120_000 }
-        if (riding) return rideTick(leg, loc, now)
+        // 地铁里网络定位误差大（几百米到一公里），坐地铁时放宽到 800 米也拿来用
+        if (riding) return rideTick(leg, loc ?: best?.takeIf { leg.isMetroOnly() && it.accuracy < 800 && now - it.time < 90_000 }, now)
 
         // 按位置纠正进度：人已经在后面某一段的上车站附近、离当前这段的站很远，说明前面几段已经坐完了（没识别到上车）
         jumpByLocation(now)?.let { return it }
@@ -559,7 +560,8 @@ class CommuteService : Service() {
         } || loc == null
         when {
             // 坐地铁时地下搜不到卫星：关掉定位只按时间倒计时，快到换乘站前 5 分钟再开
-            onMetro -> setPower(Power.OFF)
+            // 地铁里收不到卫星，但基站/Wi-Fi 网络定位还能用：保持低功耗网络定位
+            onMetro -> setPower(Power.LOW)
             connecting && prev?.isMetroOnly() == true -> setPower(Power.HIGH)
             else -> setPower(if (hot) Power.HIGH else Power.LOW)
         }
@@ -681,10 +683,10 @@ class CommuteService : Service() {
         val lineTitle = rc?.label() ?: leg.title()
         val d = if (dest == null) null else loc?.let { Geo.distanceM(it.latitude, it.longitude, dest.first, dest.second) }
         val eta = boardedAt + rideMs(legIdx)
-        val near = d != null && d <= 700
+        val near = d != null && d <= 700 && (loc?.accuracy ?: 9999f) < 400
         // 地铁段还没拿到站数（服务刚恢复、预取没完成）时，手填的乘车时间不可靠，先不按时间提醒下车
         val etaKnown = !metro || metroRideSec[legIdx] != null || Learn.rideMin(this, trip.id, legIdx) != null
-        val timeUp = etaKnown && now >= eta - 90_000 && (d == null || d < 1_500)
+        val timeUp = etaKnown && now >= eta - 90_000 && (d == null || d < 1_500 + (loc?.accuracy ?: 0f))
         if (arriveAlertedAt == 0L && (near || timeUp)) {
             arriveAlertedAt = now
             LiveNotifier.alert(this, "快到 $name 了", "准备下车", metro = metro, id = 1005)
@@ -718,7 +720,7 @@ class CommuteService : Service() {
             progress = p, metro = metro, trackerRes = if (metro) R.drawable.ic_metro else R.drawable.ic_bus, riding = true)
         LiveNotifier.update(this, LiveNotifier.build(this, v))
         LiveState.snapshot.value = LiveSnapshot(trip.id, trip.name, legIdx, trip.legs.size, lineTitle, short, text, null, p, null, riding = true)
-        if (metro && boardedAt + total - now > 5 * 60_000L) { setPower(Power.OFF); return 60_000L }
+        if (metro && boardedAt + total - now > 5 * 60_000L) { setPower(Power.LOW); return 30_000L }
         setPower(if (d != null && d < 1_500) Power.HIGH else Power.LOW)
         // 坐公交离下车站还远：网络定位 + 一分钟刷一次就够
         return if (d != null && d > 3_000) 60_000L else 20_000L
@@ -938,7 +940,8 @@ class CommuteService : Service() {
                 m.getCurrentLocation(pr, null, mainExecutor) { l ->
                     if (l == null || !::trip.isInitialized) return@getCurrentLocation
                     onLocation(l)
-                    if (!kicked || pr == LocationManager.GPS_PROVIDER) {
+                    // 循环还没真正开始（刚点了运行）时别重启，否则截止时间为 0 会直接结束
+                    if (deadlineAt > System.currentTimeMillis() && (!kicked || pr == LocationManager.GPS_PROVIDER)) {
                         kicked = true
                         loop?.cancel(); loop = scope.launch { runLoop(deadlineAt) }
                     }
