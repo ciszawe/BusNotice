@@ -16,7 +16,12 @@ import java.net.URL
 /** 检查 GitHub Release 有没有新版本；仓库公开，无需登录。网络不通就静默跳过 */
 object Updater {
     private const val API = "https://api.github.com/repos/ciszawe/BusNotice/releases/latest"
-    private const val CHECK_GAP = 3 * 3600_000L
+    private const val CHECK_GAP = 15 * 60_000L
+
+    /** 首页点「检查更新」时 +1，弹窗那边强制查一次 */
+    val force = androidx.compose.runtime.mutableIntStateOf(0)
+    /** 上次检查是否连上了 GitHub */
+    @Volatile var lastOk = true
 
     data class Release(val build: Int, val apkUrl: String, val notes: String)
 
@@ -30,12 +35,14 @@ object Updater {
         val sp = ctx.getSharedPreferences("updater", Context.MODE_PRIVATE)
         val now = System.currentTimeMillis()
         if (!force && now - sp.getLong("last", 0) < CHECK_GAP) return@withContext null
+        lastOk = false
         runCatching {
             val c = URL(API).openConnection() as HttpURLConnection
             c.connectTimeout = 8000; c.readTimeout = 8000
             c.setRequestProperty("Accept", "application/vnd.github+json")
             val txt = c.inputStream.bufferedReader().use { it.readText() }
             sp.edit().putLong("last", now).apply()
+            lastOk = true
             // releases 列表按标签字符串排序（build-9 排在 build-25 前），所以只看 GitHub 标记的最新版
             val r = JSONObject(txt)
             val n = Regex("""build-(\d+)""").find(r.optString("tag_name"))?.groupValues?.get(1)?.toIntOrNull()
@@ -47,7 +54,7 @@ object Updater {
                 if (a.optString("name").endsWith(".apk")) { url = a.optString("browser_download_url"); break }
             }
             val best = url?.let { Release(n, it, r.optString("body").take(300)) }
-            best?.takeIf { it.build > currentBuild(ctx) && it.build != sp.getInt("skip", 0) }
+            best?.takeIf { it.build > currentBuild(ctx) && (force || it.build != sp.getInt("skip", 0)) }
         }.getOrNull()
     }
 
