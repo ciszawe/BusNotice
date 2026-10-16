@@ -123,10 +123,15 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
                 }
             }
             item(key = "ver") {
-                Text("build-${com.busnotice.commute.Updater.currentBuild(ctx)} · 检查更新",
-                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.padding(horizontal = 4.dp)
-                        .clickable { com.busnotice.commute.Updater.force.intValue++ })
+                androidx.compose.foundation.layout.Row(Modifier.padding(horizontal = 4.dp)) {
+                    Text("build-${com.busnotice.commute.Updater.currentBuild(ctx)} · 检查更新",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.clickable { com.busnotice.commute.Updater.force.intValue++ })
+                    val days = remember(resumeTick) { com.busnotice.commute.TraceLog.dayCount(ctx) }
+                    if (days > 0) Text("    导出行程记录（${days} 天）",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.clickable { com.busnotice.commute.TraceLog.share(ctx) })
+                }
             }
             if (trips.isEmpty()) item {
                 Column(Modifier.fillMaxWidth().padding(vertical = 48.dp), horizontalAlignment = Alignment.CenterHorizontally) {
