@@ -321,6 +321,11 @@ private fun missingPerms(ctx: Context, request: (Array<String>) -> Unit): List<P
             open(Intent("android.settings.APP_NOTIFICATION_PROMOTION_SETTINGS").putExtra(Settings.EXTRA_APP_PACKAGE, ctx.packageName))
         }
     }
+    if (!com.busnotice.commute.TransitNotif.enabled(ctx)) {
+        out += Perm("通知使用权（可选）", "读 NFC 交通卡刷卡和系统到站提醒，进出站时间更准；只看出行通知") {
+            open(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        }
+    }
     if (!ctx.getSystemService(AlarmManager::class.java).canScheduleExactAlarms()) {
         out += Perm("精确闹钟", "准时预热") { open(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, pkg)) }
     }
