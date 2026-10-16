@@ -149,4 +149,97 @@ class DecisionTest {
         val l = Decision.metroSchedule(6 * 3600 + 620, 360, 1380, false, 10, 10, 3, Decision.DWELL_SEC)
         assertEquals(listOf(-20, 580, 1180), l)
     }
+
+    @Test fun connectMissPicksCatchableNotGoneBus() {
+        // 还要 17 分钟到换乘站：0 秒那班根本赶不上，应该提 17 分 20 秒那班（不留余量刚好来得及）
+        val a = Decision.decide(listOf(opt(1020, 0, 1040)), connecting = true)
+        assertEquals(Decision.Mode.CONNECT_MISS, a.mode)
+        assertEquals(1040, a.arrival!!.etaSec)
+        assertTrue(!a.detail.contains("0 分钟到"))
+    }
+
+    @Test fun connectMissNoCatchableBus() {
+        val a = Decision.decide(listOf(opt(1020, 0, 300)), connecting = true)
+        assertEquals(Decision.Mode.CONNECT_MISS, a.mode)
+        assertEquals(null, a.arrival)
+        assertTrue(a.detail.contains("暂无赶得上的车"))
+        assertTrue(!a.detail.contains("0 分钟到"))
+        // 知道间隔（10 分钟）：300 → 900 → 1500 秒，第一班赶得上的约 25 分钟
+        val c = Candidate(Candidate.Type.BUS, "15", "A站", 0.0, 0.0, headwayMin = 10)
+        val b = Decision.decide(listOf(opt(1020, 0, 300, c = c)), connecting = true)
+        assertTrue(b.detail.contains("下一班约 25 分钟"))
+    }
+
+    @Test fun neverShowZeroMinutes() {
+        assertEquals("即将到站", Decision.arriveText(20))
+        assertEquals("已到站", Decision.arriveText(0))
+        assertEquals("3 分钟到", Decision.arriveText(180))
+        assertEquals("即将到", Decision.minShort(10))
+        val a = Decision.decide(listOf(opt(0, 10, 400)))
+        assertEquals(Decision.Mode.AT_STOP, a.mode)
+        assertTrue(a.detail.contains("即将到站") && !a.detail.contains("0 分钟"))
+    }
+
+    // ---------- 加速度活动分类 ----------
+    private fun wins(vararg seg: Triple<Int, Double, Double>): List<AccMotion.Win> {
+        // 每段 (窗口数, m, sd)，每 2 秒一个窗口，从 t=2000 开始
+        val out = ArrayList<AccMotion.Win>()
+        var t = 0L
+        for ((k, m, sd) in seg) repeat(k) { t += 2_000; out += AccMotion.Win(t, m, sd) }
+        return out
+    }
+
+    @Test fun accClassify() {
+        assertEquals(AccMotion.Kind.STILL, AccMotion.classify(AccMotion.Win(0, 0.08, 0.03)))
+        assertEquals(AccMotion.Kind.VEHICLE, AccMotion.classify(AccMotion.Win(0, 0.5, 0.2)))
+        assertEquals(AccMotion.Kind.WALK, AccMotion.classify(AccMotion.Win(0, 1.9, 0.6)))
+        assertEquals(AccMotion.Kind.WALK, AccMotion.classify(AccMotion.Win(0, 6.0, 2.5)))
+        assertEquals(AccMotion.Kind.OTHER, AccMotion.classify(AccMotion.Win(0, 1.1, 0.3)))
+    }
+
+    @Test fun accTrainStopThenWalk() {
+        // 坐车 60 秒 → 停稳 12 秒 → 走路 26 秒（中间夹一个慢窗口）
+        val w = wins(Triple(30, 0.4, 0.15), Triple(6, 0.08, 0.03), Triple(6, 1.8, 0.5),
+            Triple(1, 0.6, 0.3), Triple(6, 2.1, 0.7))
+        val now = w.last().t
+        val start = AccMotion.walkingSustainedSince(w, now)
+        assertEquals(72_000L, start)   // 第 37 个窗口（t=74000）的开头
+        assertTrue(AccMotion.hadStillBefore(w, start!!))
+    }
+
+    @Test fun accNoWalkWhileRiding() {
+        val w = wins(Triple(40, 0.5, 0.2))
+        assertEquals(null, AccMotion.walkingSustainedSince(w, w.last().t))
+        // 走路太短（10 秒）也不算
+        val s = wins(Triple(10, 0.4, 0.1), Triple(5, 2.0, 0.6))
+        assertEquals(null, AccMotion.walkingSustainedSince(s, s.last().t))
+        // 走路前没有停稳（一直在晃）：没有静止段
+        val r = wins(Triple(30, 0.5, 0.2), Triple(12, 2.0, 0.6))
+        val st = AccMotion.walkingSustainedSince(r, r.last().t)!!
+        assertTrue(!AccMotion.hadStillBefore(r, st))
+        // 两个非走路窗口连着：只算后面那段
+        val g = wins(Triple(8, 2.0, 0.6), Triple(2, 0.5, 0.2), Triple(6, 2.0, 0.6))
+        assertEquals(null, AccMotion.walkingSustainedSince(g, g.last().t))
+    }
+
+    // ---------- 公交沿线进度 ----------
+    private fun stop(i: Int, name: String, lat: Double) = ChelaileApi.StopPoint("s$i", name, i, lat, 0.0)
+
+    @Test fun busSliceAndSnap() {
+        // 一条正北走向的线，每站约 1.1 公里
+        val all = (1..8).map { stop(it, "S$it", it * 0.01) }
+        val r = BusRide.slice(all, 2, "", Double.NaN, Double.NaN, "S6站", Double.NaN, Double.NaN)!!
+        assertEquals(listOf("S2", "S3", "S4", "S5", "S6"), r.map { it.name })
+        // 在 S3 和 S4 中间
+        val sn = BusRide.snap(r, 0.035, 0.0005)!!
+        assertEquals(1, sn.seg)
+        assertEquals(3, sn.stopsLeft)
+        assertTrue(sn.remainM in 2_600.0..2_900.0)
+        // 防抖：到过第 3 段后，不会再投回第 0 段
+        val back = BusRide.snap(r, 0.021, 0.0, minSeg = 2)!!
+        assertEquals(2, back.seg)
+        // 按坐标找上下车站
+        val r2 = BusRide.slice(all, -1, "", 0.0301, 0.0, "", 0.0499, 0.0)!!
+        assertEquals(listOf("S3", "S4", "S5"), r2.map { it.name })
+    }
 }
