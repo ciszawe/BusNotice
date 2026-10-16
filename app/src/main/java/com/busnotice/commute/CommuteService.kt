@@ -388,7 +388,7 @@ class CommuteService : Service() {
         if (riding) return rideTick(leg, loc, now)
 
         // 按位置纠正进度：人已经在后面某一段的上车站附近、离当前这段的站很远，说明前面几段已经坐完了（没识别到上车）
-        if (loc != null && loc.accuracy < 150) jumpByLocation(loc, now)?.let { return it }
+        jumpByLocation(now)?.let { return it }
 
         val dists = leg.candidates.map { c -> loc?.let { Geo.distanceM(it.latitude, it.longitude, c.lat, c.lng) } }
         val nearest = dists.filterNotNull().minOrNull()
@@ -570,19 +570,30 @@ class CommuteService : Service() {
         }
     }
 
-    /** 后面哪一段的上车站离现在位置 250 米内、当前段的站都在 600 米外，就直接跳到那一段；跳了返回下一次 tick 间隔 */
-    private fun jumpByLocation(loc: Location, now: Long): Long? {
+    /**
+     * 按位置纠正进度，两种情况跳到后面那一段：
+     * 1. 新鲜定位在后面某段上车站 250 米内，且离当前段的站都在 600 米外；
+     * 2. 地下没信号：最后一次定位在后面某段地铁站 500 米内，之后 90 秒以上没有新定位 → 进站了。
+     */
+    private fun jumpByLocation(now: Long): Long? {
+        val last = best?.takeIf { it.accuracy < 300 } ?: return null
         fun near(l: Leg) = l.candidates.filter { !it.lat.isNaN() }
-            .minOfOrNull { Geo.distanceM(loc.latitude, loc.longitude, it.lat, it.lng) } ?: Double.MAX_VALUE
-        if (near(trip.legs[legIdx]) < 600) return null
-        val k = (legIdx + 1 until trip.legs.size).firstOrNull { near(trip.legs[it]) <= 250 } ?: return null
-        Diag.mark(this, "定位显示已到第 ${k + 1} 段上车站附近，跳过前面的段")
-        // 第一段上车时间按「现在 - 这段通常乘车时长」估，供学习用；中间段直接过
-        val firstAt = if (legIdx == 0 && boardedAt == 0L) now - rideMs(0) else now
+            .minOfOrNull { Geo.distanceM(last.latitude, last.longitude, it.lat, it.lng) } ?: Double.MAX_VALUE
+        val age = now - last.time
+        val fresh = age < 120_000 && last.accuracy < 150
+        val later = legIdx + 1 until trip.legs.size
+        val k = when {
+            fresh && near(trip.legs[legIdx]) >= 600 -> later.firstOrNull { near(trip.legs[it]) <= 250 }
+            !fresh && age > 90_000 && near(trip.legs[legIdx]) >= 300 ->
+                later.firstOrNull { trip.legs[it].isMetroOnly() && near(trip.legs[it]) <= 500 }
+            else -> null
+        } ?: return null
+        Diag.mark(this, if (fresh) "定位显示已到第 ${k + 1} 段上车站附近，跳过前面的段" else "在第 ${k + 1} 段地铁站附近没了信号，判断已进站")
+        val firstAt = if (legIdx == 0 && boardedAt == 0L) last.time - rideMs(0) else now
         onBoarded(manual = false, at = firstAt)
         while (legIdx < k) onBoarded(manual = false, at = now)
-        // 已经下车站在换乘点：不再按乘车时间倒数
         boardedAt = now - rideMs(k - 1); alightAt = now; rideLearned = true
+        if (trip.legs[k].isMetroOnly()) { stationAt = if (fresh) 0L else last.time; if (fresh) nearSince = now }
         return 1_000L
     }
 
@@ -667,12 +678,16 @@ class CommuteService : Service() {
         val d = loc?.let { Geo.distanceM(it.latitude, it.longitude, dest.first, dest.second) }
         val eta = boardedAt + rideMs(legIdx)
         val near = d != null && d <= 700
-        val timeUp = now >= eta - 90_000 && (d == null || d < 1_500)
+        // 地铁段还没拿到站数（服务刚恢复、预取没完成）时，手填的乘车时间不可靠，先不按时间提醒下车
+        val etaKnown = !metro || metroRideSec[legIdx] != null || Learn.rideMin(this, trip.id, legIdx) != null
+        val timeUp = etaKnown && now >= eta - 90_000 && (d == null || d < 1_500)
         if (arriveAlertedAt == 0L && (near || timeUp)) {
             arriveAlertedAt = now
             LiveNotifier.alert(this, "快到 $name 了", "准备下车", metro = metro, id = 1005)
         }
-        if (arriveAlertedAt > 0 && ((d != null && d <= 150) || now - arriveAlertedAt > 5 * 60_000L)) {
+        // 结束：到了下车站 150 米内，或提醒后过了 5 分钟且已经超过预计到站时间 3 分钟（地下没定位时别提前结束）
+        if (arriveAlertedAt > 0 && ((d != null && d <= 150) ||
+                (now - arriveAlertedAt > 5 * 60_000L && now > eta + 3 * 60_000L))) {
             finish(); return 60_000L
         }
         val total = rideMs(legIdx).coerceAtLeast(60_000L)
@@ -683,7 +698,8 @@ class CommuteService : Service() {
         val left = if (d != null && d > 1_500) (d / (if (metro) 550.0 else 350.0)).toInt().coerceAtLeast(1)
             else ((eta - now) / 60_000L).toInt()
         val short = when {
-            arriveAlertedAt > 0 -> "下车"
+            arriveAlertedAt > 0 && (d != null && d <= 700 || now >= eta - 60_000) -> "下车"
+            arriveAlertedAt > 0 -> "快到了"
             d != null && d < 1_500 -> "${d.toInt()}米"
             left > 0 -> "约${left}分"
             else -> "快到了"
