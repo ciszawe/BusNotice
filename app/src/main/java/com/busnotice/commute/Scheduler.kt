@@ -169,6 +169,7 @@ class BootReceiver : BroadcastReceiver() {
 /** 记录最近一次自动启动发生了什么，首页显示，方便排查被系统拦截 */
 object Diag {
     fun mark(ctx: Context, what: String) {
+        TraceLog.event("diag", "msg" to what)
         val t = java.time.LocalDateTime.now()
         ctx.getSharedPreferences("diag", Context.MODE_PRIVATE).edit()
             .putString("last", "%d/%d %02d:%02d %s".format(t.monthValue, t.dayOfMonth, t.hour, t.minute, what)).apply()
