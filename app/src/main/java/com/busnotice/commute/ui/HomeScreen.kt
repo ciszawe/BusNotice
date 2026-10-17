@@ -33,6 +33,12 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.displayCutout
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -45,7 +51,6 @@ import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
-import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
@@ -56,22 +61,21 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.Snackbar
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
@@ -117,25 +121,48 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
     val days = remember(resumeTick) { com.busnotice.commute.TraceLog.dayCount(ctx) }
     val diag = remember(resumeTick, version) { com.busnotice.commute.Diag.last(ctx) }
 
-    val scroll = TopAppBarDefaults.pinnedScrollBehavior()
+    val listState = rememberLazyListState()
+    // 点「测试」或行程开始后，实时看板插到列表顶部：滚回顶部让看板完整露出来，不被挤到上面
+    val liveId = live?.tripId
+    LaunchedEffect(liveId) { if (liveId != null) listState.animateScrollToItem(0) }
+
     Box(Modifier.fillMaxSize()) {
         GradientBackground(dark)
         Scaffold(
-            modifier = Modifier.nestedScroll(scroll.nestedScrollConnection),
             containerColor = Color.Transparent,
             contentColor = ink,
-            topBar = {
-                TopAppBar(
-                    title = { Text("通勤胶囊", fontSize = 28.sp, fontWeight = FontWeight.Bold) },
-                    actions = {
-                        Box(Modifier.padding(end = 12.dp)) {
-                            Box(
-                                Modifier.size(40.dp).clip(CircleShape)
-                                    .background(Color.White.copy(alpha = if (dark) 0.1f else 0.6f))
-                                    .clickable { menuOpen = true },
-                                contentAlignment = Alignment.Center,
-                            ) { Text("⋯", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = ink) }
-                            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+            floatingActionButton = {
+                ExtendedFloatingActionButton(
+                    onClick = onNew, icon = { Icon(Icons.Default.Add, null) }, text = { Text("新建行程", fontWeight = FontWeight.Bold) },
+                    shape = CircleShape,
+                    containerColor = if (dark) Fuse.Yellow else Fuse.Night,
+                    contentColor = if (dark) Color(0xFF111111) else Color.White,
+                )
+            },
+            snackbarHost = { SnackbarHost(snack) { Snackbar(it, shape = RoundedCornerShape(16.dp)) } },
+        ) { pad ->
+            // 没有顶栏：标题放进列表第一项；列表本身从状态栏下面开始（会裁切），内容不会画到状态栏文字下面
+            LazyColumn(
+                modifier = Modifier.fillMaxSize().padding(top = pad.calculateTopPadding())
+                    .windowInsetsPadding(WindowInsets.displayCutout.only(WindowInsetsSides.Horizontal)),
+                state = listState,
+                contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = 4.dp, bottom = pad.calculateBottomPadding() + 96.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                item(key = "title") {
+                    Row(
+                        Modifier.fillMaxWidth().padding(start = 8.dp, end = 4.dp, top = 12.dp, bottom = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text("通勤胶囊", fontSize = 28.sp, fontWeight = FontWeight.Bold, color = ink, modifier = Modifier.weight(1f))
+                        Box {
+                            RoundButton(onClick = { menuOpen = true }, dark = dark) {
+                                Text("⋯", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = ink)
+                            }
+                            DropdownMenu(
+                                expanded = menuOpen, onDismissRequest = { menuOpen = false },
+                                shape = MenuShape, containerColor = Fuse.surface(dark),
+                            ) {
                                 DropdownMenuItem(
                                     text = { Text("build-${com.busnotice.commute.Updater.currentBuild(ctx)} · 检查更新") },
                                     onClick = { menuOpen = false; com.busnotice.commute.Updater.force.intValue++ },
@@ -155,30 +182,8 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
                                 }
                             }
                         }
-                    },
-                    colors = TopAppBarDefaults.topAppBarColors(
-                        containerColor = Color.Transparent,
-                        scrolledContainerColor = (if (dark) Fuse.DarkBg else Fuse.LightBg).copy(alpha = 0.85f),
-                        titleContentColor = ink, actionIconContentColor = ink,
-                    ),
-                    scrollBehavior = scroll,
-                )
-            },
-            floatingActionButton = {
-                ExtendedFloatingActionButton(
-                    onClick = onNew, icon = { Icon(Icons.Default.Add, null) }, text = { Text("新建行程", fontWeight = FontWeight.Bold) },
-                    shape = CircleShape,
-                    containerColor = if (dark) Fuse.Yellow else Fuse.Night,
-                    contentColor = if (dark) Color(0xFF111111) else Color.White,
-                )
-            },
-            snackbarHost = { SnackbarHost(snack) },
-        ) { pad ->
-            LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = pad.calculateTopPadding() + 4.dp, bottom = 120.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
+                    }
+                }
                 live?.let { s -> item(key = "live") { LiveBoard(s, trips.firstOrNull { it.id == s.tripId }, dark) } }
                 // 缺必需设置时放上面显眼处，全齐了就放到列表最后
                 val permUrgent = perms.any { !it.granted && !it.optional }
@@ -234,19 +239,21 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
         ModalBottomSheet(
             onDismissRequest = { permSheet = false },
             sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+            containerColor = Fuse.surface(dark), contentColor = ink,
         ) { PermSheet(perms) }
     }
 
     confirmDelete?.let { t ->
         AlertDialog(
             onDismissRequest = { confirmDelete = null },
+            shape = DialogShape, containerColor = Fuse.surface(dark), titleContentColor = ink, textContentColor = ink,
             title = { Text("删除「${t.name}」？") },
             confirmButton = {
-                TextButton(onClick = {
+                DialogButton("删除", primary = true, onClick = {
                     Scheduler.cancel(ctx, t.id); TripStore.delete(ctx, t.id); confirmDelete = null; version++
-                }) { Text("删除") }
+                })
             },
-            dismissButton = { TextButton(onClick = { confirmDelete = null }) { Text("取消") } },
+            dismissButton = { DialogButton("取消", onClick = { confirmDelete = null }) },
         )
     }
 }
@@ -306,7 +313,7 @@ private fun PermItem(p: Perm) {
                 Text("已开启", style = MaterialTheme.typography.labelLarge, color = Fuse.BusGreen)
             }
         } else {
-            FilledTonalButton(onClick = p.action) { Text("去开启") }
+            PillButton(onClick = p.action) { Text("去开启") }
         }
     }
 }
@@ -348,7 +355,13 @@ private fun TripCard(
             }
         }
         RouteRow(trip, dark, Modifier.padding(top = 6.dp).alpha(fade))
-        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 6.dp)) {
+        // 下次触发的说明可能较长：单独占一行（最多两行），不和「测试」「⋯」挤在一起被截断
+        val nextText = if (!running && trip.enabled) Scheduler.nextTriggerText(trip, ctx) else null
+        if (nextText != null) {
+            Text(nextText, fontSize = 13.sp, color = dimColor, maxLines = 2, overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(top = 10.dp, end = 4.dp))
+        }
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = if (nextText != null) 0.dp else 6.dp)) {
             Box(Modifier.weight(1f)) {
                 when {
                     running -> Text(
@@ -358,8 +371,7 @@ private fun TripCard(
                             .background(Fuse.BusGreen.copy(alpha = if (dark) 0.25f else 0.14f))
                             .padding(horizontal = 8.dp, vertical = 3.dp),
                     )
-                    trip.enabled -> Text(Scheduler.nextTriggerText(trip, ctx), fontSize = 13.sp, color = dimColor,
-                        maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    nextText != null -> {}
                     else -> Text("已暂停", fontSize = 13.sp, color = dimColor)
                 }
             }
@@ -370,7 +382,7 @@ private fun TripCard(
                 TextButton(onClick = { more = true }, contentPadding = PaddingValues(horizontal = 10.dp)) {
                     Text("⋯", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = dimColor)
                 }
-                DropdownMenu(expanded = more, onDismissRequest = { more = false }) {
+                DropdownMenu(expanded = more, onDismissRequest = { more = false }, shape = MenuShape, containerColor = Fuse.surface(dark)) {
                     DropdownMenuItem(text = { Text("生成回程") }, onClick = { more = false; onReverse() })
                     DropdownMenuItem(text = { Text("编辑") }, onClick = { more = false; onEdit() })
                     DropdownMenuItem(text = { Text("删除") }, onClick = { more = false; onDelete() })
