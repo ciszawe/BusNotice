@@ -190,6 +190,22 @@ fun LiveBoard(s: LiveSnapshot, trip: Trip?, dark: Boolean) {
     }
 }
 
+/** 进程重启后、服务还没刷新出新状态时的占位看板：行程名 +「正在恢复…」，可以直接结束 */
+@Composable
+fun RestoringBoard(tripName: String, dark: Boolean) {
+    val ctx = LocalContext.current
+    Column(Modifier.fillMaxWidth().board(dark).padding(18.dp)) {
+        Text(tripName, color = Color.White.copy(alpha = 0.65f), fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        Text("正在恢复…", color = Fuse.Yellow, fontSize = 32.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 10.dp))
+        Text("行程还在进行，马上刷新到最新状态", color = Color.White, fontSize = 14.sp, modifier = Modifier.padding(top = 6.dp))
+        Row(Modifier.padding(top = 14.dp)) {
+            Pill("结束", Color.White.copy(alpha = 0.12f), Color.White, Color.White.copy(alpha = 0.2f), Modifier.weight(1f)) {
+                CommuteService.stop(ctx)
+            }
+        }
+    }
+}
+
 @Composable
 private fun Pill(text: String, bg: Color, fg: Color, border: Color?, modifier: Modifier, onClick: () -> Unit) {
     var m = modifier.height(44.dp).clip(CircleShape).background(bg)
