@@ -26,8 +26,6 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TimePicker
-import androidx.compose.material3.rememberTimePickerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.getValue
@@ -211,20 +209,15 @@ fun TripEditor(
 
     pickTime?.let { which ->
         val init = if (which == 0) trip.startMinute else trip.endMinute
-        val st = rememberTimePickerState(initialHour = init / 60, initialMinute = init % 60, is24Hour = true)
-        AlertDialog(
-            onDismissRequest = { pickTime = null },
-            shape = DialogShape, containerColor = Fuse.surface(dark), titleContentColor = ink, textContentColor = ink,
-            confirmButton = {
-                DialogButton("确定", primary = true, onClick = {
-                    val m = st.hour * 60 + st.minute
-                    var t = if (which == 0) trip.copy(startMinute = m) else trip.copy(endMinute = m)
-                    if (t.endMinute <= t.startMinute) t = t.copy(endMinute = (t.startMinute + 30).coerceAtMost(23 * 60 + 59))
-                    onChange(t); pickTime = null
-                })
+        TimeWheelSheet(
+            title = if (which == 0) "开始时间" else "结束时间",
+            initialMinute = init,
+            onDismiss = { pickTime = null },
+            onConfirm = { m ->
+                var t = if (which == 0) trip.copy(startMinute = m) else trip.copy(endMinute = m)
+                if (t.endMinute <= t.startMinute) t = t.copy(endMinute = (t.startMinute + 30).coerceAtMost(23 * 60 + 59))
+                onChange(t); pickTime = null
             },
-            dismissButton = { DialogButton("取消", onClick = { pickTime = null }) },
-            text = { TimePicker(state = st, colors = glassTimePickerColors(dark)) },
         )
     }
 }
