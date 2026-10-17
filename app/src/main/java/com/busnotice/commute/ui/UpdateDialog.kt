@@ -1,21 +1,24 @@
 package com.busnotice.commute.ui
 
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
@@ -48,20 +51,27 @@ fun UpdateDialog(tick: Int) {
 
     val r = rel ?: return
     val downloading = progress >= 0f && file == null && !error
+    val dark = isSystemInDarkTheme()
+    val ink = Fuse.ink(dark)
     AlertDialog(
         onDismissRequest = { if (!downloading) rel = null },
+        shape = DialogShape, containerColor = Fuse.surface(dark), titleContentColor = ink, textContentColor = ink,
         title = { Text("有新版本 build-${r.build}") },
         text = {
             Column {
                 Text("当前 build-${Updater.currentBuild(ctx)}。" + if (error) "下载失败，网络不好时可以稍后再试。" else "")
                 if (downloading) {
                     Spacer(Modifier.height(12.dp))
-                    LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
+                    LinearProgressIndicator(
+                        progress = { progress }, modifier = Modifier.fillMaxWidth().height(6.dp).clip(CircleShape),
+                        color = Fuse.accent(dark), trackColor = Fuse.hairline(dark),
+                        strokeCap = StrokeCap.Round, gapSize = 0.dp, drawStopIndicator = {},
+                    )
                 }
             }
         },
         confirmButton = {
-            TextButton(enabled = !downloading, onClick = {
+            DialogButton(if (file != null) "安装" else if (downloading) "下载中…" else "更新", primary = true, enabled = !downloading, onClick = {
                 val have = file
                 if (have != null) waitPerm = !Updater.install(ctx, have)
                 else {
@@ -71,7 +81,7 @@ fun UpdateDialog(tick: Int) {
                         if (f == null) error = true else { file = f; waitPerm = !Updater.install(ctx, f) }
                     }
                 }
-            }) { Text(if (file != null) "安装" else if (downloading) "下载中…" else "更新") }
+            })
         },
         dismissButton = {
             if (!downloading) Row2(
@@ -85,7 +95,7 @@ fun UpdateDialog(tick: Int) {
 @Composable
 private fun Row2(onLater: () -> Unit, onSkip: () -> Unit) {
     androidx.compose.foundation.layout.Row {
-        TextButton(onClick = onSkip) { Text("跳过此版") }
-        TextButton(onClick = onLater) { Text("稍后") }
+        DialogButton("跳过此版", onClick = onSkip)
+        DialogButton("稍后", onClick = onLater)
     }
 }
