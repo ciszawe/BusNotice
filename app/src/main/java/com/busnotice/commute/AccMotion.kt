@@ -60,4 +60,37 @@ object AccMotion {
         }
         return false
     }
+
+    /**
+     * 「手机一直没动」跟踪：把最近窗口按时间增量喂进来，记下最后一次持续动（走路 ≥ 6 秒或类似坐车的晃动 ≥ 30 秒）的时刻，
+     * 以及窗口连续覆盖（中间断档不超过 90 秒）从什么时候开始。只用来判断能不能沿用上一次定位。
+     */
+    class StillTracker {
+        var coveredSince = 0L; private set
+        var lastT = 0L; private set
+        var movedAt = 0L; private set
+        private var activeRun = 0
+        private var vehicleRun = 0
+
+        fun feed(ws: List<Win>) {
+            for (w in ws.sortedBy { it.t }) {
+                if (w.t <= lastT) continue
+                if (lastT == 0L || w.t - lastT > MAX_GAP_MS) { coveredSince = w.t - WIN_MS; activeRun = 0; vehicleRun = 0 }
+                when (classify(w)) {
+                    // 走路或更剧烈（幅值 ≥ 1.0）都算「在动」
+                    Kind.WALK, Kind.OTHER -> { activeRun++; vehicleRun = 0 }
+                    Kind.VEHICLE -> { vehicleRun++; activeRun = 0 }
+                    Kind.STILL -> { activeRun = 0; vehicleRun = 0 }
+                }
+                if (activeRun >= 3 || vehicleRun >= 15) movedAt = w.t
+                lastT = w.t
+            }
+        }
+
+        /** 从 t 起手机一直没动：窗口覆盖到 t 附近（60 秒内）、最近 90 秒还有窗口、t 之后没有持续动过 */
+        fun stillSince(t: Long, now: Long): Boolean =
+            coveredSince > 0 && coveredSince <= t + 60_000L && now - lastT < MAX_GAP_MS && movedAt < t
+    }
+
+    private const val MAX_GAP_MS = 90_000L
 }
