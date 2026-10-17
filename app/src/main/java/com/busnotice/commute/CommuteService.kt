@@ -48,8 +48,79 @@ data class LiveSnapshot(
     val stopsTotal: Int? = null,
 )
 
+/**
+ * 界面读的实时状态。内存里一份（StateFlow），另外存一份到本地（SharedPreferences）：
+ * 进程被杀后重开 App、服务还没跑第一轮刷新时，首页用存下的这份先把看板显示出来。
+ * 只是显示用的缓存，不参与任何判断。
+ */
 object LiveState {
     val snapshot = MutableStateFlow<LiveSnapshot?>(null)
+
+    private const val PREFS = "live_snapshot"
+    private const val SAVE_EVERY_MS = 15_000L
+    private var lastSaved: LiveSnapshot? = null
+    private var lastSavedAt = 0L
+
+    /** 服务每次刷新时调用：更新内存，按需存盘（内容变了才写；内容没变最多 15 秒写一次） */
+    fun publish(ctx: Context, s: LiveSnapshot, deadline: Long) {
+        snapshot.value = s
+        val now = System.currentTimeMillis()
+        val same = lastSaved?.copy(updatedAt = 0L) == s.copy(updatedAt = 0L)
+        if (same && now - lastSavedAt < SAVE_EVERY_MS) return
+        lastSaved = s; lastSavedAt = now
+        runCatching {
+            ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+                .putString("snap", toJson(s).toString()).putLong("deadline", deadline).apply()
+        }
+    }
+
+    /** 行程结束：删掉存下的那份 */
+    fun clearPersisted(ctx: Context) {
+        lastSaved = null; lastSavedAt = 0L
+        runCatching { ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().clear().apply() }
+    }
+
+    /** 中断恢复记录（run_state）里还没到期的行程：tripId；没有返回 null */
+    fun activeRunTrip(ctx: Context): String? {
+        val p = ctx.getSharedPreferences("run_state", Context.MODE_PRIVATE)
+        val id = p.getString("trip", null) ?: return null
+        return id.takeIf { p.getLong("deadline", 0) > System.currentTimeMillis() }
+    }
+
+    /** 读存下的那份：run_state 里同一趟行程还没到期才算数（tripId 不对就返回 null） */
+    fun loadPersisted(ctx: Context, tripId: String? = activeRunTrip(ctx)): LiveSnapshot? {
+        if (tripId == null) return null
+        val p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        if (p.getLong("deadline", 0) <= System.currentTimeMillis()) return null
+        val s = runCatching { fromJson(org.json.JSONObject(p.getString("snap", null) ?: return null)) }.getOrNull()
+        return s?.takeIf { it.tripId == tripId }
+    }
+
+    /** 内存里是空的（进程刚重启）：用存下的那份补上；已经有就不动 */
+    fun ensureRestored(ctx: Context, tripId: String? = activeRunTrip(ctx)) {
+        if (snapshot.value != null) return
+        val s = loadPersisted(ctx, tripId) ?: return
+        snapshot.compareAndSet(null, s)
+    }
+
+    private fun toJson(s: LiveSnapshot) = org.json.JSONObject()
+        .put("tripId", s.tripId).put("tripName", s.tripName).put("legIndex", s.legIndex).put("legCount", s.legCount)
+        .put("legTitle", s.legTitle).put("headline", s.headline).put("detail", s.detail)
+        .put("mode", s.mode?.name ?: "").put("progress", s.progress ?: -1).put("countdownTo", s.countdownTo ?: -1L)
+        .put("riding", s.riding).put("updatedAt", s.updatedAt)
+        .put("stopsPassed", s.stopsPassed ?: -1).put("stopsTotal", s.stopsTotal ?: -1)
+
+    private fun fromJson(o: org.json.JSONObject) = LiveSnapshot(
+        tripId = o.getString("tripId"), tripName = o.optString("tripName"),
+        legIndex = o.optInt("legIndex"), legCount = o.optInt("legCount", 1), legTitle = o.optString("legTitle"),
+        headline = o.optString("headline"), detail = o.optString("detail"),
+        mode = o.optString("mode").takeIf { it.isNotEmpty() }?.let { m -> runCatching { Decision.Mode.valueOf(m) }.getOrNull() },
+        progress = o.optInt("progress", -1).takeIf { it >= 0 },
+        countdownTo = o.optLong("countdownTo", -1L).takeIf { it >= 0 },
+        riding = o.optBoolean("riding"), updatedAt = o.optLong("updatedAt", 0L),
+        stopsPassed = o.optInt("stopsPassed", -1).takeIf { it >= 0 },
+        stopsTotal = o.optInt("stopsTotal", -1).takeIf { it >= 0 },
+    )
 }
 
 /**
@@ -90,6 +161,7 @@ class CommuteService : Service() {
             val svc = instance
             if (svc != null) { svc.userFinish(); return }
             ctx.getSharedPreferences("run_state", Context.MODE_PRIVATE).edit().clear().apply()
+            LiveState.clearPersisted(ctx); LiveState.snapshot.value = null
             ctx.stopService(Intent(ctx, CommuteService::class.java))
         }
     }
@@ -164,6 +236,7 @@ class CommuteService : Service() {
         TraceLog.event("run", "manual" to manual, "restart" to (intent == null))
         stationAt = 0L; metroRideSec.clear(); metroRoutes.clear(); alightAt = 0L; fenceFixes.clear(); stillSince = 0L; lastFastAt = 0L; rideLearned = false; stopAlerted = ""
         stationByTap = false; arriveAnchorAt = 0L
+        placeStart = null; arrived = false; lastPlace = null
         legIdx = 0; boardedAt = 0L; nearSince = 0L; fastFixes = 0; alertedKey = null; planDone = false; planAlerted = ""
         maxStops.clear(); maxEta.clear()
         manualRun = manual; pendingBoardAt = 0L; pendingBoardLoc = null; boardCommitted = false; riding = false; transferAlerted = false; arriveAlertedAt = 0L
@@ -177,6 +250,8 @@ class CommuteService : Service() {
         val fresh = intent?.getBooleanExtra("fresh", false) == true
         if (fresh) clearRun()
         val resumedDl = if (fresh) null else restoreRun(t)
+        // 看板缓存：接着中断前那趟跑就先用存下的看板顶上（第一轮刷新前首页不空着）；新的一趟就删掉旧缓存
+        if (resumedDl != null) LiveState.ensureRestored(this, t.id) else LiveState.clearPersisted(this)
         loop = scope.launch { runLoop(resumedDl ?: if (fresh) freshDeadline(t) else deadline(t, manual)) }
         return START_STICKY
     }
@@ -408,9 +483,11 @@ class CommuteService : Service() {
         val leg = trip.legs[legIdx]
         val prev = trip.legs.getOrNull(legIdx - 1)
         val now = System.currentTimeMillis()
-        val loc = best?.takeIf { it.accuracy < 200 && now - it.time < 120_000 }
+        val fresh = best?.takeIf { it.accuracy < 200 && now - it.time < 120_000 }
         // 地铁里网络定位误差大（几百米到一公里），坐地铁时放宽到 800 米也拿来用
-        if (riding) return rideTick(leg, loc ?: best?.takeIf { leg.isMetroOnly() && it.accuracy < 800 && now - it.time < 90_000 }, now)
+        if (riding) return rideTick(leg, fresh ?: best?.takeIf { leg.isMetroOnly() && it.accuracy < 800 && now - it.time < 90_000 }, now)
+        // 第一段还没上车（在家/公司里不动）：没有新定位时试系统缓存位置，再不行且手机一直没动就沿用上一次的好定位
+        val loc = fresh ?: if (legIdx == 0 && boardedAt == 0L) walkPhaseLoc(now) else null
 
         // 按位置纠正进度：人已经在后面某一段的上车站附近、离当前这段的站很远，说明前面几段已经坐完了（没识别到上车）
         jumpByLocation(now)?.let { return it }
@@ -550,9 +627,9 @@ class CommuteService : Service() {
         if (plan != null) return planTick(plan, leg, a, now)
         val v = visual(a, leg, connecting, expectArrive, now)
         LiveNotifier.update(this, LiveNotifier.build(this, v))
-        LiveState.snapshot.value = LiveSnapshot(
+        LiveState.publish(this, LiveSnapshot(
             trip.id, trip.name, legIdx, trip.legs.size, leg.title(), v.short, v.text, a.mode, v.progress, v.countdownTo,
-        )
+        ), deadlineAt)
 
         // 该走了 / 换乘紧张：横幅 + 震动，每班车只提醒一次
         val key = "${a.mode}|${a.option?.candidate?.label()}|${a.arrival?.busId}"
@@ -682,9 +759,9 @@ class CommuteService : Service() {
         val v = LiveNotifier.Visual(title, text, short, trip.name,
             countdownTo = now + p.leaveSec * 1000L, metro = true, trackerRes = R.drawable.ic_metro)
         LiveNotifier.update(this, LiveNotifier.build(this, v))
-        LiveState.snapshot.value = LiveSnapshot(
+        LiveState.publish(this, LiveSnapshot(
             trip.id, trip.name, legIdx, trip.legs.size, leg.title(), short, text, a.mode, null, v.countdownTo,
-        )
+        ), deadlineAt)
         val key = "${p.busLabel}@${(now / 1000 + p.trainSec) / 300}"
         if (p.leaveSec in 0..660 && planAlerted != "$key|10" && planAlerted != "$key|0" && p.leaveSec > 120) {
             planAlerted = "$key|10"
@@ -702,6 +779,41 @@ class CommuteService : Service() {
             p.leaveSec < 1800 -> 45_000L
             else -> 90_000L     // 离出发还早：少查几次，省电
         }
+    }
+
+    // ---------- 静止时沿用定位（只给第一段上车前的步行估算用） ----------
+    private val still = AccMotion.StillTracker()
+    private var reuseLoggedFix = 0L
+    private val REUSE_MAX_MS = 15 * 60_000L
+
+    /**
+     * 当前没有新鲜定位时（不动就没有定位回调）：
+     * 1. 取 FUSED/NETWORK/GPS 的系统缓存位置，精度 <200 米里最新的一个，比现有的新就换上；
+     * 2. 还是不新鲜：加速度显示从那次定位起手机一直没动（没有持续走路/坐车），15 分钟内照样当作当前位置。
+     * 不改 best 以外的任何状态，也不用于车上和下车判断。
+     */
+    @SuppressLint("MissingPermission")
+    private fun walkPhaseLoc(now: Long): Location? {
+        val m = lm ?: getSystemService(LocationManager::class.java)?.also { lm = it }
+        if (m != null) {
+            val cached = listOf(LocationManager.FUSED_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.GPS_PROVIDER)
+                .mapNotNull { pr -> runCatching { m.getLastKnownLocation(pr) }.getOrNull() }
+                .filter { it.accuracy < 200 && it.time <= now + 5_000 }
+                .maxByOrNull { it.time }
+            val cur = best
+            if (cached != null && (cur == null || cached.time > cur.time)) { best = cached; TraceLog.loc(cached) }
+        }
+        val b = best?.takeIf { it.accuracy < 200 } ?: return null
+        val age = now - b.time
+        if (age < 120_000) return b
+        if (age > REUSE_MAX_MS) return null
+        still.feed(TraceLog.recentWindows())
+        if (!still.stillSince(b.time, now)) return null
+        if (reuseLoggedFix != b.time) {
+            reuseLoggedFix = b.time
+            TraceLog.event("loc_reuse", "age" to age / 1000, "acc" to b.accuracy.toInt())
+        }
+        return b
     }
 
     private fun resetBusRide() {
@@ -784,6 +896,7 @@ class CommuteService : Service() {
                 if (min >= 3) Learn.recordBusSpeed(this, trip.id, legIdx, BusRide.lengthM(br) / min)
             }
             TraceLog.event("ride_end", "by" to (if (byLoc) "loc" else "time"))
+            arrived = true
             finish(); return 60_000L
         }
         // 车比预计慢、人还在车上：截止时间往后顺延，别到点自己收起（最多顺延到乘车时间的 2 倍 + 40 分钟）
@@ -843,8 +956,8 @@ class CommuteService : Service() {
             bs != null && hops > 0 -> bs.seg.coerceIn(0, hops) to hops
             else -> null
         }
-        LiveState.snapshot.value = LiveSnapshot(trip.id, trip.name, legIdx, trip.legs.size, lineTitle, short, text, null, p, null, riding = true,
-            stopsPassed = stopUi?.first, stopsTotal = stopUi?.second)
+        LiveState.publish(this, LiveSnapshot(trip.id, trip.name, legIdx, trip.legs.size, lineTitle, short, text, null, p, null, riding = true,
+            stopsPassed = stopUi?.first, stopsTotal = stopUi?.second), deadlineAt)
         if (metro && boardedAt + total - now > 5 * 60_000L) { setPower(Power.LOW); return 30_000L }
         setPower(if (d != null && d < 1_500) Power.HIGH else Power.LOW)
         // 坐公交离下车站还远：网络定位 + 一分钟刷一次就够
@@ -957,7 +1070,8 @@ class CommuteService : Service() {
             }
         }.ifEmpty { listOf(LocationManager.GPS_PROVIDER) }
         val interval = if (p == Power.HIGH) 5_000L else 30_000L
-        val minDist = if (p == Power.HIGH) 3f else 20f
+        // 不设最小位移：人不动时也照样按间隔回调，否则在家里一直「定位中」
+        val minDist = 0f
         providers.forEach { pr ->
             try {
                 if (best == null) m.getLastKnownLocation(pr)?.let { onLocation(it) }
@@ -982,8 +1096,36 @@ class CommuteService : Service() {
         return (Geo.distanceM(p.latitude, p.longitude, loc.latitude, loc.longitude) / dt).toFloat()
     }
 
+    // ---------- 常去地点（只显示/记录，不参与判断） ----------
+    private var placeStart: Location? = null   // 这趟第一段上车前的第一个好定位（起点）
+    private var arrived = false                // 按到站结束（到下车站 / 刷卡出站）
+    private var lastPlace: Places.Label? = null
+
+    private fun placeFix(loc: Location) {
+        runCatching {
+            Places.passive(this, loc.latitude, loc.longitude, loc.accuracy, loc.time)
+            if (!::trip.isInitialized || loc.accuracy >= 200) return
+            if (placeStart == null && legIdx == 0 && boardedAt == 0L && loc.time >= startedAt - 30_000) placeStart = Location(loc)
+            val l = Places.classify(this, loc.latitude, loc.longitude, loc.accuracy)
+            if (l != lastPlace) { lastPlace = l; TraceLog.event("place", "label" to l.name) }
+        }
+    }
+
+    /** 结束时投票：真的坐过车才投起点；按到站结束才投终点（用最后一个好定位） */
+    private fun placeVotes() {
+        if (!::trip.isInitialized || restored) return
+        val now = System.currentTimeMillis()
+        runCatching {
+            val boarded = boardedAt > 0 || riding || legIdx > 0
+            placeStart?.takeIf { boarded }?.let { Places.voteTrip(this, true, startedAt, it.latitude, it.longitude, it.accuracy, it.time) }
+            if (arrived) best?.takeIf { it.accuracy < 200 && now - it.time < 10 * 60_000L && it.time > boardedAt }
+                ?.let { Places.voteTrip(this, false, startedAt, it.latitude, it.longitude, it.accuracy, it.time) }
+        }
+    }
+
     private fun onLocation(loc: Location) {
         TraceLog.loc(loc)
+        placeFix(loc)
         val spd = speedOf(loc)
         val cur = best
         val fresher = cur == null || loc.time - cur.time > 15_000
@@ -1136,6 +1278,7 @@ class CommuteService : Service() {
                     cur.isMetroOnly() && legIdx == last && (riding || stationAt > 0) -> {
                         if (riding && !restored && boardedAt > 0) Learn.recordRide(this, trip.id, legIdx, ((at - boardedAt) / 60_000L).toInt())
                         Diag.mark(this, "刷卡出站，行程结束")
+                        arrived = true
                         finish()
                         return
                     }
@@ -1195,6 +1338,7 @@ class CommuteService : Service() {
     }
 
     private fun finish() {
+        if (!finishing) placeVotes()
         TraceLog.event("finish", "leg" to legIdx, "riding" to riding)
         TraceLog.stop()
         finishing = true
@@ -1202,7 +1346,8 @@ class CommuteService : Service() {
         try { lm?.removeUpdates(listener) } catch (_: Exception) { }
         stepSensor(false)
         power = null; highSince = 0L; coolUntil = 0L
-        LiveState.snapshot.value = null
+        LiveState.clearPersisted(this)
+        if (instance === this || instance == null) LiveState.snapshot.value = null
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
     }
@@ -1215,8 +1360,11 @@ class CommuteService : Service() {
     override fun onDestroy() {
         if (!finishing) { Diag.mark(this, "服务被系统停止（非主动结束）"); TraceLog.stop() }
         try { lm?.removeUpdates(listener) } catch (_: Exception) { }
+        // 只有自己还是当前实例（或没有更新的实例）时才清内存里的看板，免得旧实例的 onDestroy 把新实例刚设的状态清掉。
+        // 不是主动结束（被系统停掉、之后会恢复）：本地存的那份留着，重开 App 时还能显示
+        val mine = instance === this || instance == null
         if (instance === this) instance = null
-        LiveState.snapshot.value = null
+        if (mine) LiveState.snapshot.value = null
         scope.cancel()
         super.onDestroy()
     }
