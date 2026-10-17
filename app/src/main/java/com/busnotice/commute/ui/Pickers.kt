@@ -446,6 +446,7 @@ fun ShuttleEditor(initial: Candidate?, onBack: () -> Unit, onDone: (Candidate) -
     var locating by remember { mutableStateOf(false) }
     var query by remember { mutableStateOf("") }
     var result by remember { mutableStateOf<List<ChelaileApi.SearchStation>?>(null) }
+    var pickDep by remember { mutableStateOf(false) }
 
     LaunchedEffect(query) {
         val q = query.trim()
@@ -458,6 +459,18 @@ fun ShuttleEditor(initial: Candidate?, onBack: () -> Unit, onDone: (Candidate) -
         if (h in 0..23 && mi in 0..59) h * 60 + mi else null
     }.distinct().sorted().toList()
 
+    if (pickDep) {
+        // 默认停在最后一班之后 20 分钟，没有就 07:00
+        val init = parsed.lastOrNull()?.let { (it + 20).coerceAtMost(23 * 60 + 59) } ?: (7 * 60)
+        TimeWheelSheet(
+            title = "发车时刻", initialMinute = init,
+            onDismiss = { pickDep = false },
+            onConfirm = { m ->
+                if (m !in parsed) times = (times.trimEnd() + " " + hhmm(m)).trim()
+                pickDep = false
+            },
+        )
+    }
     PickerScaffold(if (initial == null) "添加通勤车" else "编辑通勤车", onBack) {
         item {
             GlassCard {
@@ -470,6 +483,8 @@ fun ShuttleEditor(initial: Candidate?, onBack: () -> Unit, onDone: (Candidate) -
                     supportingText = { Text(if (parsed.isEmpty()) "还没识别到时刻" else "共 ${parsed.size} 班：" + parsed.joinToString(" ") { hhmm(it) }) },
                     modifier = Modifier.fillMaxWidth(),
                 )
+                // 也可以用滚轮选一个时刻，追加到上面
+                PillButton(secondary = true, onClick = { pickDep = true }) { Text("+ 选一个时刻") }
               }
             }
         }
