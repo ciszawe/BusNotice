@@ -50,4 +50,11 @@ object Fuse {
 
     fun ink(dark: Boolean) = if (dark) DarkInk else LightInk
     fun dim(dark: Boolean) = if (dark) DarkDim else LightDim
+    /** 主操作色：浅色模式深色胶囊，深色模式黄色胶囊（和新建行程按钮一致） */
+    fun accent(dark: Boolean) = if (dark) Yellow else Night
+    fun onAccent(dark: Boolean) = if (dark) Color(0xFF111111) else Color.White
+    /** 对话框、菜单的底色 */
+    fun surface(dark: Boolean) = if (dark) Color(0xFF22212F) else Color(0xFFF8F6FF)
+    /** 列表分隔线、浅描边 */
+    fun hairline(dark: Boolean) = if (dark) Color.White.copy(alpha = 0.10f) else Color.Black.copy(alpha = 0.07f)
 }
