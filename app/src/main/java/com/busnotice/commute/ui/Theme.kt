@@ -32,3 +32,22 @@ fun AppTheme(content: @Composable () -> Unit) {
     }
     MaterialTheme(colorScheme = scheme, content = content)
 }
+
+/** 首页「烟玻璃看板 + 浅玻璃列表」用到的固定配色 */
+object Fuse {
+    val Yellow = Color(0xFFFFD23F)
+    val BusGreen = Color(0xFF1F9D55)
+    val MetroRed = Color(0xFFD7263D)
+    val Shuttle = Color(0xFF5B5BD6)
+    val Amber = Color(0xFFE08A00)
+    val Night = Color(0xFF1E1C30)
+    val LightBg = Color(0xFFF1EEFF)
+    val DarkBg = Color(0xFF0F0F18)
+    val LightInk = Color(0xFF1B1B2B)
+    val DarkInk = Color(0xFFF1F1F6)
+    val LightDim = Color(0xFF5A5A6A)
+    val DarkDim = Color(0xFFA9A9BD)
+
+    fun ink(dark: Boolean) = if (dark) DarkInk else LightInk
+    fun dim(dark: Boolean) = if (dark) DarkDim else LightDim
+}
