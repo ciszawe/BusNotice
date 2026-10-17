@@ -2,8 +2,6 @@
 
 package com.busnotice.commute.ui
 
-import androidx.compose.foundation.clickable
-
 import android.Manifest
 import android.app.AlarmManager
 import android.app.NotificationManager
@@ -16,7 +14,11 @@ import android.os.PowerManager
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -24,39 +26,39 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Edit
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.TopAppBar
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -66,14 +68,19 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.busnotice.commute.Candidate
 import com.busnotice.commute.CommuteService
 import com.busnotice.commute.Learn
-import com.busnotice.commute.LiveSnapshot
 import com.busnotice.commute.LiveState
 import com.busnotice.commute.Reverse
 import com.busnotice.commute.Scheduler
@@ -83,12 +90,18 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-private data class Perm(val title: String, val desc: String, val action: () -> Unit)
+/** 一项设置检查：granted = 已满足；optional = 可选项（不算「还差」） */
+private data class Perm(
+    val title: String, val desc: String, val granted: Boolean, val optional: Boolean = false, val action: () -> Unit,
+)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
     val ctx = LocalContext.current
+    val dark = isSystemInDarkTheme()
+    val ink = Fuse.ink(dark)
+    val dimColor = Fuse.dim(dark)
     val scope = rememberCoroutineScope()
     val snack = remember { SnackbarHostState() }
     var version by remember { mutableStateOf(0) }
@@ -96,86 +109,132 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
     val live by LiveState.snapshot.collectAsState()
     var confirmDelete by remember { mutableStateOf<Trip?>(null) }
     var reversing by remember { mutableStateOf(false) }
+    var menuOpen by remember { mutableStateOf(false) }
+    var permSheet by remember { mutableStateOf(false) }
 
     val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { version++ }
-    val perms = remember(resumeTick, version) { missingPerms(ctx) { p -> permLauncher.launch(p) } }
+    val perms = remember(resumeTick, version) { permChecks(ctx) { p -> permLauncher.launch(p) } }
+    val days = remember(resumeTick) { com.busnotice.commute.TraceLog.dayCount(ctx) }
+    val diag = remember(resumeTick, version) { com.busnotice.commute.Diag.last(ctx) }
 
     val scroll = TopAppBarDefaults.pinnedScrollBehavior()
-    Scaffold(
-        modifier = Modifier.nestedScroll(scroll.nestedScrollConnection),
-        topBar = { TopAppBar(title = { Text("通勤胶囊", fontWeight = FontWeight.SemiBold) }, scrollBehavior = scroll) },
-        floatingActionButton = {
-            ExtendedFloatingActionButton(onClick = onNew, icon = { Icon(Icons.Default.Add, null) }, text = { Text("新建行程") })
-        },
-        snackbarHost = { SnackbarHost(snack) },
-    ) { pad ->
-        LazyColumn(
-            modifier = Modifier.fillMaxSize(),
-            contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = pad.calculateTopPadding() + 4.dp, bottom = 120.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            live?.let { s -> item { LiveCard(s) } }
-            if (perms.isNotEmpty()) item { PermCard(perms) }
-            com.busnotice.commute.Diag.last(ctx)?.let { d ->
-                item {
-                    Text("最近状态：$d", style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(horizontal = 4.dp))
-                }
-            }
-            item(key = "ver") {
-                androidx.compose.foundation.layout.Row(Modifier.padding(horizontal = 4.dp)) {
-                    Text("build-${com.busnotice.commute.Updater.currentBuild(ctx)} · 检查更新",
-                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.clickable { com.busnotice.commute.Updater.force.intValue++ })
-                    val days = remember(resumeTick) { com.busnotice.commute.TraceLog.dayCount(ctx) }
-                    if (days > 0) Text("    导出行程记录（${days} 天）",
-                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.clickable { com.busnotice.commute.TraceLog.share(ctx) })
-                }
-            }
-            if (trips.isEmpty()) item {
-                Column(Modifier.fillMaxWidth().padding(vertical = 48.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-                    Text("还没有行程", style = MaterialTheme.typography.titleMedium)
-                    Spacer(Modifier.height(4.dp))
-                    Text("新建一条，选好上车站和时间就行", style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-            }
-            items(trips, key = { it.id }) { t ->
-                TripCard(
-                    trip = t,
-                    running = live?.tripId == t.id,
-                    onToggle = { on ->
-                        val nt = t.copy(enabled = on)
-                        TripStore.upsert(ctx, nt); Scheduler.schedule(ctx, nt); version++
-                    },
-                    onTest = {
-                        CommuteService.start(ctx, t.id, manual = true)
-                        scope.launch { snack.showSnackbar("已开始测试 30 分钟，切到别的 App 看胶囊") }
-                    },
-                    onEdit = { onEdit(t) },
-                    onReverse = {
-                        if (!reversing) {
-                            reversing = true
-                            scope.launch {
-                                val r = withContext(Dispatchers.IO) { runCatching { Reverse.build(t) } }
-                                reversing = false
-                                r.onSuccess { res ->
-                                    if (res.warnings.isNotEmpty()) snack.showSnackbar(res.warnings.joinToString("；"))
-                                    if (res.trip.legs.isNotEmpty()) onEdit(res.trip)
-                                }.onFailure { snack.showSnackbar("生成回程失败：网络不通？") }
+    Box(Modifier.fillMaxSize()) {
+        GradientBackground(dark)
+        Scaffold(
+            modifier = Modifier.nestedScroll(scroll.nestedScrollConnection),
+            containerColor = Color.Transparent,
+            contentColor = ink,
+            topBar = {
+                TopAppBar(
+                    title = { Text("通勤胶囊", fontSize = 28.sp, fontWeight = FontWeight.Bold) },
+                    actions = {
+                        Box(Modifier.padding(end = 12.dp)) {
+                            Box(
+                                Modifier.size(40.dp).clip(CircleShape)
+                                    .background(Color.White.copy(alpha = if (dark) 0.1f else 0.6f))
+                                    .clickable { menuOpen = true },
+                                contentAlignment = Alignment.Center,
+                            ) { Text("⋯", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = ink) }
+                            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                                DropdownMenuItem(
+                                    text = { Text("build-${com.busnotice.commute.Updater.currentBuild(ctx)} · 检查更新") },
+                                    onClick = { menuOpen = false; com.busnotice.commute.Updater.force.intValue++ },
+                                )
+                                if (days > 0) DropdownMenuItem(
+                                    text = { Text("导出行程记录（${days} 天）") },
+                                    onClick = { menuOpen = false; com.busnotice.commute.TraceLog.share(ctx) },
+                                )
+                                diag?.let { d ->
+                                    DropdownMenuItem(
+                                        text = {
+                                            Text("最近状态：$d", style = MaterialTheme.typography.bodySmall,
+                                                modifier = Modifier.widthIn(max = 280.dp))
+                                        },
+                                        onClick = {}, enabled = false,
+                                    )
+                                }
                             }
                         }
                     },
-                    onDelete = { confirmDelete = t },
-                    onApplyLearned = { sg ->
-                        val nt = t.copy(startMinute = sg.start, endMinute = sg.end)
-                        TripStore.upsert(ctx, nt); Scheduler.schedule(ctx, nt); version++
-                        scope.launch { snack.showSnackbar("时间窗改为 ${hhmm(sg.start)}–${hhmm(sg.end)}") }
-                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = Color.Transparent,
+                        scrolledContainerColor = (if (dark) Fuse.DarkBg else Fuse.LightBg).copy(alpha = 0.85f),
+                        titleContentColor = ink, actionIconContentColor = ink,
+                    ),
+                    scrollBehavior = scroll,
                 )
+            },
+            floatingActionButton = {
+                ExtendedFloatingActionButton(
+                    onClick = onNew, icon = { Icon(Icons.Default.Add, null) }, text = { Text("新建行程", fontWeight = FontWeight.Bold) },
+                    shape = CircleShape,
+                    containerColor = if (dark) Fuse.Yellow else Fuse.Night,
+                    contentColor = if (dark) Color(0xFF111111) else Color.White,
+                )
+            },
+            snackbarHost = { SnackbarHost(snack) },
+        ) { pad ->
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(start = 14.dp, end = 14.dp, top = pad.calculateTopPadding() + 4.dp, bottom = 120.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                live?.let { s -> item(key = "live") { LiveBoard(s, trips.firstOrNull { it.id == s.tripId }, dark) } }
+                // 缺必需设置时放上面显眼处，全齐了就放到列表最后
+                val permUrgent = perms.any { !it.granted && !it.optional }
+                if (permUrgent) item(key = "perm") { PermRow(perms, dark) { permSheet = true } }
+                if (trips.isEmpty()) item {
+                    Column(Modifier.fillMaxWidth().padding(vertical = 48.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                        Text("还没有行程", style = MaterialTheme.typography.titleMedium, color = ink)
+                        Spacer(Modifier.height(4.dp))
+                        Text("新建一条，选好上车站和时间就行", style = MaterialTheme.typography.bodyMedium, color = dimColor)
+                    }
+                }
+                items(trips, key = { it.id }) { t ->
+                    TripCard(
+                        trip = t,
+                        running = live?.tripId == t.id,
+                        dark = dark,
+                        onToggle = { on ->
+                            val nt = t.copy(enabled = on)
+                            TripStore.upsert(ctx, nt); Scheduler.schedule(ctx, nt); version++
+                        },
+                        onTest = {
+                            CommuteService.start(ctx, t.id, manual = true)
+                            scope.launch { snack.showSnackbar("已开始测试 30 分钟，切到别的 App 看胶囊") }
+                        },
+                        onEdit = { onEdit(t) },
+                        onReverse = {
+                            if (!reversing) {
+                                reversing = true
+                                scope.launch {
+                                    val r = withContext(Dispatchers.IO) { runCatching { Reverse.build(t) } }
+                                    reversing = false
+                                    r.onSuccess { res ->
+                                        if (res.warnings.isNotEmpty()) snack.showSnackbar(res.warnings.joinToString("；"))
+                                        if (res.trip.legs.isNotEmpty()) onEdit(res.trip)
+                                    }.onFailure { snack.showSnackbar("生成回程失败：网络不通？") }
+                                }
+                            }
+                        },
+                        onDelete = { confirmDelete = t },
+                        onApplyLearned = { sg ->
+                            val nt = t.copy(startMinute = sg.start, endMinute = sg.end)
+                            TripStore.upsert(ctx, nt); Scheduler.schedule(ctx, nt); version++
+                            scope.launch { snack.showSnackbar("时间窗改为 ${hhmm(sg.start)}–${hhmm(sg.end)}") }
+                        },
+                    )
+                }
+                if (!permUrgent && perms.isNotEmpty()) item(key = "perm") { PermRow(perms, dark) { permSheet = true } }
             }
         }
+    }
+
+    if (permSheet) {
+        ModalBottomSheet(
+            onDismissRequest = { permSheet = false },
+            sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        ) { PermSheet(perms) }
     }
 
     confirmDelete?.let { t ->
@@ -192,152 +251,211 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
     }
 }
 
+/** 设置检查一行：「设置检查  N / M ›」，缺必需项时显示琥珀色提示 */
 @Composable
-private fun LiveCard(s: LiveSnapshot) {
-    val ctx = LocalContext.current
-    Card(
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
-        shape = RoundedCornerShape(24.dp),
+private fun PermRow(perms: List<Perm>, dark: Boolean, onOpen: () -> Unit) {
+    val ink = Fuse.ink(dark)
+    val ok = perms.count { it.granted }
+    val missing = perms.count { !it.granted && !it.optional }
+    Row(
+        Modifier.fillMaxWidth().glass(dark).clickable(onClick = onOpen).padding(horizontal = 16.dp, vertical = 16.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
-            Text(
-                if (s.legCount > 1) "${s.tripName} · 第 ${s.legIndex + 1}/${s.legCount} 段 · ${s.legTitle}" else "${s.tripName} · ${s.legTitle}",
-                style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onPrimaryContainer,
-                maxLines = 1, overflow = TextOverflow.Ellipsis,
-            )
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(s.headline, style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.onPrimaryContainer, modifier = Modifier.weight(1f))
-                if (!s.riding) {
-                    FilledTonalButton(onClick = { CommuteService.instance?.onBoarded() },
-                        contentPadding = PaddingValues(horizontal = 14.dp)) { Text("已上车") }
-                    Spacer(Modifier.width(6.dp))
-                }
-                OutlinedButton(onClick = { CommuteService.stop(ctx) },
-                    contentPadding = PaddingValues(horizontal = 14.dp)) { Text("结束") }
-            }
-            Text(s.detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onPrimaryContainer,
-                maxLines = 2, overflow = TextOverflow.Ellipsis)
-            s.progress?.let {
-                Spacer(Modifier.height(8.dp))
-                LinearProgressIndicator(progress = { it.coerceIn(0, 100) / 100f }, modifier = Modifier.fillMaxWidth().height(4.dp))
-            }
+        Text("设置检查", fontSize = 14.sp, color = ink)
+        Spacer(Modifier.weight(1f))
+        if (missing > 0) {
+            Box(Modifier.size(7.dp).clip(CircleShape).background(Fuse.Amber))
+            Spacer(Modifier.width(6.dp))
+            Text("还差 $missing 项设置", fontSize = 13.sp, color = Fuse.Amber, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.width(10.dp))
+        }
+        Text("$ok / ${perms.size} ›", fontSize = 14.sp, color = ink, style = TextStyle(fontFeatureSettings = "tnum"))
+    }
+}
+
+@Composable
+private fun PermSheet(perms: List<Perm>) {
+    Column(
+        Modifier.fillMaxWidth().verticalScroll(rememberScrollState())
+            .padding(start = 20.dp, end = 20.dp, bottom = 24.dp).navigationBarsPadding(),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text("设置检查", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+        perms.filter { !it.optional }.forEach { PermItem(it) }
+        val opt = perms.filter { it.optional }
+        if (opt.isNotEmpty()) {
+            Text("可选", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 8.dp))
+            opt.forEach { PermItem(it) }
         }
     }
 }
 
 @Composable
-private fun PermCard(perms: List<Perm>) {
-    Card(
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
-        shape = RoundedCornerShape(24.dp),
-    ) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+private fun PermItem(p: Perm) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(p.title, style = MaterialTheme.typography.bodyLarge)
+            Text(p.desc, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Spacer(Modifier.width(8.dp))
+        if (p.granted) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Default.Warning, null, tint = MaterialTheme.colorScheme.onErrorContainer)
-                Spacer(Modifier.width(8.dp))
-                Text("还差几项设置", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.onErrorContainer)
+                Icon(Icons.Default.Check, null, tint = Fuse.BusGreen, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(4.dp))
+                Text("已开启", style = MaterialTheme.typography.labelLarge, color = Fuse.BusGreen)
             }
-            perms.forEach { p ->
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Column(Modifier.weight(1f)) {
-                        Text(p.title, style = MaterialTheme.typography.bodyLarge, color = MaterialTheme.colorScheme.onErrorContainer)
-                        Text(p.desc, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onErrorContainer)
-                    }
-                    FilledTonalButton(onClick = p.action) { Text("去开启") }
-                }
-            }
+        } else {
+            FilledTonalButton(onClick = p.action) { Text("去开启") }
         }
     }
 }
 
 @Composable
 private fun TripCard(
-    trip: Trip, running: Boolean,
+    trip: Trip, running: Boolean, dark: Boolean,
     onToggle: (Boolean) -> Unit, onTest: () -> Unit, onEdit: () -> Unit, onReverse: () -> Unit, onDelete: () -> Unit,
-    onApplyLearned: (Learn.Suggestion) -> Unit,
+    @Suppress("UNUSED_PARAMETER") onApplyLearned: (Learn.Suggestion) -> Unit,
 ) {
     val ctx = LocalContext.current
-    Card(shape = RoundedCornerShape(24.dp), onClick = onEdit) {
-        Column(Modifier.padding(start = 20.dp, end = 12.dp, top = 16.dp, bottom = 8.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text(trip.name, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
-                    Text("${trip.daysText()} · ${trip.timeText()}", style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-                Switch(checked = trip.enabled, onCheckedChange = onToggle)
+    val ink = Fuse.ink(dark)
+    val dimColor = Fuse.dim(dark)
+    val fade = if (trip.enabled) 1f else 0.55f
+    var more by remember { mutableStateOf(false) }
+
+    Column(Modifier.fillMaxWidth().glass(dark).clickable(onClick = onEdit).padding(start = 16.dp, end = 12.dp, top = 16.dp, bottom = 6.dp)) {
+        Row(verticalAlignment = Alignment.Top) {
+            Column(Modifier.weight(1f).padding(end = 8.dp)) {
+                Text(trip.name, fontSize = 19.sp, fontWeight = FontWeight.Bold, color = ink, maxLines = 1,
+                    overflow = TextOverflow.Ellipsis, modifier = Modifier.alpha(fade))
+                Text("${trip.daysText()} · 至 ${hhmm(trip.endMinute)}", fontSize = 13.sp, color = dimColor,
+                    modifier = Modifier.padding(top = 3.dp))
             }
-            Spacer(Modifier.height(10.dp))
-            Text(
-                trip.legs.joinToString("  →  ") { it.title() }.ifEmpty { "还没有设置线路" },
-                style = MaterialTheme.typography.bodyLarge, maxLines = 2, overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                trip.legs.firstOrNull()?.stopName()?.let { "从 $it 上车" } ?: "",
-                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    if (running) "运行中" else if (trip.enabled) Scheduler.nextTriggerText(trip, ctx) else "已暂停",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = if (running) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.weight(1f),
+            Column(horizontalAlignment = Alignment.End) {
+                Text(hhmm(trip.startMinute), fontSize = 28.sp, fontWeight = FontWeight.Bold, color = ink,
+                    style = TextStyle(fontFeatureSettings = "tnum"), modifier = Modifier.alpha(fade))
+                Switch(
+                    checked = trip.enabled, onCheckedChange = onToggle,
+                    colors = SwitchDefaults.colors(
+                        checkedTrackColor = if (dark) Fuse.Yellow else Fuse.Night,
+                        checkedThumbColor = if (dark) Fuse.Night else Color.White,
+                        checkedBorderColor = Color.Transparent,
+                        uncheckedTrackColor = Color(0x667F7F8C),
+                        uncheckedThumbColor = Color.White,
+                        uncheckedBorderColor = Color.Transparent,
+                    ),
                 )
-                IconButton(onClick = onTest) { Icon(Icons.Default.PlayArrow, "测试") }
-                IconButton(onClick = onReverse) { Icon(Icons.Default.Refresh, "生成回程") }
-                IconButton(onClick = onEdit) { Icon(Icons.Default.Edit, "编辑") }
-                IconButton(onClick = onDelete) { Icon(Icons.Default.Delete, "删除", Modifier.size(22.dp)) }
+            }
+        }
+        RouteRow(trip, dark, Modifier.padding(top = 6.dp).alpha(fade))
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 6.dp)) {
+            Box(Modifier.weight(1f)) {
+                when {
+                    running -> Text(
+                        "运行中", fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                        color = if (dark) Color(0xFF7FE0A6) else Color(0xFF167A40),
+                        modifier = Modifier.clip(RoundedCornerShape(6.dp))
+                            .background(Fuse.BusGreen.copy(alpha = if (dark) 0.25f else 0.14f))
+                            .padding(horizontal = 8.dp, vertical = 3.dp),
+                    )
+                    trip.enabled -> Text(Scheduler.nextTriggerText(trip, ctx), fontSize = 13.sp, color = dimColor,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    else -> Text("已暂停", fontSize = 13.sp, color = dimColor)
+                }
+            }
+            TextButton(onClick = onTest, contentPadding = PaddingValues(horizontal = 10.dp)) {
+                Text("测试", fontSize = 13.sp, color = dimColor)
+            }
+            Box {
+                TextButton(onClick = { more = true }, contentPadding = PaddingValues(horizontal = 10.dp)) {
+                    Text("⋯", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = dimColor)
+                }
+                DropdownMenu(expanded = more, onDismissRequest = { more = false }) {
+                    DropdownMenuItem(text = { Text("生成回程") }, onClick = { more = false; onReverse() })
+                    DropdownMenuItem(text = { Text("编辑") }, onClick = { more = false; onEdit() })
+                    DropdownMenuItem(text = { Text("删除") }, onClick = { more = false; onDelete() })
+                }
             }
         }
     }
 }
 
+/** 线路小牌：步行（去第一段上车点） — 各段线路牌，段内多个可选线路用「/」隔开 */
+@Composable
+private fun RouteRow(trip: Trip, dark: Boolean, modifier: Modifier = Modifier) {
+    val ink = Fuse.ink(dark)
+    val legs = trip.legs.filter { it.candidates.isNotEmpty() }
+    if (legs.isEmpty()) {
+        Text("还没有设置线路", fontSize = 13.sp, color = Fuse.dim(dark), modifier = modifier.padding(vertical = 4.dp))
+        return
+    }
+    @Composable
+    fun Dash() = Text("—", fontSize = 13.sp, color = ink.copy(alpha = 0.35f), modifier = Modifier.padding(horizontal = 6.dp))
+
+    Row(modifier, verticalAlignment = Alignment.CenterVertically) {
+        // 第一段总是先走到上车点（App 按步行时间算出发），所以开头放一个「步」
+        Box(
+            Modifier.clip(RoundedCornerShape(6.dp))
+                .background(if (dark) Color.White.copy(alpha = 0.12f) else Color.Black.copy(alpha = 0.07f))
+                .padding(horizontal = 6.dp, vertical = 2.dp),
+            contentAlignment = Alignment.Center,
+        ) { Text("步", fontSize = 12.sp, color = ink) }
+        legs.take(4).forEach { leg ->
+            Dash()
+            leg.candidates.take(3).forEachIndexed { i, c: Candidate ->
+                if (i > 0) Text("/", fontSize = 12.sp, color = ink.copy(alpha = 0.35f), modifier = Modifier.padding(horizontal = 3.dp))
+                LineBadge(shortLine(c.name.ifEmpty { c.label() }), lineColor(c))
+            }
+        }
+        if (legs.size > 4) { Dash(); Text("…", fontSize = 13.sp, color = ink) }
+    }
+}
+
 private fun granted(ctx: Context, p: String) = ctx.checkSelfPermission(p) == PackageManager.PERMISSION_GRANTED
 
-private fun missingPerms(ctx: Context, request: (Array<String>) -> Unit): List<Perm> {
+/** 全部设置检查（含已满足的），申请方式和以前一样 */
+private fun permChecks(ctx: Context, request: (Array<String>) -> Unit): List<Perm> {
     val out = mutableListOf<Perm>()
     val pkg = Uri.parse("package:${ctx.packageName}")
     fun open(i: Intent) = runCatching { ctx.startActivity(i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
         .recover { ctx.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, pkg).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
 
-    if (!granted(ctx, Manifest.permission.ACCESS_FINE_LOCATION)) {
-        out += Perm("精确定位", "算你走到车站要多久") {
+    val fine = granted(ctx, Manifest.permission.ACCESS_FINE_LOCATION)
+    out += Perm("精确定位", "算你走到车站要多久", fine) {
+        request(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
+    }
+    out += Perm("后台定位：始终允许", "闹钟在后台叫醒时也能定位", fine && granted(ctx, Manifest.permission.ACCESS_BACKGROUND_LOCATION)) {
+        // 系统要求先有前台定位才能申请后台定位
+        if (!granted(ctx, Manifest.permission.ACCESS_FINE_LOCATION))
             request(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION))
-        }
-    } else if (!granted(ctx, Manifest.permission.ACCESS_BACKGROUND_LOCATION)) {
-        out += Perm("后台定位：始终允许", "闹钟在后台叫醒时也能定位") {
-            request(arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION))
-        }
+        else request(arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION))
     }
-    if (!granted(ctx, Manifest.permission.ACTIVITY_RECOGNITION)) {
-        out += Perm("身体活动（计步）", "判断你下了地铁、开始走路") { request(arrayOf(Manifest.permission.ACTIVITY_RECOGNITION)) }
+    out += Perm("身体活动（计步）", "判断你下了地铁、开始走路", granted(ctx, Manifest.permission.ACTIVITY_RECOGNITION)) {
+        request(arrayOf(Manifest.permission.ACTIVITY_RECOGNITION))
     }
-    if (!granted(ctx, Manifest.permission.POST_NOTIFICATIONS)) {
-        out += Perm("通知", "显示流体云胶囊") { request(arrayOf(Manifest.permission.POST_NOTIFICATIONS)) }
-    } else if (Build.VERSION.SDK_INT >= 36 &&
-        !ctx.getSystemService(NotificationManager::class.java).canPostPromotedNotifications()) {
-        out += Perm("实时通知 / 流体云", "让胶囊出现在状态栏") {
-            open(Intent("android.settings.APP_NOTIFICATION_PROMOTION_SETTINGS").putExtra(Settings.EXTRA_APP_PACKAGE, ctx.packageName))
+    val notif = granted(ctx, Manifest.permission.POST_NOTIFICATIONS)
+    out += Perm("通知", "显示流体云胶囊", notif) { request(arrayOf(Manifest.permission.POST_NOTIFICATIONS)) }
+    if (Build.VERSION.SDK_INT >= 36) {
+        val promoted = notif && ctx.getSystemService(NotificationManager::class.java).canPostPromotedNotifications()
+        out += Perm("实时通知 / 流体云", "让胶囊出现在状态栏", promoted) {
+            if (!granted(ctx, Manifest.permission.POST_NOTIFICATIONS)) request(arrayOf(Manifest.permission.POST_NOTIFICATIONS))
+            else open(Intent("android.settings.APP_NOTIFICATION_PROMOTION_SETTINGS").putExtra(Settings.EXTRA_APP_PACKAGE, ctx.packageName))
         }
     }
-    if (!com.busnotice.commute.TransitNotif.enabled(ctx)) {
-        out += Perm("通知使用权（可选）", "读 NFC 交通卡刷卡和系统到站提醒，进出站时间更准；只看出行通知") {
-            open(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
-        }
+    out += Perm("精确闹钟", "准时预热", ctx.getSystemService(AlarmManager::class.java).canScheduleExactAlarms()) {
+        open(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, pkg))
     }
-    if (!com.busnotice.commute.TransitA11y.enabled(ctx)) {
-        out += Perm("出行识别（可选）", "无障碍：行程中读系统出行胶囊、交通卡弹窗的文字，只记在本机") {
-            open(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-        }
+    out += Perm("电池不限制", "也请在 设置→电池 里允许后台活动和自启动",
+        ctx.getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(ctx.packageName)) {
+        open(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, pkg))
     }
-    if (!ctx.getSystemService(AlarmManager::class.java).canScheduleExactAlarms()) {
-        out += Perm("精确闹钟", "准时预热") { open(Intent(Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM, pkg)) }
+    out += Perm("通知使用权", "读 NFC 交通卡刷卡和系统到站提醒，进出站时间更准；只看出行通知",
+        com.busnotice.commute.TransitNotif.enabled(ctx), optional = true) {
+        open(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
     }
-    if (!ctx.getSystemService(PowerManager::class.java).isIgnoringBatteryOptimizations(ctx.packageName)) {
-        out += Perm("电池不限制", "也请在 设置→电池 里允许后台活动和自启动") {
-            open(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, pkg))
-        }
+    out += Perm("出行识别", "无障碍：行程中读系统出行胶囊、交通卡弹窗的文字，只记在本机",
+        com.busnotice.commute.TransitA11y.enabled(ctx), optional = true) {
+        open(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
     }
     return out
 }
