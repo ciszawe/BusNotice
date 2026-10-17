@@ -43,6 +43,9 @@ data class LiveSnapshot(
     val countdownTo: Long?,
     val riding: Boolean = false,
     val updatedAt: Long = System.currentTimeMillis(),
+    // 仅供界面显示：车上已过几站 / 上车到下车共几站（没有站点数据时为 null）
+    val stopsPassed: Int? = null,
+    val stopsTotal: Int? = null,
 )
 
 object LiveState {
@@ -831,7 +834,17 @@ class CommuteService : Service() {
             progress = p, stops = if (bs != null) hops.coerceIn(0, 12) else 0,
             metro = metro, trackerRes = if (metro) R.drawable.ic_metro else R.drawable.ic_bus, riding = true)
         LiveNotifier.update(this, LiveNotifier.build(this, v))
-        LiveState.snapshot.value = LiveSnapshot(trip.id, trip.name, legIdx, trip.legs.size, lineTitle, short, text, null, p, null, riding = true)
+        // 界面用的站点进度：公交按沿线投影，地铁按已坐时间推算（与上面文字同一算法，只读）
+        val stopUi: Pair<Int, Int>? = when {
+            mr != null && arriveAlertedAt == 0L -> {
+                val hopsM = mr.hops.coerceAtLeast(1)
+                (hopsM - MetroRoutes.progress(mr, now - boardedAt, total).second) to hopsM
+            }
+            bs != null && hops > 0 -> bs.seg.coerceIn(0, hops) to hops
+            else -> null
+        }
+        LiveState.snapshot.value = LiveSnapshot(trip.id, trip.name, legIdx, trip.legs.size, lineTitle, short, text, null, p, null, riding = true,
+            stopsPassed = stopUi?.first, stopsTotal = stopUi?.second)
         if (metro && boardedAt + total - now > 5 * 60_000L) { setPower(Power.LOW); return 30_000L }
         setPower(if (d != null && d < 1_500) Power.HIGH else Power.LOW)
         // 坐公交离下车站还远：网络定位 + 一分钟刷一次就够
