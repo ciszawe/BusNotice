@@ -86,11 +86,14 @@ import com.busnotice.commute.Candidate
 import com.busnotice.commute.CommuteService
 import com.busnotice.commute.Learn
 import com.busnotice.commute.LiveState
+import com.busnotice.commute.Loc
+import com.busnotice.commute.Places
 import com.busnotice.commute.Reverse
 import com.busnotice.commute.Scheduler
 import com.busnotice.commute.Trip
 import com.busnotice.commute.TripStore
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -121,6 +124,38 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
     val days = remember(resumeTick) { com.busnotice.commute.TraceLog.dayCount(ctx) }
     val diag = remember(resumeTick, version) { com.busnotice.commute.Diag.last(ctx) }
 
+    // 进程重启后内存里的看板是空的：先用本地存的那份顶上；还没有的话显示「正在恢复…」，30 秒后服务还没起来就不再显示
+    LaunchedEffect(resumeTick) { LiveState.ensureRestored(ctx) }
+    // 要显示「正在恢复…」的行程：内存里没看板但 run_state 有没到期的行程，或者看板太旧（5 分钟没更新，多半是存下来的旧状态）
+    val pendingTrip = remember(resumeTick, live) {
+        val s = live
+        when {
+            s == null -> LiveState.activeRunTrip(ctx)
+            System.currentTimeMillis() - s.updatedAt > 5 * 60_000L -> s.tripId
+            else -> null
+        }
+    }
+    var pendingExpired by remember(resumeTick) { mutableStateOf(false) }
+    LaunchedEffect(resumeTick, pendingTrip) {
+        if (pendingTrip != null) {
+            delay(30_000)
+            if (CommuteService.instance == null) pendingExpired = true
+        }
+    }
+
+    // 常去地点：回到前台时用一次当前位置判断「在家 / 在公司 / 路上」，只在本机算
+    var placeVer by remember { mutableStateOf(0) }
+    var placeText by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(resumeTick, placeVer) {
+        val ok = granted(ctx, Manifest.permission.ACCESS_FINE_LOCATION) || granted(ctx, Manifest.permission.ACCESS_COARSE_LOCATION)
+        val l = if (ok) runCatching { Loc.current(ctx) }.getOrNull() else null
+        placeText = runCatching {
+            if (l != null) Places.passive(ctx, l.latitude, l.longitude, l.accuracy, l.time)
+            val label = l?.let { Places.text(Places.classify(ctx, it.latitude, it.longitude, it.accuracy)) }
+            label ?: if (!Places.bothConfirmed(ctx)) "常去地点学习中 ${Places.progress(ctx)}/3" else null
+        }.getOrNull()
+    }
+
     val listState = rememberLazyListState()
     // 点「测试」或行程开始后，实时看板插到列表顶部：滚回顶部让看板完整露出来，不被挤到上面
     val liveId = live?.tripId
@@ -150,6 +185,7 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 item(key = "title") {
+                  Column {
                     Row(
                         Modifier.fillMaxWidth().padding(start = 8.dp, end = 4.dp, top = 12.dp, bottom = 4.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -171,6 +207,13 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
                                     text = { Text("导出行程记录（${days} 天）") },
                                     onClick = { menuOpen = false; com.busnotice.commute.TraceLog.share(ctx) },
                                 )
+                                DropdownMenuItem(
+                                    text = { Text("重置常去地点") },
+                                    onClick = {
+                                        menuOpen = false; Places.reset(ctx); placeVer++
+                                        scope.launch { snack.showSnackbar("已清空常去地点，会重新学习") }
+                                    },
+                                )
                                 diag?.let { d ->
                                     DropdownMenuItem(
                                         text = {
@@ -183,8 +226,17 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
                             }
                         }
                     }
+                    placeText?.let { PlaceChip(it, dark) }
+                  }
                 }
-                live?.let { s -> item(key = "live") { LiveBoard(s, trips.firstOrNull { it.id == s.tripId }, dark) } }
+                val board = live
+                if (board != null && pendingTrip == null) {
+                    item(key = "live") { LiveBoard(board, trips.firstOrNull { it.id == board.tripId }, dark) }
+                } else if (pendingTrip != null && !pendingExpired) {
+                    // 服务 30 秒内还没起来就不再显示占位
+                    val name = board?.tripName ?: trips.firstOrNull { it.id == pendingTrip }?.name ?: "通勤"
+                    item(key = "live") { RestoringBoard(name, dark) }
+                }
                 // 缺必需设置时放上面显眼处，全齐了就放到列表最后
                 val permUrgent = perms.any { !it.granted && !it.optional }
                 if (permUrgent) item(key = "perm") { PermRow(perms, dark) { permSheet = true } }
@@ -255,6 +307,21 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
             },
             dismissButton = { DialogButton("取消", onClick = { confirmDelete = null }) },
         )
+    }
+}
+
+/** 标题下的小玻璃胶囊：在家 / 在公司 / 路上 / 学习中 */
+@Composable
+private fun PlaceChip(text: String, dark: Boolean) {
+    Row(
+        Modifier.padding(start = 8.dp, bottom = 2.dp).clip(CircleShape)
+            .background(Color.White.copy(alpha = if (dark) 0.10f else 0.55f))
+            .padding(horizontal = 10.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(Modifier.size(6.dp).clip(CircleShape).background(if (text.startsWith("常去")) Fuse.dim(dark) else Fuse.BusGreen))
+        Spacer(Modifier.width(6.dp))
+        Text(text, fontSize = 12.sp, color = Fuse.ink(dark), style = TextStyle(fontFeatureSettings = "tnum"))
     }
 }
 
