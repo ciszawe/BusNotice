@@ -135,6 +135,21 @@ object LiveNotifier {
         try {
             NotificationManagerCompat.from(ctx).notify(id, n)
         } catch (_: SecurityException) { }
+        buzz(ctx)
+    }
+
+    /**
+     * 直接调马达再震一次：ColorOS 有时会把通知渠道的震动吞掉（渠道被改成静默、同一条通知反复更新等），
+     * 「该走了」这种提醒不能只靠通知。两短一长，手机在静音模式下也会震（勿扰模式由系统决定）。
+     */
+    private fun buzz(ctx: Context) {
+        runCatching {
+            val v = if (android.os.Build.VERSION.SDK_INT >= 31)
+                ctx.getSystemService(android.os.VibratorManager::class.java)?.defaultVibrator
+            else @Suppress("DEPRECATION") ctx.getSystemService(android.os.Vibrator::class.java)
+            if (v == null || !v.hasVibrator()) return
+            v.vibrate(android.os.VibrationEffect.createWaveform(longArrayOf(0, 200, 120, 200, 120, 450), -1))
+        }
     }
 
     /** 重新显示胶囊（有提醒或打开 App 时） */
