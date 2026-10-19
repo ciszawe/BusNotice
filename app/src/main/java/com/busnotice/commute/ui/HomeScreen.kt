@@ -115,6 +115,8 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
     val trips = remember(resumeTick, version) { TripStore.all(ctx) }
     val live by LiveState.snapshot.collectAsState()
     var confirmDelete by remember { mutableStateOf<Trip?>(null) }
+    var confirmSwitch by remember { mutableStateOf<Trip?>(null) }
+    var confirmRestart by remember { mutableStateOf<Trip?>(null) }
     var reversing by remember { mutableStateOf(false) }
     var menuOpen by remember { mutableStateOf(false) }
     var permSheet by remember { mutableStateOf(false) }
@@ -152,7 +154,7 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
         placeText = runCatching {
             if (l != null) Places.passive(ctx, l.latitude, l.longitude, l.accuracy, l.time)
             val label = l?.let { Places.text(Places.classify(ctx, it.latitude, it.longitude, it.accuracy)) }
-            label ?: if (!Places.bothConfirmed(ctx)) "常去地点学习中 ${Places.progress(ctx)}/3" else null
+            label ?: if (!Places.bothConfirmed(ctx)) "学习中 家 ${Places.progressOf(ctx, Places.Kind.HOME)}/3 · 公司 ${Places.progressOf(ctx, Places.Kind.WORK)}/3" else null
         }.getOrNull()
     }
 
@@ -257,9 +259,18 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
                             TripStore.upsert(ctx, nt); Scheduler.schedule(ctx, nt); version++
                         },
                         onTest = {
-                            CommuteService.start(ctx, t.id, manual = true)
-                            scope.launch { snack.showSnackbar("已开始测试 30 分钟，切到别的 App 看胶囊") }
+                            // 正在跑的那趟不许被重复点击清零；跑着别的趟要先确认再切换
+                            val cur = CommuteService.runningTripId()
+                            when {
+                                cur == t.id -> scope.launch { snack.showSnackbar("这趟已在进行中；要从头来请在「⋯」里选重新开始") }
+                                cur != null -> confirmSwitch = t
+                                else -> {
+                                    CommuteService.start(ctx, t.id, manual = true)
+                                    scope.launch { snack.showSnackbar("已手动开始，切到别的 App 看胶囊") }
+                                }
+                            }
                         },
+                        onRestart = { confirmRestart = t },
                         onEdit = { onEdit(t) },
                         onReverse = {
                             if (!reversing) {
@@ -293,6 +304,38 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
             sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
             containerColor = Fuse.surface(dark), contentColor = ink,
         ) { PermSheet(perms) }
+    }
+
+    confirmSwitch?.let { t ->
+        val curName = CommuteService.runningTripId()?.let { id -> trips.firstOrNull { it.id == id }?.name } ?: "另一趟行程"
+        AlertDialog(
+            onDismissRequest = { confirmSwitch = null },
+            shape = DialogShape, containerColor = Fuse.surface(dark), titleContentColor = ink, textContentColor = ink,
+            title = { Text("正在进行「$curName」") },
+            text = { Text("要结束它并切换到「${t.name}」吗？当前进度会丢失。") },
+            confirmButton = {
+                DialogButton("切换", primary = true, onClick = {
+                    CommuteService.start(ctx, t.id, manual = true, restart = true); confirmSwitch = null
+                    scope.launch { snack.showSnackbar("已切换到「${t.name}」") }
+                })
+            },
+            dismissButton = { DialogButton("取消", onClick = { confirmSwitch = null }) },
+        )
+    }
+
+    confirmRestart?.let { t ->
+        AlertDialog(
+            onDismissRequest = { confirmRestart = null },
+            shape = DialogShape, containerColor = Fuse.surface(dark), titleContentColor = ink, textContentColor = ink,
+            title = { Text("重新开始「${t.name}」？") },
+            text = { Text("会按你现在的位置重新判断走到了第几段。") },
+            confirmButton = {
+                DialogButton("重新开始", primary = true, onClick = {
+                    CommuteService.start(ctx, t.id, manual = true, restart = true); confirmRestart = null
+                })
+            },
+            dismissButton = { DialogButton("取消", onClick = { confirmRestart = null }) },
+        )
     }
 
     confirmDelete?.let { t ->
@@ -389,6 +432,7 @@ private fun PermItem(p: Perm) {
 private fun TripCard(
     trip: Trip, running: Boolean, dark: Boolean,
     onToggle: (Boolean) -> Unit, onTest: () -> Unit, onEdit: () -> Unit, onReverse: () -> Unit, onDelete: () -> Unit,
+    onRestart: () -> Unit,
     @Suppress("UNUSED_PARAMETER") onApplyLearned: (Learn.Suggestion) -> Unit,
 ) {
     val ctx = LocalContext.current
@@ -443,13 +487,14 @@ private fun TripCard(
                 }
             }
             TextButton(onClick = onTest, contentPadding = PaddingValues(horizontal = 10.dp)) {
-                Text("测试", fontSize = 13.sp, color = dimColor)
+                Text(if (running) "进行中" else "开始", fontSize = 13.sp, color = dimColor)
             }
             Box {
                 TextButton(onClick = { more = true }, contentPadding = PaddingValues(horizontal = 10.dp)) {
                     Text("⋯", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = dimColor)
                 }
                 DropdownMenu(expanded = more, onDismissRequest = { more = false }, shape = MenuShape, containerColor = Fuse.surface(dark)) {
+                    if (running) DropdownMenuItem(text = { Text("重新开始") }, onClick = { more = false; onRestart() })
                     DropdownMenuItem(text = { Text("生成回程") }, onClick = { more = false; onReverse() })
                     DropdownMenuItem(text = { Text("编辑") }, onClick = { more = false; onEdit() })
                     DropdownMenuItem(text = { Text("删除") }, onClick = { more = false; onDelete() })
