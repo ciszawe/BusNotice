@@ -14,5 +14,6 @@ class TransitSignalTest {
     @Test fun approachPlain() = assertEquals(Kind.APPROACH, TransitSignal.classify("地铁 某某站"))
     // 公交刷卡扣费不能当地铁出站
     @Test fun busFareNotExit() = assertEquals(Kind.APPROACH, TransitSignal.classify("交通卡 公交乘车 扣费1元"))
+    @Test fun lowBalanceIsTap() = assertEquals(Kind.TAP, TransitSignal.classify("某某交通卡低额提醒 当前余额为8.00 元，请及时充值"))
     @Test fun chatIgnored() = assertNull(TransitSignal.classify("晚上一起吃饭吗"))
 }
