@@ -93,4 +93,39 @@ object AccMotion {
     }
 
     private const val MAX_GAP_MS = 90_000L
+
+    /**
+     * 地铁站里最后一次「走了几步」结束的时刻：连续 3 个窗口里有 2 个是走路就算（上车前跨进车门那几步也要抓到）。
+     * 只看 (from, now] 之间；没有返回 null。
+     */
+    fun lastWalkEnd(ws: List<Win>, from: Long, now: Long): Long? {
+        val l = ws.filter { it.t > from && it.t <= now }.sortedBy { it.t }
+        var end: Long? = null
+        for (i in l.indices) {
+            if (classify(l[i]) != Kind.WALK) continue
+            val walks = (maxOf(0, i - 2)..i).count { classify(l[it]) == Kind.WALK }
+            if (walks >= 2) end = l[i].t
+        }
+        return end
+    }
+
+    /**
+     * 列车开动：from 之后第一段「连续 spanMs 都在晃、没有走路」的开始时刻。
+     * 实测：下扶梯约 60 秒也在晃，站台上站着等车静止和小晃交替；列车开起来是连续一两分钟的晃动。
+     * 所以要求 90 秒里至少 80% 窗口在晃（非静止）、一个走路窗口都没有、中间不断档。
+     * 只用加速度分不清「站台上坐着玩手机」和「坐在车上」，要配合基站切换 / 定位移动才当上车。
+     */
+    fun departureSince(ws: List<Win>, from: Long, now: Long, spanMs: Long = 90_000L): Long? {
+        val l = ws.filter { it.t > from && it.t <= now }.sortedBy { it.t }
+        for (i in l.indices) {
+            val t0 = l[i].t - WIN_MS
+            if (t0 + spanMs > now) return null
+            val seg = l.subList(i, l.size).takeWhile { it.t <= t0 + spanMs }
+            if (seg.size < spanMs / WIN_MS * 0.8) continue
+            if (seg.any { classify(it) == Kind.WALK }) continue
+            if (seg.zipWithNext().any { (a, b) -> b.t - a.t > GAP_MS }) continue
+            if (seg.count { classify(it) != Kind.STILL } >= seg.size * 0.8) return t0
+        }
+        return null
+    }
 }
