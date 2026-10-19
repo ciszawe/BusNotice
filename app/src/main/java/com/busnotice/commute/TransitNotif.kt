@@ -40,7 +40,7 @@ class TransitNotif : NotificationListenerService() {
 }
 
 object TransitSignal {
-    enum class Kind { ENTER, EXIT, ARRIVE, APPROACH }
+    enum class Kind { ENTER, EXIT, ARRIVE, APPROACH, TAP }
 
     private const val PREFS = "transit_signal"
     private val TRAVEL = Regex("进站|出站|交通卡|地铁|下车|到站|乘车")
@@ -48,6 +48,8 @@ object TransitSignal {
     private val ENTER = Regex("已进站|进站成功|刷卡进站")
     private val PROMO = Regex("奖励|领取|优惠|达标|红包|立减|福利|活动|券")
     private val ARRIVE = Regex("准备下车|当前站|即将到站|即将到达")
+    // 交通卡余额 / 低额提醒：只说明刚刷了卡，由 CommuteService 按当前段解释
+    private val TAP = Regex("余额|低额提醒")
 
     /** 只认明确的说法；对不上的出行通知只记录原文，不参与判断（以后按真实样本补规则） */
     fun classify(s: String): Kind? {
@@ -58,6 +60,7 @@ object TransitSignal {
             EXIT.containsMatchIn(s) -> Kind.EXIT
             ENTER.containsMatchIn(s) -> Kind.ENTER
             ARRIVE.containsMatchIn(s) -> Kind.ARRIVE
+            TAP.containsMatchIn(s) -> Kind.TAP
             else -> Kind.APPROACH
         }
     }
@@ -68,7 +71,7 @@ object TransitSignal {
         if (p.getString("kind", null) == kind.name && at - p.getLong("at", 0) < 30_000) return
         p.edit().putString("kind", kind.name).putLong("at", at).putString("text", text).putString("pkg", pkg).apply()
         TraceLog.event("transit", "kind" to kind.name, "text" to text, "pkg" to pkg, "at" to at)
-        val label = when (kind) { Kind.ENTER -> "进站"; Kind.EXIT -> "出站"; Kind.ARRIVE -> "到站提醒"; Kind.APPROACH -> "出行" }
+        val label = when (kind) { Kind.ENTER -> "进站"; Kind.EXIT -> "出站"; Kind.ARRIVE -> "到站提醒"; Kind.APPROACH -> "出行"; Kind.TAP -> "刷卡" }
         Diag.mark(ctx, "收到$label 通知：${text.take(30)}")
         // 「地铁 xxx」靠近站口这类：只记录，不切换
         if (kind != Kind.APPROACH) CommuteService.instance?.onTransitSignal(kind, text, at)
