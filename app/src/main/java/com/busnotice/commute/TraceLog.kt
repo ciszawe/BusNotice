@@ -37,12 +37,14 @@ import kotlin.math.sqrt
  *  cell  服务基站变化：type id tac pci dbm（只在换了基站时记）
  *  acc   加速度：每 2 秒一条，线性加速度幅值的均值 m 和标准差 sd（看列车启停），
  *        三轴均值 ax ay az、重力向量均值 gx gy gz（离线投影到水平面看加减速），ts = 按传感器时间戳算的窗口结束时刻
+ *  env   磁场 + 气压：每 2 秒一条。mm/msd = 磁场幅值均值/标准差（μT，列车牵引电机启停时会大幅波动），
+ *        p = 气压均值（hPa，下扶梯约 −0.1 hPa/米、进出隧道有压力波）；手机没有对应传感器就不写那一项
  *  ev    状态：上车、换段、判断下车、提醒、手动结束等
  * 保留最近 30 天。
  */
 object TraceLog {
     private const val KEEP_DAYS = 30L
-    private const val CELL_EVERY_MS = 10_000L
+    private const val CELL_EVERY_MS = 5_000L   // 地铁站间约 2 分钟，5 秒一查才不漏掉站台那一下的基站切换
 
     private var writer: OutputStreamWriter? = null
     private var thread: HandlerThread? = null
@@ -55,13 +57,31 @@ object TraceLog {
     private var n = 0; private var sum = 0.0; private var sumSq = 0.0; private var winStart = 0L; private var lastT = 0L
     private var sx = 0.0; private var sy = 0.0; private var sz = 0.0
     private var gn = 0; private var gx = 0.0; private var gy = 0.0; private var gz = 0.0
+    // 磁场 / 气压 2 秒窗口（只记录，暂不参与判断）
+    private var mn = 0; private var msum = 0.0; private var msq = 0.0; private var pn = 0; private var psum = 0.0; private var envStart = 0L
     private const val LATENCY_US = 10_000_000   // 允许传感器攒 10 秒再报：息屏 doze 时数据也能到
 
-    // 最近约 5 分钟的窗口，给下车判断用
+    // 最近约 15 分钟的窗口，给下车判断用
     private val recent = ArrayDeque<AccMotion.Win>()
-    private const val RECENT_MAX = 150
+    private const val RECENT_MAX = 450   // 约 15 分钟：等车上车的判断要回看进站以来的全部窗口
 
     fun recentWindows(): List<AccMotion.Win> = synchronized(recent) { recent.toList() }
+
+    // 服务基站切换的时刻（最近 30 个）：坐地铁时列车在动 → 基站每一两分钟换一次；人不动 → 长时间不换。
+    // 只在行程记录开着时更新（5 秒查一次）。
+    private val cellChanges = ArrayDeque<Long>()
+    @Volatile var cellSince = 0L; private set     // 当前服务基站从什么时候开始一直没换（记录开始时 = 开始时刻）
+
+    @Synchronized private fun noteCellChange(t: Long) {
+        cellChanges.addLast(t); while (cellChanges.size > 30) cellChanges.removeFirst()
+        cellSince = t
+    }
+
+    /** t 之后第一次换基站的时刻；没有返回 null */
+    @Synchronized fun cellChangeAfter(t: Long): Long? = cellChanges.firstOrNull { it > t }
+
+    /** 基站已经多久没换了（毫秒）；记录没开返回 null */
+    fun cellStillMs(now: Long): Long? = if (writer == null || cellSince == 0L) null else now - cellSince
 
     private fun dir(ctx: Context) = File(ctx.filesDir, "traces").apply { mkdirs() }
 
@@ -76,6 +96,7 @@ object TraceLog {
         h = Handler(t.looper)
         lastCell = ""
         write("ev", JSONObject().put("e", "start").put("trip", tripName))
+        synchronized(this) { cellChanges.clear() }; cellSince = System.currentTimeMillis()
         h?.post(cellPoll)
         sm = c.getSystemService(SensorManager::class.java)
         // 优先用唤醒型传感器：息屏后也会按批量延迟把数据送上来（不另外持有唤醒锁）
@@ -85,6 +106,38 @@ object TraceLog {
         resetWin(); synchronized(recent) { recent.clear() }
         if (s != null) sm?.registerListener(accel, s, SensorManager.SENSOR_DELAY_NORMAL, LATENCY_US, h)
         if (g != null) sm?.registerListener(accel, g, SensorManager.SENSOR_DELAY_NORMAL, LATENCY_US, h)
+        val mag = pick(Sensor.TYPE_MAGNETIC_FIELD)
+        val baro = pick(Sensor.TYPE_PRESSURE)
+        resetEnv()
+        if (mag != null) sm?.registerListener(env, mag, SensorManager.SENSOR_DELAY_NORMAL, LATENCY_US, h)
+        if (baro != null) sm?.registerListener(env, baro, SensorManager.SENSOR_DELAY_NORMAL, LATENCY_US, h)
+        write("ev", JSONObject().put("e", "sensors").put("mag", mag != null).put("baro", baro != null)
+            .put("lin", s?.type == Sensor.TYPE_LINEAR_ACCELERATION))
+    }
+
+    private fun resetEnv() { mn = 0; msum = 0.0; msq = 0.0; pn = 0; psum = 0.0; envStart = 0L }
+
+    private val env = object : SensorEventListener {
+        override fun onSensorChanged(e: SensorEvent) {
+            val t = evTime(e.timestamp)
+            if (envStart == 0L) envStart = t
+            if (e.sensor.type == Sensor.TYPE_PRESSURE) { pn++; psum += e.values[0] }
+            else {
+                val x = e.values[0].toDouble(); val y = e.values[1].toDouble(); val z = e.values[2].toDouble()
+                val m = sqrt(x * x + y * y + z * z); mn++; msum += m; msq += m * m
+            }
+            if (t - envStart >= 2_000 || t < envStart) {
+                val o = JSONObject().put("ts", t)
+                if (mn > 0) {
+                    val mean = msum / mn
+                    o.put("mm", r(mean, 10.0)).put("msd", r(sqrt((msq / mn - mean * mean).coerceAtLeast(0.0)), 100.0))
+                }
+                if (pn > 0) o.put("p", r(psum / pn, 100.0))
+                write("env", o)
+                resetEnv()
+            }
+        }
+        override fun onAccuracyChanged(s: Sensor?, a: Int) {}
     }
 
     @Synchronized
@@ -92,6 +145,7 @@ object TraceLog {
         if (writer == null) return
         write("ev", JSONObject().put("e", "stop"))
         runCatching { sm?.unregisterListener(accel) }
+        runCatching { sm?.unregisterListener(env) }
         h?.removeCallbacksAndMessages(null)
         thread?.quitSafely(); thread = null; h = null
         runCatching { writer?.close() }; writer = null
@@ -210,8 +264,22 @@ object TraceLog {
         // 只在服务基站变化时记一条（信号强度变化不算）
         val key = keys.sorted().joinToString("|")
         if (key == lastCell) return
+        val first = lastCell.isEmpty()
         lastCell = key
-        write("cell", JSONObject().put("cells", arr))
+        if (!first) noteCellChange(System.currentTimeMillis())
+        // 顺带记最强的几个邻区（只有 pci + 信号）：以后做「站点基站指纹」时比单个服务基站更稳
+        val nb = org.json.JSONArray()
+        infos.filter { !it.isRegistered }.mapNotNull { ci ->
+            when (ci) {
+                is CellInfoNr -> Triple("nr", (ci.cellIdentity as CellIdentityNr).pci, ci.cellSignalStrength.dbm)
+                is CellInfoLte -> Triple("lte", ci.cellIdentity.pci, ci.cellSignalStrength.dbm)
+                else -> null
+            }
+        }.filter { it.second in 0..1007 }.sortedByDescending { it.third }.take(4)
+            .forEach { (ty, pci, dbm) -> nb.put(JSONObject().put("type", ty).put("pci", pci).put("dbm", dbm)) }
+        val o = JSONObject().put("cells", arr)
+        if (nb.length() > 0) o.put("nb", nb)
+        write("cell", o)
     }
 
     private fun prune(ctx: Context) {
