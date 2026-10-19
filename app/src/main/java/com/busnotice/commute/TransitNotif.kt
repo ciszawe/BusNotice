@@ -46,11 +46,14 @@ object TransitSignal {
     private val TRAVEL = Regex("进站|出站|交通卡|地铁|下车|到站|乘车")
     private val EXIT = Regex("已出站|出站成功|出站扣费|刷卡出站")
     private val ENTER = Regex("已进站|进站成功|刷卡进站")
+    private val PROMO = Regex("奖励|领取|优惠|达标|红包|立减|福利|活动|券")
     private val ARRIVE = Regex("准备下车|当前站|即将到站|即将到达")
 
     /** 只认明确的说法；对不上的出行通知只记录原文，不参与判断（以后按真实样本补规则） */
     fun classify(s: String): Kind? {
         if (!TRAVEL.containsMatchIn(s)) return null
+        // 钱包/App 的营销推送（「达标奖励」「领取优惠」）不是出行事件
+        if (PROMO.containsMatchIn(s)) return null
         return when {
             EXIT.containsMatchIn(s) -> Kind.EXIT
             ENTER.containsMatchIn(s) -> Kind.ENTER
