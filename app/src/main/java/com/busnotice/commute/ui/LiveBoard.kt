@@ -169,7 +169,7 @@ fun LiveBoard(s: LiveSnapshot, trip: Trip?, dark: Boolean) {
         val passed = s.stopsPassed
         val total = s.stopsTotal
         if (passed != null && total != null && total > 0) {
-            StopDots(passed.coerceIn(0, total), total)
+            StopDots(passed.coerceIn(0, total), total, s.fromStop, s.curStop, s.toStop)
         } else s.progress?.let { p ->
             Box(
                 Modifier.padding(top = 16.dp).fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp))
@@ -217,7 +217,7 @@ private fun Pill(text: String, bg: Color, fg: Color, border: Color?, modifier: M
 
 /** 站点圆点：已过白色、当前黄色带光、未到暗色、下车站黄色圆环 */
 @Composable
-private fun StopDots(passed: Int, total: Int) {
+private fun StopDots(passed: Int, total: Int, from: String? = null, curName: String? = null, to: String? = null) {
     val cur = passed.coerceAtMost(total - 1).coerceAtLeast(0)
     val dense = total > 14   // 站太多就不画中间的小点，只画线
     Column(Modifier.padding(top = 16.dp)) {
@@ -253,13 +253,18 @@ private fun StopDots(passed: Int, total: Int) {
         }
         BoxWithConstraints(Modifier.fillMaxWidth().padding(top = 4.dp)) {
             val labelColor = Color.White.copy(alpha = 0.5f)
-            Text("上车", color = labelColor, fontSize = 11.sp, modifier = Modifier.align(Alignment.CenterStart))
-            Text("下车", color = labelColor, fontSize = 11.sp, modifier = Modifier.align(Alignment.CenterEnd))
+            Text(from ?: "上车", color = labelColor, fontSize = 11.sp, maxLines = 1,
+                modifier = Modifier.align(Alignment.CenterStart).widthIn(max = 72.dp))
+            Text(to ?: "下车", color = labelColor, fontSize = 11.sp, maxLines = 1,
+                modifier = Modifier.align(Alignment.CenterEnd).widthIn(max = 72.dp))
             val f = cur.toFloat() / total
-            if (f in 0.15f..0.85f) {
-                // 「当前」居中到当前点下方（标签约 24dp 宽）
-                val cx = 8.dp + (maxWidth - 16.dp) * f - 12.dp
-                Text("当前", color = labelColor, fontSize = 11.sp, modifier = Modifier.align(Alignment.CenterStart).offset(x = cx))
+            if (f in 0.25f..0.75f) {
+                // 当前站名居中到当前点下方（标签最宽约 64dp）
+                val label = curName ?: "当前"
+                val half = (if (curName != null) 32 else 12).dp
+                val cx = 8.dp + (maxWidth - 16.dp) * f - half
+                Text(label, color = Fuse.Yellow, fontSize = 11.sp, maxLines = 1, textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    modifier = Modifier.align(Alignment.CenterStart).offset(x = cx).width(half * 2))
             }
         }
     }
