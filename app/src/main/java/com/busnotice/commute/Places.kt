@@ -122,6 +122,11 @@ object Places {
         } ?: 0
     }
 
+    /** 单个地点的进度 0..3（首页分开显示「家」「公司」各学到哪了，不再只显示慢的那个） */
+    fun progressOf(ctx: Context, k: Kind): Int = load(ctx).filter { it.kind == k }.maxOfOrNull { c ->
+        if (c.confirmed) NEED_VOTES else c.votes.coerceAtMost(if (c.days.size >= NEED_DAYS) NEED_VOTES else NEED_VOTES - 1)
+    } ?: 0
+
     fun bothConfirmed(ctx: Context) = Kind.values().all { confirmed(ctx, it) != null }
 
     @Synchronized
