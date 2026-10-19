@@ -36,6 +36,12 @@ class MainActivity : ComponentActivity() {
     private fun handleStart(i: android.content.Intent?) {
         val id = i?.getStringExtra(EXTRA_START_TRIP) ?: return
         i.removeExtra(EXTRA_START_TRIP)
+        val cur = CommuteService.runningTripId()
+        if (cur != null && cur != id) {
+            // 另一趟正在跑：不悄悄覆盖，回首页让用户自己决定要不要切换
+            android.widget.Toast.makeText(this, "另一趟行程进行中，要切换请在首页点「开始」", android.widget.Toast.LENGTH_LONG).show()
+            return
+        }
         runCatching { CommuteService.start(this, id, manual = i.getBooleanExtra(EXTRA_MANUAL, false)) }
         // 从快捷开关点进来：启动完就退到后台，直接看胶囊
         if (i.getBooleanExtra(EXTRA_BACKGROUND, false)) moveTaskToBack(true)
