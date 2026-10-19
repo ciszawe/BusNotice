@@ -46,6 +46,10 @@ data class LiveSnapshot(
     // 仅供界面显示：车上已过几站 / 上车到下车共几站（没有站点数据时为 null）
     val stopsPassed: Int? = null,
     val stopsTotal: Int? = null,
+    // 仅供界面显示：当前（刚过）站、上车站、下车站名（没有站点数据时为 null）
+    val curStop: String? = null,
+    val fromStop: String? = null,
+    val toStop: String? = null,
 )
 
 /**
@@ -109,6 +113,7 @@ object LiveState {
         .put("mode", s.mode?.name ?: "").put("progress", s.progress ?: -1).put("countdownTo", s.countdownTo ?: -1L)
         .put("riding", s.riding).put("updatedAt", s.updatedAt)
         .put("stopsPassed", s.stopsPassed ?: -1).put("stopsTotal", s.stopsTotal ?: -1)
+        .put("curStop", s.curStop ?: "").put("fromStop", s.fromStop ?: "").put("toStop", s.toStop ?: "")
 
     private fun fromJson(o: org.json.JSONObject) = LiveSnapshot(
         tripId = o.getString("tripId"), tripName = o.optString("tripName"),
@@ -120,6 +125,9 @@ object LiveState {
         riding = o.optBoolean("riding"), updatedAt = o.optLong("updatedAt", 0L),
         stopsPassed = o.optInt("stopsPassed", -1).takeIf { it >= 0 },
         stopsTotal = o.optInt("stopsTotal", -1).takeIf { it >= 0 },
+        curStop = o.optString("curStop").ifEmpty { null },
+        fromStop = o.optString("fromStop").ifEmpty { null },
+        toStop = o.optString("toStop").ifEmpty { null },
     )
 }
 
@@ -134,17 +142,26 @@ class CommuteService : Service() {
         private const val TAG = "CommuteService"
         private const val EXTRA_TRIP_ID = "tripId"
         private const val EXTRA_MANUAL = "manual"
+        private const val EXTRA_RESTART = "restart"
         private const val MANUAL_RUN_MS = 30 * 60_000L
         private const val NEAR_STOP_M = 120.0
         @Volatile var instance: CommuteService? = null
 
-        fun start(ctx: Context, tripId: String, manual: Boolean, fresh: Boolean = false) {
+        /**
+         * restart = 用户明确要「重新开始 / 切换到这一趟」：才允许清掉正在跑的进度。
+         * 不带 restart 时：同一趟正在跑 → 不动；别的趟正在跑 → 自动启动直接忽略，手动启动交给界面先确认。
+         */
+        fun start(ctx: Context, tripId: String, manual: Boolean, fresh: Boolean = false, restart: Boolean = false) {
             val i = Intent(ctx, CommuteService::class.java)
                 .putExtra(EXTRA_TRIP_ID, tripId)
                 .putExtra(EXTRA_MANUAL, manual)
                 .putExtra("fresh", fresh)
+                .putExtra(EXTRA_RESTART, restart)
             ctx.startForegroundService(i)
         }
+
+        /** 正在跑的行程 id（服务活着且行程没结束）；没有返回 null */
+        fun runningTripId(): String? = instance?.runningId()
 
         /** 有没结束的行程但服务不在（被系统杀了）：重新拉起，接着原进度跑 */
         fun resumeIfNeeded(ctx: Context) {
@@ -212,6 +229,16 @@ class CommuteService : Service() {
         val id = intent?.getStringExtra(EXTRA_TRIP_ID) ?: savedRunTrip()
         val t = id?.let { TripStore.get(this, it) }
         LiveNotifier.ensureChannels(this)
+        val manual = intent?.getBooleanExtra(EXTRA_MANUAL, false) ?: false
+        // 已经有一趟在跑：不许被重复点击 / 自动启动悄悄覆盖掉进度
+        val curId = runningId()
+        if (intent != null && curId != null && !intent.getBooleanExtra(EXTRA_RESTART, false)) {
+            val same = curId == id
+            TraceLog.event("start_ignored", "same" to same, "manual" to manual, "fresh" to intent.getBooleanExtra("fresh", false))
+            Diag.mark(this, if (same) "行程已在进行中，忽略重复启动" else "另一趟行程进行中，忽略这次启动")
+            if (same) LiveNotifier.unhide(this)
+            return START_STICKY
+        }
         try {
             startForeground(LiveNotifier.LIVE_ID, LiveNotifier.warming(this, t?.name ?: "通勤"),
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
@@ -223,17 +250,21 @@ class CommuteService : Service() {
             stopSelf(); return START_NOT_STICKY
         }
         if (t == null || t.legs.isEmpty()) { finish(); return START_NOT_STICKY }
-        val manual = intent?.getBooleanExtra(EXTRA_MANUAL, false) ?: false
 
         instance = this
         LiveNotifier.hidden = false
         if (intent == null) Diag.mark(this, "服务被系统杀掉后自动重启")
         else if (!manual) Diag.mark(this, "已自动启动")
+        val restart = intent?.getBooleanExtra(EXTRA_RESTART, false) == true
         trip = t
+        finishing = false
         restored = false
         startedAt = System.currentTimeMillis()
+        // 用户手动「重新开始 / 切换」：常常人已经在半路（甚至在地下没信号），
+        // 允许用最近 10 分钟内的定位来判断现在在第几段，而不是一律从第一段的上车站算起
+        trustFixSince = startedAt - if (restart) 10 * 60_000L else 30_000L
         runCatching { TraceLog.start(this, t.id, t.name) }
-        TraceLog.event("run", "manual" to manual, "restart" to (intent == null))
+        TraceLog.event("run", "manual" to manual, "restart" to (intent == null), "userRestart" to restart)
         stationAt = 0L; metroRideSec.clear(); metroRoutes.clear(); alightAt = 0L; fenceFixes.clear(); stillSince = 0L; lastFastAt = 0L; rideLearned = false; stopAlerted = ""
         stationByTap = false; arriveAnchorAt = 0L
         placeStart = null; arrived = false; lastPlace = null
@@ -247,7 +278,7 @@ class CommuteService : Service() {
         scope.launch(Dispatchers.IO) { prefetchMetroStops(t); prefetch(t); prefetchLastMetroByName(t) }
         loop?.cancel()
         // 围栏拉起的是一趟全新的行程：不接中断前的进度
-        val fresh = intent?.getBooleanExtra("fresh", false) == true
+        val fresh = intent?.getBooleanExtra("fresh", false) == true || restart
         if (fresh) clearRun()
         val resumedDl = if (fresh) null else restoreRun(t)
         // 看板缓存：接着中断前那趟跑就先用存下的看板顶上（第一轮刷新前首页不空着）；新的一趟就删掉旧缓存
@@ -512,7 +543,15 @@ class CommuteService : Service() {
 
         val dists = leg.candidates.map { c -> loc?.let { Geo.distanceM(it.latitude, it.longitude, c.lat, c.lng) } }
         val nearest = dists.filterNotNull().minOrNull()
-        if (nearest != null && nearest <= NEAR_STOP_M && nearSince == 0L) {
+        // 还在上一段地铁上（没确认下车）：站里的网络定位忽近忽远，单凭一次定位贴近下一段站牌就切换显示会来回跳。
+        // 只认精度 ≤ 100 米、且已经到了快下车的时间窗，才算到了换乘点（同时记为下车）
+        val metroUnsure = prev?.isMetroOnly() == true && boardedAt > 0 && alightAt == 0L
+        val prevArrive = if (metroUnsure) (anchoredArrive(legIdx - 1) ?: (boardedAt + rideMs(legIdx - 1))) else 0L
+        val nearOk = !metroUnsure || (loc != null && loc.accuracy <= 100 && now >= prevArrive - 5 * 60_000L)
+        if (metroUnsure && nearOk && nearest != null && nearest <= 300) {
+            markAlight(now, "near")
+        }
+        if (nearest != null && nearest <= NEAR_STOP_M && nearSince == 0L && nearOk) {
             nearSince = now
             // 换乘到了：记下上一段实际坐了多久，下次推算换乘更准
             if (prev != null && boardedAt > 0 && !rideLearned) {
@@ -542,10 +581,12 @@ class CommuteService : Service() {
             if (speed != null && speed >= 6.0) { steps = 0; stillSince = 0L; lastFastAt = now }
             val dist = if (fix != null && st != null) Geo.distanceM(fix.latitude, fix.longitude, st.first, st.second) else null
             val inFence = dist != null && dist <= 350 + fix!!.accuracy.coerceAtMost(200f)
-            if (inFence && (speed == null || speed < 2.0)) { if (stillSince == 0L) stillSince = now } else if (!inFence) stillSince = 0L
+            // 站里经常一阵子没有可用定位：没定位不算「离开围栏」，只有定位明确在围栏外才清零
+            if (inFence && (speed == null || speed < 2.0)) { if (stillSince == 0L) stillSince = now } else if (dist != null && !inFence) stillSince = 0L
             val recentlyFast = now - lastFastAt < 60_000
             val noLocFor = fenceFixes.lastOrNull()?.let { now - it.time } ?: Long.MAX_VALUE
             // 加速度：列车停稳（静止）之后持续走路 ≥ 20 秒 = 下车往外走；只当佐证，要配合时间窗和位置
+            val cellStill = TraceLog.cellStillMs(now)
             val wins = if (window) TraceLog.recentWindows() else emptyList()
             val walkStart = AccMotion.walkingSustainedSince(wins, now)?.takeIf { it > boardedAt }
             val motionOk = window && walkStart != null && AccMotion.hadStillBefore(wins, walkStart) && !recentlyFast &&
@@ -559,7 +600,10 @@ class CommuteService : Service() {
                 // 在换乘站围栏内 + 走了 25 步，且最近一分钟没有车速移动
                 window && inFence && stepOn && steps >= 25 && !recentlyFast -> "fence+steps"
                 // 在换乘站围栏内静止超过 90 秒（站台上等、在站里坐着等公交）
-                window && inFence && stillSince > 0 && now - stillSince >= 90_000 -> "fence+still"
+                window && stillSince > 0 && now - stillSince >= 90_000 && (inFence || dist == null) -> "fence+still"
+                // 服务基站 150 秒以上没换：列车在跑时一两分钟就换一次，长时间不换 = 人已经停下来了（下车在站里等）
+                window && cellStill != null && cellStill >= 150_000 && TraceLog.cellSince > boardedAt + 3 * 60_000L &&
+                    !recentlyFast && (inFence || dist == null || noLocFor > 60_000L) -> "cell_still"
                 // 完全没有位置时才单靠步数
                 window && noLocFor > 3 * 60_000L && stepOn && steps >= 40 -> "steps"
                 // 兜底：过了预计时间 3 分钟；但定位显示离换乘站还远且在动，说明晚点了，最多再等 10 分钟
@@ -569,7 +613,12 @@ class CommuteService : Service() {
             }
             if (by != null) {
                 // 按加速度判断时，下车时刻是开始走路的时刻（换乘步行从那时算）
-                val at = if (by == "motion") (walkStart ?: now) else now
+                val at = when (by) {
+                    "motion" -> walkStart ?: now
+                    // 基站不再变的那一刻就是列车停下、人下车的时刻
+                    "cell_still" -> TraceLog.cellSince.coerceIn(boardedAt, now)
+                    else -> now
+                }
                 alightAt = at; stepSensor(false); saveRun(deadlineAt)
                 Log.i(TAG, "判断已下地铁：$by")
                 TraceLog.event("alight_detect", "leg" to legIdx - 1, "by" to by, "at" to at)
@@ -579,8 +628,9 @@ class CommuteService : Service() {
                 }
             }
         }
-        val connecting = expectArrive > 0 && nearSince == 0L && (nearest == null || nearest > 300) &&
-            (if (fromMetro) alightAt == 0L else now < expectArrive + 5 * 60_000L)
+        // 上一段是地铁：是否还在车上只看有没有确认下车，不随单次定位远近来回切换（之前会在公交和地铁之间跳）
+        val connecting = expectArrive > 0 && nearSince == 0L &&
+            (if (fromMetro) alightAt == 0L else (nearest == null || nearest > 300) && now < expectArrive + 5 * 60_000L)
         val connectSec = if (connecting) (((expectArrive - now) / 1000).toInt().coerceAtLeast(0) + leg.transferWalkMin * 60) else 0
 
         // 推断进站：在站口附近待了两分钟，或最后一次卫星定位在站口 500 米内、之后 90 秒没信号。
@@ -596,10 +646,8 @@ class CommuteService : Service() {
         }
         if (leg.isMetroOnly() && stationAt > 0) {
             val train = nextTrainAfter(leg, stationAt) ?: (stationAt + 4 * 60_000L)
-            if (legIdx == trip.legs.size - 1) {
-                // 最后一段地铁（只影响这种行程）：进站后先「等车」，有证据真的坐上了才切过去
-                lastMetroBoardAt(leg, train, now)?.let { onBoarded(manual = false, at = it); return 1_000L }
-            } else if (now >= train + Decision.DWELL_SEC * 1000L) { onBoarded(manual = false, at = train); return 1_000L }
+            // 所有地铁段（上班最后一段、下班第一段）都一样：进站后先「等车」，有证据真的坐上了才切过去
+            metroBoardAt(leg, train, now)?.let { onBoarded(manual = false, at = it); return 1_000L }
         }
 
         val secOfDay = LocalTime.now().toSecondOfDay()
@@ -648,8 +696,14 @@ class CommuteService : Service() {
         if (plan != null) return planTick(plan, leg, a, now)
         val v = visual(a, leg, connecting, expectArrive, now)
         LiveNotifier.update(this, LiveNotifier.build(this, v))
+        // 换乘中还在地铁上：看板也给站点圆点和站名（和胶囊同一算法）
+        val cr = if (connecting && prev?.isMetroOnly() == true && now < expectArrive) metroRoutes[legIdx - 1] else null
+        val cp = cr?.let { connectPassed(it, rideMs(legIdx - 1), now) }
         LiveState.publish(this, LiveSnapshot(
             trip.id, trip.name, legIdx, trip.legs.size, leg.title(), v.short, v.text, a.mode, v.progress, v.countdownTo,
+            stopsPassed = cp, stopsTotal = cr?.hops?.coerceAtLeast(1),
+            curStop = if (cr != null && cp != null) cr.stations[cp].name else null,
+            fromStop = cr?.stations?.first()?.name, toStop = cr?.stations?.last()?.name,
         ), deadlineAt)
 
         // 该走了 / 换乘紧张：横幅 + 震动，每班车只提醒一次
@@ -711,7 +765,7 @@ class CommuteService : Service() {
      */
     private fun jumpByLocation(now: Long): Long? {
         // 只认这趟行程开始之后拿到的定位：系统缓存的旧位置（比如上次进地铁时）会让刚启动就误跳段
-        val last = best?.takeIf { it.accuracy < 300 && it.time >= startedAt - 30_000 } ?: return null
+        val last = best?.takeIf { it.accuracy < 300 && it.time >= trustFixSince } ?: return null
         fun near(l: Leg) = l.candidates.filter { !it.lat.isNaN() }
             .minOfOrNull { Geo.distanceM(last.latitude, last.longitude, it.lat, it.lng) } ?: Double.MAX_VALUE
         val age = now - last.time
@@ -738,24 +792,37 @@ class CommuteService : Service() {
      * 2. 兜底：赶得上的那班车过去 6 分钟、且 1 分钟内没在走路；再晚到 12 分钟无论如何切。
      * 上车时刻 = max(那班车, 最后一段持续走路结束)，不早于人还在走的时候。
      */
-    private fun lastMetroBoardAt(leg: Leg, train: Long, now: Long): Long? {
-        val ws = TraceLog.recentWindows().filter { it.t > stationAt }.sortedBy { it.t }
-        var walkEnd = stationAt
-        var run = 0
-        for (w in ws) {
-            if (AccMotion.classify(w) == AccMotion.Kind.WALK) { run++; if (run >= 5) walkEnd = w.t } else run = 0
-        }
-        val at = maxOf(train, walkEnd)
+    /**
+     * 地铁段（不论第几段）：进站后先「等车」，有证据真的坐上了才切过去，上车时刻按列车真正开动来记。
+     * 证据（按可靠程度）：
+     *  1. 定位离开上车站 500 米以上（精度 ≤ 1000 米）；
+     *  2. 加速度显示「最后一次走动（跨进车门）之后连续 90 秒在晃」+ 那之后服务基站换了 → 列车开了；
+     *  3. 兜底：预计班次过去 6 分钟且 1 分钟内没在走路；最晚 12 分钟一定切。
+     * 上车时刻优先用 2 里「开始连续晃动」那一刻；没有就用 max(预计班次, 最后一次走动)。
+     */
+    private fun metroBoardAt(leg: Leg, train: Long, now: Long): Long? {
+        val ws = TraceLog.recentWindows()
+        val walkEnd = AccMotion.lastWalkEnd(ws, stationAt, now) ?: stationAt
+        val dep = AccMotion.departureSince(ws, walkEnd, now)
+        val fallbackAt = dep ?: maxOf(train, walkEnd)
         val st = leg.candidates.firstOrNull { it.isMetro() }
         val b = best
         if (st != null && b != null && b.time > stationAt && b.accuracy <= 1_000 &&
             Geo.distanceM(b.latitude, b.longitude, st.lat, st.lng) - b.accuracy > 500) {
-            TraceLog.event("metro_board", "by" to "moved", "at" to minOf(at, b.time))
-            return minOf(at, b.time)
+            val at = minOf(fallbackAt, b.time)
+            TraceLog.event("metro_board", "by" to "moved", "at" to at, "dep" to dep, "walkEnd" to walkEnd)
+            return at
+        }
+        if (dep != null) {
+            val cc = TraceLog.cellChangeAfter(maxOf(dep + 30_000L, walkEnd + 20_000L))
+            if (cc != null && cc <= now) {
+                TraceLog.event("metro_board", "by" to "cell", "at" to dep, "cell" to cc, "walkEnd" to walkEnd)
+                return dep
+            }
         }
         if ((now >= train + 6 * 60_000L && now - walkEnd > 60_000L) || now >= train + 12 * 60_000L) {
-            TraceLog.event("metro_board", "by" to "time", "at" to at)
-            return at
+            TraceLog.event("metro_board", "by" to "time", "at" to fallbackAt, "dep" to dep, "walkEnd" to walkEnd)
+            return fallbackAt
         }
         return null
     }
@@ -870,6 +937,13 @@ class CommuteService : Service() {
     private var metroAnchorAt = 0L
 
     /** 地铁已过几站（0..hops-1）和预计到下车站的时刻；没有途经站数据返回 null */
+    /** 换乘中（还在上一段地铁上）已过几站：有「准备下车」锚点就是倒数第二站，否则按已坐时间 */
+    private fun connectPassed(r: ChelaileApi.MetroRoute, total: Long, now: Long): Int {
+        val hops = r.hops.coerceAtLeast(1)
+        if (arriveAnchorAt > 0) return hops - 1
+        return if (total <= 0) 0 else (((now - boardedAt).toDouble() / total) * hops).toInt().coerceIn(0, hops - 1)
+    }
+
     private fun metroProgress(mr: ChelaileApi.MetroRoute, total: Long, now: Long): Pair<Int, Long> {
         val hops = mr.hops.coerceAtLeast(1)
         val perHop = (total / hops).coerceAtLeast(60_000L)
@@ -1019,13 +1093,16 @@ class CommuteService : Service() {
                 val passed = metroProgress(mr, total, now).first
                 val next = mr.stations[passed + 1].name
                 val n = mr.hops.coerceAtLeast(1) - passed
-                "下一站 $next · 还有 $n 站到 $name"
+                "当前 ${mr.stations[passed].name} · 下一站 $next · 还有 $n 站到 $name"
             }
             bs != null && br != null ->
                 if (bs.stopsLeft <= 1) "下一站就是 $name" else "下一站 ${br[bs.seg + 1].name} · 还有 ${bs.stopsLeft} 站到 $name"
             else -> "前往 $name" + (d?.let { " · 还有约 ${"%.1f".format(it / 1000)} 公里" } ?: "")
         }
-        val v = LiveNotifier.Visual("$lineTitle · 到 $name", text, short,
+        // 流体云标题：地铁有站点数据时直接显示「当前站 → 下一站」
+        val metroCur = if (mr != null && arriveAlertedAt == 0L) metroProgress(mr, total, now).first else -1
+        val title = if (metroCur >= 0) "$lineTitle · ${mr!!.stations[metroCur].name} → ${mr.stations[metroCur + 1].name}" else "$lineTitle · 到 $name"
+        val v = LiveNotifier.Visual(title, text, short,
             if (trip.legs.size > 1) "${trip.name} · 最后一段" else trip.name,
             progress = p, stops = if (bs != null) hops.coerceIn(0, 12) else 0,
             metro = metro, trackerRes = if (metro) R.drawable.ic_metro else R.drawable.ic_bus, riding = true)
@@ -1039,8 +1116,14 @@ class CommuteService : Service() {
             bs != null && hops > 0 -> bs.seg.coerceIn(0, hops) to hops
             else -> null
         }
+        val names: Triple<String?, String?, String?> = when {
+            mr != null && arriveAlertedAt == 0L -> Triple(mr.stations[metroCur.coerceAtLeast(0)].name, mr.stations.first().name, mr.stations.last().name)
+            bs != null && br != null && hops > 0 -> Triple(br[bs.seg.coerceIn(0, hops)].name, br.first().name, br.last().name)
+            else -> Triple(null, null, null)
+        }
         LiveState.publish(this, LiveSnapshot(trip.id, trip.name, legIdx, trip.legs.size, lineTitle, short, text, null, p, null, riding = true,
-            stopsPassed = stopUi?.first, stopsTotal = stopUi?.second), deadlineAt)
+            stopsPassed = stopUi?.first, stopsTotal = stopUi?.second,
+            curStop = names.first, fromStop = names.second, toStop = names.third), deadlineAt)
         if (metro && boardedAt + total - now > 5 * 60_000L) { setPower(Power.LOW); return 30_000L }
         setPower(if (d != null && d < 1_500) Power.HIGH else Power.LOW)
         // 坐公交离下车站还远：网络定位 + 一分钟刷一次就够
@@ -1067,10 +1150,12 @@ class CommuteService : Service() {
             val p = if (total > 0) (100 - (expectArrive - now) * 100 / total).toInt() else 50
             val r = metroRoutes[legIdx - 1]
             if (r != null && now < expectArrive) {
-                val (next, left) = if (arriveAnchorAt > 0) r.stations.last().name to 1
-                    else MetroRoutes.progress(r, now - boardedAt, total)
+                val passed = connectPassed(r, total, now)
+                val next = r.stations[passed + 1].name
+                val left = r.hops.coerceAtLeast(1) - passed
+                val curName = r.stations[passed].name
                 val line = prev.candidates.firstOrNull { it.isMetro() }?.label() ?: prev.title()
-                return LiveNotifier.Visual("$line · 下一站 $next", "还有 $left 站到 ${r.stations.last().name} · ${a.detail}",
+                return LiveNotifier.Visual("$line · $curName → $next", "当前 $curName · 下一站 $next · 还有 $left 站到 ${r.stations.last().name} · ${a.detail}",
                     a.headline, sub, countdownTo = arr?.let { now + it.etaSec * 1000L }, progress = p,
                     stops = r.hops.coerceAtMost(12), metro = true, trackerRes = R.drawable.ic_metro)
             }
@@ -1286,6 +1371,10 @@ class CommuteService : Service() {
     }
 
     private var finishing = false
+    private var trustFixSince = 0L
+
+    /** 本服务正在跑的行程：主循环还活着才算 */
+    fun runningId(): String? = if (::trip.isInitialized && !finishing && loop?.isActive == true) trip.id else null
 
     /** 打开 App：马上定一次位，按最新位置重算一遍（纠正段落、刷新胶囊） */
     @SuppressLint("MissingPermission")
@@ -1375,6 +1464,26 @@ class CommuteService : Service() {
                 kick()
             }
             TransitSignal.Kind.APPROACH -> Unit
+            TransitSignal.Kind.TAP -> {
+                // 余额通知只说明「刚刷了卡」：按现在在哪一段来解释成进站 / 出站 / 上公交
+                val cur = trip.legs[legIdx]
+                val prevMetro = legIdx > 0 && trip.legs[legIdx - 1].isMetroOnly()
+                val meaning = when {
+                    // 还在地铁上（换乘中没下车，或最后一段坐着）且已坐了 3 分钟以上：出站
+                    prevMetro && alightAt == 0L && boardedAt > 0 && at - boardedAt > 3 * 60_000L -> TransitSignal.Kind.EXIT
+                    riding && cur.isMetroOnly() && at - boardedAt > 3 * 60_000L -> TransitSignal.Kind.EXIT
+                    // 当前段是地铁、没在车上：进站（之前的进站刷卡 10 分钟内的重复不算）
+                    cur.isMetroOnly() && !riding && !(stationByTap && stationAt > 0 && at - stationAt < 10 * 60_000L) -> TransitSignal.Kind.ENTER
+                    // 当前段是公交、还没上：刷卡 = 上车
+                    !cur.isMetroOnly() && !riding && (nearSince > 0 || alightAt > 0) -> null
+                    else -> return
+                }
+                TraceLog.event("tap", "as" to (meaning?.name ?: "BUS_BOARD"), "leg" to legIdx)
+                if (meaning != null) { applyTransit(meaning, text, at); return }
+                Diag.mark(this, "刷卡上公交")
+                onBoarded(manual = false, at = at)
+                kick()
+            }
             TransitSignal.Kind.ARRIVE -> {
                 // 「准备下车」= 列车刚离开前一站、快到下车站了；只当锚点，不当下车
                 if (arriveAnchorAt > 0 && at - arriveAnchorAt < 10 * 60_000L) return
@@ -1404,13 +1513,15 @@ class CommuteService : Service() {
     }
 
     /** 换乘段：出站时刻就是下地铁时刻，顺便学这段地铁实际坐了多久 */
-    private fun markAlight(at: Long) {
+    private fun markAlight(at: Long, by: String = "tap") {
+        if (alightAt > 0) return
         alightAt = at; stepSensor(false)
+        TraceLog.event("alight_detect", "leg" to legIdx - 1, "by" to by, "at" to at)
         if (!rideLearned && !restored && boardedAt > 0) {
             rideLearned = true
             Learn.recordRide(this, trip.id, legIdx - 1, ((at - boardedAt) / 60_000L).toInt())
         }
-        Diag.mark(this, "刷卡出站，开始换乘")
+        Diag.mark(this, if (by == "tap") "刷卡出站，开始换乘" else "已到换乘点，开始换乘")
         saveRun(deadlineAt)
     }
 
