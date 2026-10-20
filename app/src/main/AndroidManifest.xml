@@ -45,6 +45,10 @@
             android:exported="false" />
 
         <receiver
+            android:name=".PlaceSampleReceiver"
+            android:exported="false" />
+
+        <receiver
             android:name=".GeoReceiver"
             android:exported="false" />
 
