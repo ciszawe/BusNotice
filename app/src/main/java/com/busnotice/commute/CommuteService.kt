@@ -158,6 +158,7 @@ class CommuteService : Service() {
                 .putExtra("fresh", fresh)
                 .putExtra(EXTRA_RESTART, restart)
             ctx.startForegroundService(i)
+            Scheduler.markRan(ctx, tripId)
         }
 
         /** 正在跑的行程 id（服务活着且行程没结束）；没有返回 null */
