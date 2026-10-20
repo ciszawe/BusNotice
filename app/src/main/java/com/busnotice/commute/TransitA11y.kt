@@ -10,7 +10,7 @@ import android.view.accessibility.AccessibilityWindowInfo
 
 /**
  * 出行识别（可选，无障碍）：只在有行程运行时，读系统出行胶囊 / 交通卡弹窗上的文字，
- * 带出行关键词的才记进本机行程记录。只记录，不参与任何判断。
+ * 带出行关键词的才记进本机行程记录；系统刷卡弹窗（已进站 / 已出站 / 消费成功）当作刷卡信号交给行程判断。
  */
 class TransitA11y : AccessibilityService() {
 
@@ -46,6 +46,7 @@ class TransitA11y : AccessibilityService() {
         if (text == lastText && now - lastAt < 30_000) return
         lastText = text; lastAt = now
         TraceLog.event("a11y", "pkg" to pkg, "text" to text.take(120))
+        tapSignal(text, pkg, now)
         BALANCE.find(text)?.groupValues?.get(1)?.toDoubleOrNull()?.let { v ->
             val p = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             val prev = p.getFloat("balance", Float.NaN)
@@ -55,13 +56,34 @@ class TransitA11y : AccessibilityService() {
                 p.edit().putFloat("balance", v.toFloat()).putLong("balanceAt", now).apply()
                 // 余额刚少了一笔车费 = 刚刷了卡。上一次余额必须是 3 小时内看到的，
                 // 否则可能是之前没看到的扣费（比如打开钱包时才发现少了），不能当成「现在刷卡」
-                val fresh = delta != null && delta < 0 && delta >= -15 && now - prevAt < 3 * 3_600_000L
-                TraceLog.event("tap_balance", "value" to v, "delta" to delta, "fresh" to fresh)
-                if (fresh) TransitSignal.post(this, TransitSignal.Kind.TAP, "交通卡扣费 ${-delta!!} 元", pkg, now)
+                // 余额只记录：地铁进站时弹的余额还是上一笔（公交）扣完的数，按差值判断会错位；刷卡判断看下面的弹窗原文
+                TraceLog.event("tap_balance", "value" to v, "delta" to delta, "prevAgoMin" to if (prevAt > 0) (now - prevAt) / 60_000L else null)
             }
             // 余额没变也刷新「看到时间」，下一次扣费才算得上新鲜
             else p.edit().putLong("balanceAt", now).apply()
         }
+    }
+
+    private var lastTapKind: TransitSignal.Kind? = null
+    private var lastTapAt = 0L
+
+    /**
+     * 系统 NFC 刷卡弹窗（只认系统界面 / 钱包）：
+     * 「已出站」= 出站，「已进站」= 进站，「消费成功 本次消费：x 元 刚刚」= 刚刷卡（公交上车等，由行程按当前段解释）。
+     * 通知栏里过后再看到的旧记录不是「刚刚」，不算；同一种 3 分钟内只算一次。
+     */
+    private fun tapSignal(text: String, pkg: String, now: Long) {
+        if (!pkg.contains("systemui") && !pkg.contains("wallet")) return
+        val kind = when {
+            Regex("(?<!判断)已出站").containsMatchIn(text) -> TransitSignal.Kind.EXIT
+            Regex("(?<!判断)已进站").containsMatchIn(text) -> TransitSignal.Kind.ENTER
+            Regex("消费成功|本次消费").containsMatchIn(text) && text.contains("刚刚") -> TransitSignal.Kind.TAP
+            else -> return
+        }
+        if (kind == lastTapKind && now - lastTapAt < 3 * 60_000L) return
+        lastTapKind = kind; lastTapAt = now
+        TraceLog.event("tap_popup", "kind" to kind.name)
+        TransitSignal.post(this, kind, "刷卡弹窗：${kind.name}", pkg, now)
     }
 
     /** 深度最多 6 层、总共最多 80 个节点 */
@@ -83,7 +105,7 @@ class TransitA11y : AccessibilityService() {
         private const val PREFS = "transit_a11y"
         private const val MAX_DEPTH = 6
         private const val MAX_NODES = 80
-        private val KEYWORDS = Regex("交通卡|余额|到站|下车|进站|出站|地铁|公交|乘车")
+        private val KEYWORDS = Regex("交通卡|余额|到站|下车|进站|出站|地铁|公交|乘车|消费成功|本次消费")
         private val BALANCE = Regex("余额[:：]?\\s*¥?\\s*([0-9]+\\.[0-9]{2})")
 
         fun enabled(ctx: Context): Boolean {
