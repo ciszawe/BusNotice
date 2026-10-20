@@ -18,7 +18,8 @@ class TransitA11y : AccessibilityService() {
     private var lastAt = 0L
 
     override fun onAccessibilityEvent(e: AccessibilityEvent?) {
-        if (e == null || CommuteService.instance == null) return
+        if (e == null) return
+        if (CommuteService.instance == null && !windowOpen()) return
         val pkg = e.packageName?.toString() ?: return
         if (pkg == packageName) return
         runCatching { handle(e, pkg) }
@@ -84,6 +85,13 @@ class TransitA11y : AccessibilityService() {
         lastTapKind = kind; lastTapAt = now
         TraceLog.event("tap_popup", "kind" to kind.name)
         TransitSignal.post(this, kind, "刷卡弹窗：${kind.name}", pkg, now)
+        // 行程还没开始（比如公司离车站近，还没走出范围就进站了）：刷卡就直接开始这趟
+        if (CommuteService.instance == null && (kind == TransitSignal.Kind.ENTER || kind == TransitSignal.Kind.TAP)) {
+            Scheduler.pendingInWindow(this)?.let { plan ->
+                Diag.mark(this, "刷卡${if (kind == TransitSignal.Kind.ENTER) "进站" else "上车"}，自动开始「${plan.name}」")
+                runCatching { CommuteService.start(this, plan.id, manual = false) }
+            }
+        }
     }
 
     /** 深度最多 6 层、总共最多 80 个节点 */
@@ -100,6 +108,42 @@ class TransitA11y : AccessibilityService() {
     }
 
     override fun onInterrupt() {}
+
+    // ---------- 有没有正在等着开始的行程（每分钟最多查一次） ----------
+    private var windowCheckedAt = 0L
+    private var windowOpenCache = false
+    private fun windowOpen(): Boolean {
+        val now = System.currentTimeMillis()
+        if (now - windowCheckedAt > 60_000L) {
+            windowCheckedAt = now
+            windowOpenCache = runCatching { Scheduler.pendingInWindow(this) != null }.getOrDefault(false)
+        }
+        return windowOpenCache
+    }
+
+    // ---------- Wi-Fi 断开：马上看一眼是不是离开了出发地（不用等下一次 2 分钟的检查） ----------
+    private var netCb: android.net.ConnectivityManager.NetworkCallback? = null
+
+    override fun onServiceConnected() {
+        super.onServiceConnected()
+        runCatching {
+            val cm = getSystemService(android.net.ConnectivityManager::class.java)
+            val req = android.net.NetworkRequest.Builder().addTransportType(android.net.NetworkCapabilities.TRANSPORT_WIFI).build()
+            val cb = object : android.net.ConnectivityManager.NetworkCallback() {
+                override fun onLost(network: android.net.Network) {
+                    if (CommuteService.instance != null) return
+                    val plan = runCatching { Scheduler.pendingInWindow(this@TransitA11y) }.getOrNull() ?: return
+                    if (plan.leaveMode()) Scheduler.watchNow(this@TransitA11y, plan)
+                }
+            }
+            cm.registerNetworkCallback(req, cb); netCb = cb
+        }
+    }
+
+    override fun onDestroy() {
+        netCb?.let { cb -> runCatching { getSystemService(android.net.ConnectivityManager::class.java).unregisterNetworkCallback(cb) } }
+        super.onDestroy()
+    }
 
     companion object {
         private const val PREFS = "transit_a11y"
