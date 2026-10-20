@@ -1541,8 +1541,8 @@ class CommuteService : Service() {
                     riding && cur.isMetroOnly() && at - boardedAt > 3 * 60_000L -> TransitSignal.Kind.EXIT
                     // 当前段是地铁、没在车上：进站（之前的进站刷卡 10 分钟内的重复不算）
                     cur.isMetroOnly() && !riding && !(stationByTap && stationAt > 0 && at - stationAt < 10 * 60_000L) -> TransitSignal.Kind.ENTER
-                    // 当前段是公交、还没上：刷卡 = 上车
-                    !cur.isMetroOnly() && !riding && (nearSince > 0 || alightAt > 0) -> null
+                    // 当前段是公交、还没上：刷卡 = 上车（交通卡只在乘车时刷，不再要求先走到站牌边）
+                    !cur.isMetroOnly() && !riding -> null
                     else -> return
                 }
                 TraceLog.event("tap", "as" to (meaning?.name ?: "BUS_BOARD"), "leg" to legIdx)
