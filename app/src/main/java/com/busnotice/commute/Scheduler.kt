@@ -24,6 +24,7 @@ object Scheduler {
 
     fun rescheduleAll(ctx: Context) {
         TripStore.all(ctx).forEach { schedule(ctx, it) }
+        PlaceSampler.ensure(ctx)
     }
 
     fun schedule(ctx: Context, plan: Trip) {
