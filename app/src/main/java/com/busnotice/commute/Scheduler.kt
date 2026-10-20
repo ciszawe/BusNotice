@@ -55,6 +55,17 @@ object Scheduler {
     fun ranToday(ctx: Context, planId: String): Boolean =
         ctx.getSharedPreferences("ran_day", Context.MODE_PRIVATE).getLong(planId, -1L) == LocalDate.now().toEpochDay()
 
+    /** 窗口内、今天还没跑过的行程（刷卡弹窗 / Wi-Fi 断开时用来直接启动） */
+    fun pendingInWindow(ctx: Context): Trip? {
+        val now = LocalDateTime.now()
+        return TripStore.all(ctx).firstOrNull { it.enabled && it.legs.isNotEmpty() && inWindow(it, now) && !ranToday(ctx, it.id) }
+    }
+
+    /** 马上做一次「离开了没有」检查（Wi-Fi 断开时由无障碍服务叫） */
+    fun watchNow(ctx: Context, plan: Trip) {
+        runCatching { watchIntent(ctx, plan.id).send() }
+    }
+
     fun cancel(ctx: Context, planId: String) {
         val am = ctx.getSystemService(AlarmManager::class.java)
         am.cancel(alarmIntent(ctx, planId)); am.cancel(watchIntent(ctx, planId))
@@ -146,6 +157,20 @@ class AlarmReceiver : BroadcastReceiver() {
         if (!Scheduler.inWindow(plan, now)) {
             Diag.mark(ctx, "${plan.name}：窗口内一直没离开出发地"); return
         }
+        // 出发地 Wi-Fi：还连着 → 人还在，不用定位；刚才还连着、现在断了 → 已经离开
+        val ssid = OfficeWifi.current(ctx)
+        if (ssid != null && OfficeWifi.known(ctx, plan.id, ssid)) {
+            OfficeWifi.markOn(ctx, plan.id)
+            Scheduler.scheduleWatch(ctx, plan, System.currentTimeMillis() + Scheduler.WATCH_EVERY_MS)
+            return
+        }
+        if (ssid == null && OfficeWifi.wasOnRecently(ctx, plan.id)) {
+            OfficeWifi.clearOn(ctx, plan.id)
+            TraceLog.event("leave_by_wifi")
+            Diag.mark(ctx, "出发地 Wi-Fi 断开，判断已离开，自动启动")
+            withContext(Dispatchers.Main) { start(ctx, plan) }
+            return
+        }
         // 外层超时要比 Loc.current 里的 8 秒长，否则现取的位置永远拿不到；超过 2 分钟的旧位置不算数
         val loc = withTimeoutOrNull(12_000) { Loc.current(ctx) }
             ?.takeIf { System.currentTimeMillis() - it.time < 120_000 }
@@ -155,6 +180,8 @@ class AlarmReceiver : BroadcastReceiver() {
             Diag.mark(ctx, "已离开出发地，自动启动")
             withContext(Dispatchers.Main) { start(ctx, plan) }
         } else {
+            // 人在出发地范围内：顺便记下连着的 Wi-Fi（满 2 天就当出发地 Wi-Fi 用）
+            if (d != null && ssid != null) OfficeWifi.observe(ctx, plan.id, ssid)
             if (loc == null) Diag.mark(ctx, "留意离开中：这次没拿到位置")
             Scheduler.scheduleWatch(ctx, plan, System.currentTimeMillis() + Scheduler.WATCH_EVERY_MS)
         }
