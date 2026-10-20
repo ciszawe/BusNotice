@@ -285,6 +285,10 @@ class CommuteService : Service() {
         // 看板缓存：接着中断前那趟跑就先用存下的看板顶上（第一轮刷新前首页不空着）；新的一趟就删掉旧缓存
         if (resumedDl != null) LiveState.ensureRestored(this, t.id) else LiveState.clearPersisted(this)
         loop = scope.launch { runLoop(resumedDl ?: if (fresh) freshDeadline(t) else deadline(t, manual)) }
+        // 由刷卡弹窗拉起的新行程：把那次刷卡（3 分钟内）补交给行程，直接按进站 / 上车处理
+        if (resumedDl == null) TransitSignal.recent(this, 3 * 60_000L)?.let { (k, txt, at) ->
+            if (k == TransitSignal.Kind.ENTER || k == TransitSignal.Kind.TAP) onTransitSignal(k, txt, at)
+        }
         return START_STICKY
     }
 
