@@ -19,6 +19,7 @@ object LiveNotifier {
     const val CHANNEL_LIVE = "commute_live"
     const val CHANNEL_ALERT = "commute_alert_v2"
     const val CHANNEL_QUIET = "commute_quiet"
+    const val CHANNEL_POP = "commute_pop"
     const val LIVE_ID = 1001
     private const val ALERT_ID = 1002
 
@@ -65,6 +66,13 @@ object LiveNotifier {
             }
         )
         nm.createNotificationChannel(
+            NotificationChannel(CHANNEL_POP, "车快到了（展开流体云）", NotificationManager.IMPORTANCE_HIGH).apply {
+                description = "车快到、该出发、快到站时，把流体云胶囊直接展开成卡片；震动由 App 自己控制"
+                setSound(null, null)
+                enableVibration(false)
+            }
+        )
+        nm.createNotificationChannel(
             NotificationChannel(CHANNEL_ALERT, "该出门了提醒", NotificationManager.IMPORTANCE_HIGH).apply {
                 description = "需要马上出发、或换乘紧张时横幅 + 震动"
                 enableVibration(true)
@@ -95,8 +103,9 @@ object LiveNotifier {
     fun warming(ctx: Context, tripName: String): Notification =
         base(ctx, Visual(tripName, "正在定位、查询实时公交…", "定位中")).build()
 
-    fun build(ctx: Context, v: Visual): Notification {
-        val b = base(ctx, v)
+    fun build(ctx: Context, v: Visual, channel: String = CHANNEL_LIVE): Notification {
+        if (channel == CHANNEL_LIVE) lastVisual = v
+        val b = base(ctx, v, channel)
         if (v.countdownTo != null && v.countdownTo > System.currentTimeMillis()) {
             b.setWhen(v.countdownTo).setShowWhen(true).setUsesChronometer(true).setChronometerCountDown(true)
         } else {
@@ -132,12 +141,16 @@ object LiveNotifier {
     }
 
     @Volatile var last: Notification? = null
+    @Volatile private var lastVisual: Visual? = null
+    /** 胶囊刚展开成卡片：这段时间内的常规刷新先不发，免得把展开的卡片又刷回小胶囊 */
+    @Volatile private var popUntil = 0L
+    private const val POP_HOLD_MS = 25_000L
     /** 用户划掉了胶囊：行程照常在后台跑，但先不显示，等下一次提醒（到站、该出发、换乘）或打开 App 再出来 */
     @Volatile var hidden = false
 
     fun update(ctx: Context, n: Notification) {
         last = n
-        if (hidden) return
+        if (hidden || System.currentTimeMillis() < popUntil) return
         if (NotificationManagerCompat.from(ctx).areNotificationsEnabled()) {
             try {
                 NotificationManagerCompat.from(ctx).notify(LIVE_ID, n)
@@ -148,7 +161,8 @@ object LiveNotifier {
     /** 需要马上出发 / 换乘紧张时，额外弹一条横幅并震动 */
     fun alert(ctx: Context, title: String, text: String, metro: Boolean = false, id: Int = ALERT_ID) {
         unhide(ctx)
-        TraceLog.event("alert", "title" to title, "text" to text)
+        val popped = pop(ctx, title, text)
+        TraceLog.event("alert", "title" to title, "text" to text, "pop" to popped)
         val n = NotificationCompat.Builder(ctx, CHANNEL_ALERT)
             .setSmallIcon(if (metro) R.drawable.ic_metro else R.drawable.ic_bus)
             .setColor(if (metro) GREEN else BLUE)
@@ -159,11 +173,28 @@ object LiveNotifier {
             .setAutoCancel(true)
             .setTimeoutAfter(2 * 60_000L)
             .setContentIntent(openApp(ctx))
+            // 已经用流体云卡片提醒过了：通知栏这条只留底，不再响/震第二次
+            .setSilent(popped)
             .build()
         try {
             NotificationManagerCompat.from(ctx).notify(id, n)
         } catch (_: SecurityException) { }
         buzz(ctx)
+    }
+
+    /**
+     * 把流体云胶囊本身重发成「会提醒」的样子（高重要级渠道、不静音、不只提醒一次）：
+     * ColorOS 对会提醒的实时通知直接弹出展开的卡片，不用下拉通知栏。下一次常规刷新（POP_HOLD_MS 之后）回到小胶囊。
+     */
+    private fun pop(ctx: Context, title: String, text: String): Boolean {
+        val v = lastVisual ?: return false
+        if (!NotificationManagerCompat.from(ctx).areNotificationsEnabled()) return false
+        val n = build(ctx, v.copy(title = title, text = text, urgent = true), CHANNEL_POP)
+        return try {
+            NotificationManagerCompat.from(ctx).notify(LIVE_ID, n)
+            popUntil = System.currentTimeMillis() + POP_HOLD_MS
+            true
+        } catch (_: SecurityException) { false }
     }
 
     /**
@@ -209,8 +240,8 @@ object LiveNotifier {
         } catch (_: SecurityException) { }
     }
 
-    private fun base(ctx: Context, v: Visual): NotificationCompat.Builder =
-        NotificationCompat.Builder(ctx, CHANNEL_LIVE)
+    private fun base(ctx: Context, v: Visual, channel: String = CHANNEL_LIVE): NotificationCompat.Builder =
+        NotificationCompat.Builder(ctx, channel)
             .setSmallIcon(if (v.metro) R.drawable.ic_metro else R.drawable.ic_bus)
             .setColor(if (v.metro) GREEN else BLUE)
             .setContentTitle(v.title)
@@ -218,8 +249,8 @@ object LiveNotifier {
             .setSubText(v.sub.ifEmpty { null })
             .setShortCriticalText(v.short)
             .setOngoing(true)
-            .setOnlyAlertOnce(true)
-            .setSilent(true)
+            .setOnlyAlertOnce(channel != CHANNEL_POP)
+            .setSilent(channel != CHANNEL_POP)
             .setRequestPromotedOngoing(true)
             .setCategory(NotificationCompat.CATEGORY_NAVIGATION)
             .setContentIntent(openApp(ctx))
