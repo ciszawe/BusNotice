@@ -1313,7 +1313,7 @@ class CommuteService : Service() {
     private val DWELL_MS = 5 * 60_000L      // 在同一处（60 米内）待满 5 分钟才算到了目的地
     private val DWELL_R = 60.0
 
-    /** 到站结束：行程算完（不再恢复），但再低功耗记一会儿，等人在某处停下来再投终点票 */
+    /** 到站结束：行程算完（不再恢复），但再低功耗记一会儿下车后的步行，人停下来或满 25 分钟就停 */
     private fun endTrip(by: String) {
         if (tail || finishing) return
         if (!arrived) { finish(); return }
@@ -1332,8 +1332,7 @@ class CommuteService : Service() {
 
     /**
      * 驻留判断：进入记录满 5 分钟后，最近 5 分钟的好定位（精度 ≤ 100 米）至少 3 个、跨度 ≥ 3 分钟、都在中心 60 米内，
-     * 且最近 3 分钟走路不到 30 秒 → 在这里停下来了，投终点票（上午的行程 = 公司，下午/晚上 = 家），结束记录。
-     * 路上溜达、买早餐一般停不满 5 分钟；就算偶尔投到别处，常去地点要 ≥ 3 票、跨 ≥ 2 天，并按票数取最多的那处，不会被带偏。
+     * 且最近 3 分钟走路不到 30 秒 → 人停下来了，结束记录（只留轨迹给分析用，不投票）。
      */
     private fun tailTick(now: Long): Long {
         val b = best
@@ -1351,7 +1350,7 @@ class CommuteService : Service() {
         val walking = TraceLog.recentWindows().count { it.t > now - 180_000L && AccMotion.classify(it) == AccMotion.Kind.WALK }
         if (walking > 15) return 30_000L
         val acc = recent.map { it.accuracy }.sorted()[recent.size / 2]
-        runCatching { Places.voteTrip(this, false, startedAt, lat, lng, acc, now) }
+        // 停下来只用来结束记录，不再投终点票：家/公司改由全天随机采样来学（PlaceSampler）
         TraceLog.event("tail_dwell", "after" to (now - tailStart) / 1000, "spread" to spread.toInt(), "acc" to acc.toInt())
         finish()
         return 60_000L
