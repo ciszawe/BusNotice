@@ -65,6 +65,15 @@ object TransitSignal {
         }
     }
 
+    /** 最近一次出行信号（maxAgeMs 以内）；没有返回 null */
+    fun recent(ctx: Context, maxAgeMs: Long): Triple<Kind, String, Long>? {
+        val p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val at = p.getLong("at", 0L)
+        if (System.currentTimeMillis() - at > maxAgeMs) return null
+        val k = runCatching { Kind.valueOf(p.getString("kind", null) ?: return null) }.getOrNull() ?: return null
+        return Triple(k, p.getString("text", "") ?: "", at)
+    }
+
     fun post(ctx: Context, kind: Kind, text: String, pkg: String, at: Long) {
         // 同一条通知会反复更新：同类信号 30 秒内只算一次
         val p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
