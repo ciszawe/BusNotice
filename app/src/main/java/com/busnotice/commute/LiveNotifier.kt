@@ -18,6 +18,7 @@ import androidx.core.graphics.drawable.IconCompat
 object LiveNotifier {
     const val CHANNEL_LIVE = "commute_live"
     const val CHANNEL_ALERT = "commute_alert_v2"
+    const val CHANNEL_QUIET = "commute_quiet"
     const val LIVE_ID = 1001
     private const val ALERT_ID = 1002
 
@@ -56,12 +57,39 @@ object LiveNotifier {
             }
         )
         nm.createNotificationChannel(
+            NotificationChannel(CHANNEL_QUIET, "到站后记录", NotificationManager.IMPORTANCE_MIN).apply {
+                description = "到站后记录走到目的地的那段路（用来学习常去地点），最多 25 分钟"
+                setSound(null, null)
+                enableVibration(false)
+                setShowBadge(false)
+            }
+        )
+        nm.createNotificationChannel(
             NotificationChannel(CHANNEL_ALERT, "该出门了提醒", NotificationManager.IMPORTANCE_HIGH).apply {
                 description = "需要马上出发、或换乘紧张时横幅 + 震动"
                 enableVibration(true)
                 vibrationPattern = longArrayOf(0, 250, 150, 250)
             }
         )
+    }
+
+    /** 到站后记录最后一段步行：不上流体云、不响不震，只在通知栏折叠一条（前台服务必须有通知） */
+    fun quiet(ctx: Context, title: String, text: String): Notification =
+        NotificationCompat.Builder(ctx, CHANNEL_QUIET)
+            .setSmallIcon(R.drawable.ic_walk)
+            .setContentTitle(title)
+            .setContentText(text)
+            .setOngoing(true)
+            .setSilent(true)
+            .setPriority(NotificationCompat.PRIORITY_MIN)
+            .setContentIntent(openApp(ctx))
+            .addAction(0, "停止记录", actionIntent(ctx, ActionReceiver.ACTION_STOP))
+            .build()
+
+    /** 直接替换前台通知（不管胶囊是否被划掉隐藏） */
+    fun replace(ctx: Context, n: Notification) {
+        last = n
+        try { NotificationManagerCompat.from(ctx).notify(LIVE_ID, n) } catch (_: SecurityException) { }
     }
 
     fun warming(ctx: Context, tripName: String): Notification =
