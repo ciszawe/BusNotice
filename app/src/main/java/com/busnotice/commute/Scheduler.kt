@@ -34,7 +34,7 @@ object Scheduler {
         GeoWatch.register(ctx, plan)
         if (!plan.enabled || plan.dayMask == 0 || plan.legs.isEmpty()) return
         // 「离开某地才弹」：保存时正好在窗口里，一分钟后就开始留意
-        if (plan.leaveMode() && inWindow(plan, LocalDateTime.now())) {
+        if (plan.leaveMode() && inWindow(plan, LocalDateTime.now()) && !ranToday(ctx, plan.id)) {
             scheduleWatch(ctx, plan, System.currentTimeMillis() + 60_000L)
         }
         val at = nextTrigger(plan, LocalDateTime.now(), ctx) ?: return
@@ -46,6 +46,14 @@ object Scheduler {
         }
         Log.i(TAG, "${plan.name} 下次唤醒 $at")
     }
+
+    /** 这趟今天已经跑过（自动或手动启动过）：当天不再「留意离开」自动拉起，免得到家后又被重新开始 */
+    fun markRan(ctx: Context, planId: String) {
+        ctx.getSharedPreferences("ran_day", Context.MODE_PRIVATE).edit().putLong(planId, LocalDate.now().toEpochDay()).apply()
+    }
+
+    fun ranToday(ctx: Context, planId: String): Boolean =
+        ctx.getSharedPreferences("ran_day", Context.MODE_PRIVATE).getLong(planId, -1L) == LocalDate.now().toEpochDay()
 
     fun cancel(ctx: Context, planId: String) {
         val am = ctx.getSystemService(AlarmManager::class.java)
@@ -133,6 +141,7 @@ class AlarmReceiver : BroadcastReceiver() {
 
     private suspend fun watch(ctx: Context, plan: Trip) {
         if (CommuteService.instance != null) return
+        if (Scheduler.ranToday(ctx, plan.id)) { Diag.mark(ctx, "${plan.name}：今天已经走过，不再自动启动"); return }
         val now = LocalDateTime.now()
         if (!Scheduler.inWindow(plan, now)) {
             Diag.mark(ctx, "${plan.name}：窗口内一直没离开出发地"); return
