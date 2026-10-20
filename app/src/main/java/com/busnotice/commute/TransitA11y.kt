@@ -51,9 +51,16 @@ class TransitA11y : AccessibilityService() {
             val prev = p.getFloat("balance", Float.NaN)
             val delta = if (prev.isNaN()) null else Math.round((v - prev) * 100) / 100.0
             if (prev.isNaN() || delta != 0.0) {
-                p.edit().putFloat("balance", v.toFloat()).apply()
-                TraceLog.event("tap_balance", "value" to v, "delta" to delta)
+                val prevAt = p.getLong("balanceAt", 0L)
+                p.edit().putFloat("balance", v.toFloat()).putLong("balanceAt", now).apply()
+                // 余额刚少了一笔车费 = 刚刷了卡。上一次余额必须是 3 小时内看到的，
+                // 否则可能是之前没看到的扣费（比如打开钱包时才发现少了），不能当成「现在刷卡」
+                val fresh = delta != null && delta < 0 && delta >= -15 && now - prevAt < 3 * 3_600_000L
+                TraceLog.event("tap_balance", "value" to v, "delta" to delta, "fresh" to fresh)
+                if (fresh) TransitSignal.post(this, TransitSignal.Kind.TAP, "交通卡扣费 ${-delta!!} 元", pkg, now)
             }
+            // 余额没变也刷新「看到时间」，下一次扣费才算得上新鲜
+            else p.edit().putLong("balanceAt", now).apply()
         }
     }
 
