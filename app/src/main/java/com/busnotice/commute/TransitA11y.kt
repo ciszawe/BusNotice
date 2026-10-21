@@ -65,25 +65,30 @@ class TransitA11y : AccessibilityService() {
         }
     }
 
-    private var lastTapKind: TransitSignal.Kind? = null
+    private var lastTapSig = ""
     private var lastTapAt = 0L
+    private var lastStaleAt = 0L
 
     /**
      * 系统 NFC 刷卡弹窗（只认系统界面 / 钱包）：
-     * 「已出站」= 出站，「已进站」= 进站，「消费成功 本次消费：x 元 刚刚」= 刚刷卡（公交上车等，由行程按当前段解释）。
-     * 通知栏里过后再看到的旧记录不是「刚刚」，不算；同一种 30 秒内只算一次（出站后马上上公交的刷卡不能被吞掉）。
+     * 「已出站」= 出站，「已进站」= 进站，「消费成功 本次消费：x 元」= 刚刷卡（公交上车等，由行程按当前段解释）。
+     * 只认这一条记录自己的时间戳是「刚刚」的（见 TapPopup）：通知栏里几分钟前的旧扣费，哪怕旁边别的通知写着「刚刚」也不算。
+     * 同一笔（种类 + 金额）90 秒内只算一次：「刚刚」最多挂一分钟，弹窗和通知栏会反复读到同一笔。
      */
     private fun tapSignal(text: String, pkg: String, now: Long) {
         if (!pkg.contains("systemui") && !pkg.contains("wallet")) return
-        val kind = when {
-            Regex("(?<!判断)已出站").containsMatchIn(text) -> TransitSignal.Kind.EXIT
-            Regex("(?<!判断)已进站").containsMatchIn(text) -> TransitSignal.Kind.ENTER
-            Regex("消费成功|本次消费").containsMatchIn(text) && text.contains("刚刚") -> TransitSignal.Kind.TAP
-            else -> return
+        val hit = TapPopup.read(text)
+        if (hit == null) {
+            if (TapPopup.mentions(text) && now - lastStaleAt > 60_000L) {
+                lastStaleAt = now
+                TraceLog.event("tap_stale", "ctx" to TapPopup.firstMention(text))
+            }
+            return
         }
-        if (kind == lastTapKind && now - lastTapAt < 30_000L) return
-        lastTapKind = kind; lastTapAt = now
-        TraceLog.event("tap_popup", "kind" to kind.name)
+        if (hit.sig == lastTapSig && now - lastTapAt < 90_000L) return
+        lastTapSig = hit.sig; lastTapAt = now
+        val kind = hit.kind
+        TraceLog.event("tap_popup", "kind" to kind.name, "ctx" to hit.ctx)
         TransitSignal.post(this, kind, "刷卡弹窗：${kind.name}", pkg, now)
         // 行程还没开始（比如公司离车站近，还没走出范围就进站了）：刷卡就直接开始这趟
         if (CommuteService.instance == null && (kind == TransitSignal.Kind.ENTER || kind == TransitSignal.Kind.TAP)) {
