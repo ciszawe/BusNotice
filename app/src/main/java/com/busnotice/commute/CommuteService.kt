@@ -273,6 +273,7 @@ class CommuteService : Service() {
         runCatching { TraceLog.start(this, t.id, t.name) }
         TraceLog.event("run", "manual" to manual, "restart" to (intent == null), "userRestart" to restart, "why" to why)
         TraceLog.onCell = { snap -> scope.launch(Dispatchers.Main) { runCatching { onCell(snap) }.onFailure { Log.w(TAG, "基站处理失败", it) } } }
+        walkFixes.clear(); firstWalkDone = false; userRestarted = restart
         metroGate.reset(); cellExitAt = 0L; if (metroRideOn) fpRec.finish(); metroRideOn = false; busMovingOn = false; tacLearner = null
         stationAt = 0L; metroRideSec.clear(); metroRoutes.clear(); alightAt = 0L; fenceFixes.clear(); stillSince = 0L; lastFastAt = 0L; rideLearned = false; stopAlerted = ""
         stationByTap = false; arriveAnchorAt = 0L; metroAnchorIdx = -1; metroAnchorAt = 0L
@@ -599,6 +600,7 @@ class CommuteService : Service() {
         commitBoard(System.currentTimeMillis())
         flushPendingLearn(System.currentTimeMillis())
         retryDeferredTap(System.currentTimeMillis())
+        runCatching { checkFirstWalk() }
         val leg = trip.legs[legIdx]
         val prev = trip.legs.getOrNull(legIdx - 1)
         val now = System.currentTimeMillis()
@@ -1441,6 +1443,7 @@ class CommuteService : Service() {
         val acc = recent.map { it.accuracy }.sorted()[recent.size / 2]
         // 停下来只用来结束记录，不再投终点票：家/公司改由全天随机采样来学（PlaceSampler）
         TraceLog.event("tail_dwell", "after" to (now - tailStart) / 1000, "spread" to spread.toInt(), "acc" to acc.toInt())
+        runCatching { learnLastWalk(lat, lng) }
         finish()
         return 60_000L
     }
@@ -1453,6 +1456,11 @@ class CommuteService : Service() {
         val fresher = cur == null || loc.time - cur.time > 15_000
         if (fresher || loc.accuracy <= cur!!.accuracy) best = loc
         if (loc.provider == LocationManager.GPS_PROVIDER) lastGpsFix = loc
+        // 第一段步行阶段（还没到上车点）：留下定位轨迹，给学步行用
+        if (::trip.isInitialized && !tail && !firstWalkDone && legIdx == 0 && boardedAt == 0L) {
+            walkFixes.addLast(WalkLearn.Fix(loc.time, loc.latitude, loc.longitude, loc.accuracy))
+            while (walkFixes.size > 300) walkFixes.removeFirst()
+        }
         if (!::trip.isInitialized || riding) return
 
         // 中途才打开：还没到过上车点、但速度像坐车且贴着这条线走 → 说明已经在车上了
@@ -1740,6 +1748,37 @@ class CommuteService : Service() {
                 kick()
             }
         }
+    }
+
+    // ---------- 学步行（只学不用）：出发地 → 第一段上车点、最后下车 → 目的地 ----------
+    private val walkFixes = ArrayDeque<WalkLearn.Fix>()
+    private var firstWalkDone = false
+    private var userRestarted = false
+
+    /** 第一段：走到上车站附近（公交）或进了站（地铁）的那一刻，结算这段步行 */
+    private fun checkFirstWalk() {
+        if (firstWalkDone || restored || legIdx != 0) return
+        if (nearSince == 0L && stationAt == 0L) return
+        firstWalkDone = true
+        val end = if (stationAt > 0) stationAt else nearSince
+        val wins = TraceLog.recentWindows()
+        val start = WalkLearn.walkStart(wins, startedAt - 30_000L, end) ?: return
+        // 启动时人已经在走（离开出发地才启动、手动重新开始）：时长只是下限，步速照样能用
+        val partial = start - startedAt < 30_000L || userRestarted
+        val s = WalkLearn.build(LocalDate.now().toEpochDay(), "first", start, end, walkFixes.toList(), wins, partial) ?: return
+        WalkLearn.record(this, trip.id, s)
+        TraceLog.event("walk_learn", "kind" to "first", "dur" to s.durSec, "path" to s.pathM, "walk" to s.walkSec, "spd" to s.speed, "partial" to partial)
+    }
+
+    /** 最后一段：从下车 / 出站（尾段记录开始）到在终点停下来的那一刻 */
+    private fun learnLastWalk(lat: Double, lng: Double) {
+        if (restored) return
+        val fixes = tailFixes.map { WalkLearn.Fix(it.time, it.latitude, it.longitude, it.accuracy) }
+        val arrive = WalkLearn.arriveAt(fixes, lat, lng) ?: return
+        val wins = TraceLog.recentWindows()
+        val s = WalkLearn.build(LocalDate.now().toEpochDay(), "last", tailStart, arrive, fixes, wins, partial = false) ?: return
+        WalkLearn.record(this, trip.id, s)
+        TraceLog.event("walk_learn", "kind" to "last", "dur" to s.durSec, "path" to s.pathM, "walk" to s.walkSec, "spd" to s.speed)
     }
 
     // ---------- 地铁基站：学地下专网区号判进出站，顺便记沿途基站序列（只存本机） ----------
