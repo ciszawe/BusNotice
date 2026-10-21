@@ -71,7 +71,7 @@ class TransitA11y : AccessibilityService() {
     /**
      * 系统 NFC 刷卡弹窗（只认系统界面 / 钱包）：
      * 「已出站」= 出站，「已进站」= 进站，「消费成功 本次消费：x 元 刚刚」= 刚刷卡（公交上车等，由行程按当前段解释）。
-     * 通知栏里过后再看到的旧记录不是「刚刚」，不算；同一种 3 分钟内只算一次。
+     * 通知栏里过后再看到的旧记录不是「刚刚」，不算；同一种 30 秒内只算一次（出站后马上上公交的刷卡不能被吞掉）。
      */
     private fun tapSignal(text: String, pkg: String, now: Long) {
         if (!pkg.contains("systemui") && !pkg.contains("wallet")) return
@@ -81,7 +81,7 @@ class TransitA11y : AccessibilityService() {
             Regex("消费成功|本次消费").containsMatchIn(text) && text.contains("刚刚") -> TransitSignal.Kind.TAP
             else -> return
         }
-        if (kind == lastTapKind && now - lastTapAt < 3 * 60_000L) return
+        if (kind == lastTapKind && now - lastTapAt < 30_000L) return
         lastTapKind = kind; lastTapAt = now
         TraceLog.event("tap_popup", "kind" to kind.name)
         TransitSignal.post(this, kind, "刷卡弹窗：${kind.name}", pkg, now)
