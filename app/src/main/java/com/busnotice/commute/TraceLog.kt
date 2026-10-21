@@ -85,6 +85,9 @@ object TraceLog {
 
     private fun dir(ctx: Context) = File(ctx.filesDir, "traces").apply { mkdirs() }
 
+    /** 每次查基站（5 秒一次，不管变没变）都回调一次，给地铁进出站 / 基站学习用；在记录线程上调用 */
+    @Volatile var onCell: ((CellSnap) -> Unit)? = null
+
     @Synchronized
     fun start(ctx: Context, tripId: String, tripName: String) {
         stop()
@@ -243,6 +246,8 @@ object TraceLog {
         if (serving.isEmpty()) return
         val arr = org.json.JSONArray()
         val keys = mutableListOf<String>()
+        var nrTac: Int? = null; var nrId: Long? = null; var lteTac: Int? = null; var lteId: Int? = null
+        fun okInt(v: Int) = v.takeIf { it in 0 until Int.MAX_VALUE }
         serving.forEach { ci ->
             val o = JSONObject()
             when (ci) {
@@ -250,9 +255,13 @@ object TraceLog {
                     val id = ci.cellIdentity as CellIdentityNr
                     o.put("type", "nr").put("id", id.nci).put("tac", id.tac).put("pci", id.pci)
                         .put("dbm", ci.cellSignalStrength.dbm)
+                    if (nrTac == null) { nrTac = okInt(id.tac); nrId = id.nci.takeIf { it in 0 until Long.MAX_VALUE } }
                 }
-                is CellInfoLte -> o.put("type", "lte").put("id", ci.cellIdentity.ci).put("tac", ci.cellIdentity.tac)
-                    .put("pci", ci.cellIdentity.pci).put("dbm", ci.cellSignalStrength.dbm)
+                is CellInfoLte -> {
+                    o.put("type", "lte").put("id", ci.cellIdentity.ci).put("tac", ci.cellIdentity.tac)
+                        .put("pci", ci.cellIdentity.pci).put("dbm", ci.cellSignalStrength.dbm)
+                    if (lteId == null) { lteId = okInt(ci.cellIdentity.ci); lteTac = okInt(ci.cellIdentity.tac) }
+                }
                 is CellInfoWcdma -> o.put("type", "wcdma").put("id", ci.cellIdentity.cid).put("tac", ci.cellIdentity.lac)
                     .put("dbm", ci.cellSignalStrength.dbm)
                 is CellInfoGsm -> o.put("type", "gsm").put("id", ci.cellIdentity.cid).put("tac", ci.cellIdentity.lac)
@@ -261,6 +270,7 @@ object TraceLog {
             }
             arr.put(o); keys += "${o.optString("type")}:${o.opt("id")}:${o.opt("pci")}"
         }
+        onCell?.let { cb -> runCatching { cb(CellSnap(System.currentTimeMillis(), nrTac, nrId, lteTac, lteId)) } }
         // 只在服务基站变化时记一条（信号强度变化不算）
         val key = keys.sorted().joinToString("|")
         if (key == lastCell) return
