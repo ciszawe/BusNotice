@@ -1,5 +1,7 @@
 package com.busnotice.commute.ui
 
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.collectAsState
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -180,7 +182,12 @@ fun LiveBoard(s: LiveSnapshot, trip: Trip?, dark: Boolean) {
         }
 
         Row(Modifier.padding(top = 14.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            if (!s.riding) {
+            val undoAt by CommuteService.undoUntil.collectAsState()
+            val canUndo = undoAt > System.currentTimeMillis()
+            if (canUndo) {
+                // 刚手点过「已上车」：2 分钟内这个按钮是撤销，防误点、防连点跳两段
+                Pill("撤销上车", Color.White.copy(alpha = 0.12f), Fuse.Yellow, Fuse.Yellow.copy(alpha = 0.5f), Modifier.weight(1f)) { CommuteService.instance?.onBoarded() }
+            } else if (!s.riding) {
                 Pill("已上车", Fuse.Yellow, Color(0xFF111111), null, Modifier.weight(1f)) { CommuteService.instance?.onBoarded() }
             }
             Pill("结束", Color.White.copy(alpha = 0.12f), Color.White, Color.White.copy(alpha = 0.2f), Modifier.weight(1f)) {
