@@ -144,6 +144,10 @@ class CommuteService : Service() {
         private const val EXTRA_MANUAL = "manual"
         private const val EXTRA_RESTART = "restart"
         private const val MANUAL_RUN_MS = 30 * 60_000L
+        private const val UNDO_MS = 2 * 60_000L
+        /** 手点「已上车」后 2 分钟内：按钮变「撤销」，再点是撤回不是跳下一段 */
+        val undoUntil = MutableStateFlow(0L)
+        fun undoActive() = undoUntil.value > System.currentTimeMillis()
         private const val NEAR_STOP_M = 120.0
         @Volatile var instance: CommuteService? = null
 
@@ -269,6 +273,7 @@ class CommuteService : Service() {
         stationAt = 0L; metroRideSec.clear(); metroRoutes.clear(); alightAt = 0L; fenceFixes.clear(); stillSince = 0L; lastFastAt = 0L; rideLearned = false; stopAlerted = ""
         stationByTap = false; arriveAnchorAt = 0L; metroAnchorIdx = -1; metroAnchorAt = 0L
         deferredTapAt = 0L; deferredTapKind = null
+        boardSnap = null; undoUntil.value = 0L; pendingLearnLeg = -1
         placeStart = null; arrived = false; lastPlace = null; tail = false; tailFixes.clear(); startVoted = false
         legIdx = 0; boardedAt = 0L; nearSince = 0L; fastFixes = 0; alertedKey = null; planDone = false; planAlerted = ""
         maxStops.clear(); maxEta.clear()
@@ -441,24 +446,72 @@ class CommuteService : Service() {
     private var ridingCand: Candidate? = null  // 最后一段实际坐的线
 
     /** 地铁段手动点「已上车」= 真实列车时刻，拿来修正推算 */
-    private fun learnMetro(leg: Leg) {
+    private fun learnMetro(leg: Leg, nowSec: Int = LocalTime.now().toSecondOfDay()) {
         val c = leg.candidates.firstOrNull { it.isMetro() && it.metroDir.isNotEmpty() } ?: return
         val d = metroDirs["${c.stopName}|${c.name}"]?.firstOrNull { it.dest == c.metroDir } ?: return
-        val nowSec = LocalTime.now().toSecondOfDay()
         val weekday = LocalDate.now().dayOfWeek.value <= 5
         val r = Decision.metroResidual(nowSec - 30, d.firstMin, d.lastMin, weekday, c.peakHw(), c.offPeakHw()) ?: return
         val peak = Decision.headwayAt(nowSec / 60, weekday, 1, 2) == 1
         Learn.recordMetro(this, Learn.metroKey(c, peak), r)
     }
 
+    /** 手点「已上车」前的进度，撤销时整个放回去 */
+    private data class BoardSnap(
+        val legIdx: Int, val boardedAt: Long, val riding: Boolean, val stationAt: Long, val stationByTap: Boolean,
+        val alightAt: Long, val rideLearned: Boolean, val arriveAnchorAt: Long, val arriveAlertedAt: Long,
+        val pendingBoardAt: Long, val pendingBoardLoc: Location?, val ridingCand: Candidate?,
+        val metroAnchorIdx: Int, val metroAnchorAt: Long, val nearSince: Long, val transferAlerted: Boolean, val deadlineAt: Long,
+    )
+    private var boardSnap: BoardSnap? = null
+    // 地铁段手点的时刻：撤销窗口过了才拿去学，误点撤回的不学
+    private var pendingLearnLeg = -1
+    private var pendingLearnSec = 0
+
+    private fun undoBoard() {
+        val b = boardSnap ?: return
+        boardSnap = null; undoUntil.value = 0L; pendingLearnLeg = -1
+        legIdx = b.legIdx; boardedAt = b.boardedAt; riding = b.riding; stationAt = b.stationAt; stationByTap = b.stationByTap
+        alightAt = b.alightAt; rideLearned = b.rideLearned; arriveAnchorAt = b.arriveAnchorAt; arriveAlertedAt = b.arriveAlertedAt
+        pendingBoardAt = b.pendingBoardAt; pendingBoardLoc = b.pendingBoardLoc; ridingCand = b.ridingCand
+        metroAnchorIdx = b.metroAnchorIdx; metroAnchorAt = b.metroAnchorAt; nearSince = b.nearSince; transferAlerted = b.transferAlerted
+        alertedKey = null; speeds.clear(); routeHits.clear()
+        TraceLog.event("board_undo", "leg" to legIdx)
+        Diag.mark(this, "撤销了手点的「已上车」，回到第 ${legIdx + 1} 段")
+        loop?.cancel()
+        deadlineAt = b.deadlineAt
+        loop = scope.launch { runLoop(b.deadlineAt) }
+        saveRun(b.deadlineAt)
+    }
+
+    /** 撤销窗口过了：手点的地铁上车时刻才算数 */
+    private fun flushPendingLearn(now: Long) {
+        if (undoUntil.value > now) return
+        boardSnap = null
+        val i = pendingLearnLeg
+        if (i < 0) return
+        pendingLearnLeg = -1
+        runCatching { learnMetro(trip.legs[i], pendingLearnSec) }
+    }
+
     /** 「已上车」按钮或速度判断：进入下一段；最后一段则进入「去下车站」，再按一次结束 */
     fun onBoarded(manual: Boolean = true, at: Long = System.currentTimeMillis()) {
         if (!::trip.isInitialized) { finish(); return }
         if (tail) return
+        // 手点后 2 分钟内再点 = 撤销（防误点 / 连点直接跳两段）
+        if (manual && boardSnap != null && undoActive()) { undoBoard(); return }
         val now = at
         TraceLog.event("boarded", "leg" to legIdx, "manual" to manual, "at" to at, "riding" to riding)
+        if (manual) {
+            if (legIdx >= trip.legs.size - 1 && riding) return
+            boardSnap = BoardSnap(legIdx, boardedAt, riding, stationAt, stationByTap, alightAt, rideLearned, arriveAnchorAt, arriveAlertedAt,
+                pendingBoardAt, pendingBoardLoc, ridingCand, metroAnchorIdx, metroAnchorAt, nearSince, transferAlerted, deadlineAt)
+            undoUntil.value = System.currentTimeMillis() + UNDO_MS
+        } else if (boardSnap != null) {
+            // 自动判断接着推进了：之前那次手点就不再能撤
+            boardSnap = null; undoUntil.value = 0L
+        }
         stationAt = 0L
-        if (manual && !riding && trip.legs[legIdx].isMetroOnly()) runCatching { learnMetro(trip.legs[legIdx]) }
+        if (manual && !riding && trip.legs[legIdx].isMetroOnly()) { pendingLearnLeg = legIdx; pendingLearnSec = LocalTime.now().toSecondOfDay() }
         // 只学自动启动的行程：手动点开测试的不算习惯；先挂起，确认真的坐了一段才记（commitBoard）
         if (legIdx == 0 && boardedAt == 0L && !manualRun && !boardCommitted) {
             pendingBoardAt = now; pendingBoardLoc = best?.let { Location(it) }
@@ -538,6 +591,7 @@ class CommuteService : Service() {
     private suspend fun tick(): Long {
         if (tail) return tailTick(System.currentTimeMillis())
         commitBoard(System.currentTimeMillis())
+        flushPendingLearn(System.currentTimeMillis())
         retryDeferredTap(System.currentTimeMillis())
         val leg = trip.legs[legIdx]
         val prev = trip.legs.getOrNull(legIdx - 1)
@@ -698,7 +752,16 @@ class CommuteService : Service() {
                 }
             }.awaitAll()
         }
-        val a = Decision.decide(options, connecting)
+        val a0 = Decision.decide(options, connecting)
+        // 离到换乘站还有 10 分钟以上：实时到站那么远不准，不提赶不赶得上，只给预计到换乘站的时间
+        val a = if (connecting && prev != null && expectArrive - now > 10 * 60_000L) {
+            val at = prev.candidates.firstOrNull { it.alightName.isNotEmpty() }?.alightName ?: "换乘站"
+            val hhmm = java.time.Instant.ofEpochMilli(expectArrive).atZone(ZoneId.systemDefault()).toLocalTime()
+                .let { String.format("%02d:%02d", it.hour, it.minute) }
+            val nextLine = a0.option?.candidate?.label() ?: leg.title()
+            Decision.Advice(Decision.Mode.CONNECT, a0.option, null, a0.walkSec, 0, "${hhmm}到",
+                "预计 $hhmm 到 $at · 之后换 $nextLine，快到时再看赶哪班")
+        } else a0
         a.option?.candidate?.let { lastCand = it }
         // 先坐地铁再换公交、还没出发：倒推「最晚几点走，到换乘站刚好赶上公交」
         val plan = if (!planDone && legIdx == 0 && boardedAt == 0L && nearSince == 0L && leg.isMetroOnly())
