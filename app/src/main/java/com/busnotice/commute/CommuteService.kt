@@ -234,6 +234,8 @@ class CommuteService : Service() {
         val id = intent?.getStringExtra(EXTRA_TRIP_ID) ?: savedRunTrip()
         val t = id?.let { TripStore.get(this, it) }
         LiveNotifier.ensureChannels(this)
+        // 是什么拉起的这一趟（闹钟 / 离开出发地 / 刷卡 / 围栏…）：取启动前最后一条诊断，写进行程记录，方便查误启动
+        val why = Diag.last(this)
         val manual = intent?.getBooleanExtra(EXTRA_MANUAL, false) ?: false
         // 已经有一趟在跑：不许被重复点击 / 自动启动悄悄覆盖掉进度
         val curId = runningId()
@@ -269,7 +271,9 @@ class CommuteService : Service() {
         // 允许用最近 10 分钟内的定位来判断现在在第几段，而不是一律从第一段的上车站算起
         trustFixSince = startedAt - if (restart) 10 * 60_000L else 30_000L
         runCatching { TraceLog.start(this, t.id, t.name) }
-        TraceLog.event("run", "manual" to manual, "restart" to (intent == null), "userRestart" to restart)
+        TraceLog.event("run", "manual" to manual, "restart" to (intent == null), "userRestart" to restart, "why" to why)
+        TraceLog.onCell = { snap -> scope.launch(Dispatchers.Main) { runCatching { onCell(snap) }.onFailure { Log.w(TAG, "基站处理失败", it) } } }
+        metroGate.reset(); cellExitAt = 0L; if (metroRideOn) fpRec.finish(); metroRideOn = false; busMovingOn = false; tacLearner = null
         stationAt = 0L; metroRideSec.clear(); metroRoutes.clear(); alightAt = 0L; fenceFixes.clear(); stillSince = 0L; lastFastAt = 0L; rideLearned = false; stopAlerted = ""
         stationByTap = false; arriveAnchorAt = 0L; metroAnchorIdx = -1; metroAnchorAt = 0L
         deferredTapAt = 0L; deferredTapKind = null
@@ -1400,6 +1404,7 @@ class CommuteService : Service() {
     /** 到站结束：行程算完（不再恢复），但再低功耗记一会儿下车后的步行，人停下来或满 25 分钟就停 */
     private fun endTrip(by: String) {
         if (tail || finishing) return
+        if (metroRideOn) runCatching { endMetroRide() }
         if (!arrived) { finish(); return }
         placeVotes()
         val now = System.currentTimeMillis()
@@ -1677,7 +1682,9 @@ class CommuteService : Service() {
                 val sinceExit = at - metroExitAt
                 val meaning = when {
                     // 坐完地铁后的第一次刷卡 = 出站扣费（哪怕定位/基站已经先判了下车），不是上公交
-                    prevMetro && boardedAt > 0 && !metroExitSeen && at - boardedAt > 3 * 60_000L -> TransitSignal.Kind.EXIT
+                    // 例外：基站已经判了出站、又过了 2 分钟以上才刷卡 → 出站那下没读到，这次是上公交
+                    prevMetro && boardedAt > 0 && !metroExitSeen && at - boardedAt > 3 * 60_000L &&
+                        !(cellExitAt > 0 && at - cellExitAt > 2 * 60_000L) -> TransitSignal.Kind.EXIT
                     // 还在地铁上（换乘中没下车，或最后一段坐着）且已坐了 3 分钟以上：出站
                     prevMetro && alightAt == 0L && boardedAt > 0 && at - boardedAt > 3 * 60_000L -> TransitSignal.Kind.EXIT
                     // 中间一段地铁：以为还在站台等车，但进站已经 3 分钟以上又刷卡 → 只能是出站
@@ -1735,6 +1742,95 @@ class CommuteService : Service() {
         }
     }
 
+    // ---------- 地铁基站：学地下专网区号判进出站，顺便记沿途基站序列（只存本机） ----------
+    private var tacLearner: MetroTacLearner? = null
+    private val metroGate = MetroGate { tac -> tacLearner?.isMetroTac(tac) == true }
+    private val fpRec = MetroFpRecorder()
+    private var metroRideOn = false
+    private var metroRideKey = ""
+    private var metroRideStart = 0L
+    private var busMovingOn = false
+    private var cellExitAt = 0L          // 基站判断出站的时刻（离开地下区号的第一次采样）
+
+    /** 正在坐地铁（含站台等车）：最后一段地铁上车了，或者前一段是地铁、上了车还没下 */
+    private fun inMetroRide(): Boolean {
+        if (riding) return trip.legs[legIdx].isMetroOnly()
+        return legIdx > 0 && trip.legs[legIdx - 1].isMetroOnly() && boardedAt > 0 && alightAt == 0L && !metroExitSeen
+    }
+
+    /** 坐着公交、车在路上跑（GPS 速度 ≥ 4 m/s）：这时见到的区号肯定是地面的 */
+    private fun busMoving(now: Long): Boolean {
+        val onBus = if (riding) !trip.legs[legIdx].isMetroOnly()
+            else legIdx > 0 && !trip.legs[legIdx - 1].isMetroOnly() && boardedAt > 0 && alightAt == 0L
+        val fast = best?.let { now - it.time < 30_000 && it.hasSpeed() && it.speed >= 4f } == true
+        return onBus && fast
+    }
+
+    private fun onCell(s: CellSnap) {
+        if (!::trip.isInitialized || tail || finishing) return
+        val l = tacLearner ?: MetroCells.load(this).also { tacLearner = it }
+        val inRide = inMetroRide()
+        if (inRide) {
+            if (!metroRideOn) {
+                metroRideOn = true; metroRideStart = s.t
+                metroRideKey = trip.id.take(8) + ":" + (if (riding) legIdx else legIdx - 1)
+            }
+            l.sampleRide(s); fpRec.sample(s)
+        } else if (metroRideOn) endMetroRide()
+        if (busMoving(s.t)) { busMovingOn = true; l.sampleSurface(s) }
+        else if (busMovingOn) { busMovingOn = false; l.endSurface(); MetroCells.save(this, l) }
+
+        val edge = metroGate.feed(s) ?: return
+        val last = trip.legs.size - 1
+        val cur = trip.legs[legIdx]
+        when (edge.first) {
+            MetroGate.Edge.ENTER -> {
+                // 当前该进地铁站、还没判进站：连上地下区号 = 进站（刷卡来了会用刷卡时刻覆盖）
+                if (!cur.isMetroOnly() || riding || stationAt > 0) return
+                // 有可靠定位且离这段地铁站很远（比如坐公交路过别的地铁站）：不算
+                val fix = best?.takeIf { it.accuracy < 200 && s.t - it.time < 60_000 }
+                if (fix != null && !nearMetroLeg(fix, legIdx)) { TraceLog.event("cell_enter_skip", "leg" to legIdx); return }
+                stationAt = edge.second; stationByTap = false
+                TraceLog.event("cell_enter", "leg" to legIdx)
+                Diag.mark(this, "连上地铁里的基站，判断已进站")
+                saveRun(deadlineAt); kick()
+            }
+            MetroGate.Edge.EXIT -> {
+                if (!inRide) return
+                cellExitAt = edge.second
+                TraceLog.event("cell_exit", "leg" to legIdx, "at" to edge.second)
+                when {
+                    riding && cur.isMetroOnly() && legIdx == last -> {
+                        endMetroRide()
+                        Diag.mark(this, "离开地铁里的基站，判断已出站，行程结束")
+                        arrived = true
+                        endTrip("cell_exit")
+                        return
+                    }
+                    !riding && legIdx > 0 && trip.legs[legIdx - 1].isMetroOnly() && alightAt == 0L -> {
+                        endMetroRide()
+                        markAlight(edge.second, by = "cell")
+                    }
+                }
+                kick()
+            }
+        }
+    }
+
+    /** 一趟地铁结束：结算区号学习，存下沿途基站序列 */
+    private fun endMetroRide() {
+        metroRideOn = false
+        val l = tacLearner ?: return
+        val tac = l.endRide()
+        MetroCells.save(this, l)
+        fpRec.finish()?.let { seq ->
+            MetroCells.appendRide(this, metroRideKey, org.json.JSONObject()
+                .put("start", metroRideStart).put("end", System.currentTimeMillis())
+                .put("board", boardedAt).put("tacOk", tac != null).put("seq", seq))
+        }
+        TraceLog.event("metro_cells", "tacOk" to (tac != null), "learned" to l.hasLearned(), "rides" to MetroCells.rideCount(this))
+    }
+
     /** 换乘段：出站时刻就是下地铁时刻，顺便学这段地铁实际坐了多久 */
     private fun markAlight(at: Long, by: String = "tap") {
         if (alightAt > 0) return
@@ -1755,6 +1851,9 @@ class CommuteService : Service() {
     }
 
     private fun finish() {
+        if (metroRideOn) runCatching { endMetroRide() }
+        if (busMovingOn) runCatching { busMovingOn = false; tacLearner?.let { it.endSurface(); MetroCells.save(this, it) } }
+        TraceLog.onCell = null
         if (!finishing && !tail) placeVotes()
         if (tail && !finishing) TraceLog.event("tail_end", "after" to (System.currentTimeMillis() - tailStart) / 1000)
         TraceLog.event("finish", "leg" to legIdx, "riding" to riding)
@@ -1781,7 +1880,7 @@ class CommuteService : Service() {
         // 只有自己还是当前实例（或没有更新的实例）时才清内存里的看板，免得旧实例的 onDestroy 把新实例刚设的状态清掉。
         // 不是主动结束（被系统停掉、之后会恢复）：本地存的那份留着，重开 App 时还能显示
         val mine = instance === this || instance == null
-        if (instance === this) instance = null
+        if (instance === this) { instance = null; TraceLog.onCell = null }
         if (mine) LiveState.snapshot.value = null
         scope.cancel()
         super.onDestroy()
