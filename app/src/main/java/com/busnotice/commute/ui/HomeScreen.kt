@@ -504,7 +504,7 @@ private fun TripCard(
     }
 }
 
-/** 线路小牌：步行（去第一段上车点） — 各段线路牌，段内多个可选线路用「/」隔开 */
+/** 线路小牌：步行 — 各段线路牌 — 步行，段内多个可选线路用「/」隔开 */
 @Composable
 private fun RouteRow(trip: Trip, dark: Boolean, modifier: Modifier = Modifier) {
     val ink = Fuse.ink(dark)
@@ -516,14 +516,17 @@ private fun RouteRow(trip: Trip, dark: Boolean, modifier: Modifier = Modifier) {
     @Composable
     fun Dash() = Text("—", fontSize = 13.sp, color = ink.copy(alpha = 0.35f), modifier = Modifier.padding(horizontal = 6.dp))
 
+    // 步行小牌：开头走到第一段上车点、结尾从最后下车走到目的地，两头对称
+    @Composable
+    fun Walk() = Box(
+        Modifier.clip(RoundedCornerShape(6.dp))
+            .background(if (dark) Color.White.copy(alpha = 0.12f) else Color.Black.copy(alpha = 0.07f))
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+        contentAlignment = Alignment.Center,
+    ) { Text("步", fontSize = 12.sp, color = ink) }
+
     Row(modifier, verticalAlignment = Alignment.CenterVertically) {
-        // 第一段总是先走到上车点（App 按步行时间算出发），所以开头放一个「步」
-        Box(
-            Modifier.clip(RoundedCornerShape(6.dp))
-                .background(if (dark) Color.White.copy(alpha = 0.12f) else Color.Black.copy(alpha = 0.07f))
-                .padding(horizontal = 6.dp, vertical = 2.dp),
-            contentAlignment = Alignment.Center,
-        ) { Text("步", fontSize = 12.sp, color = ink) }
+        Walk()
         legs.take(4).forEach { leg ->
             Dash()
             leg.candidates.take(3).forEachIndexed { i, c: Candidate ->
@@ -532,6 +535,8 @@ private fun RouteRow(trip: Trip, dark: Boolean, modifier: Modifier = Modifier) {
             }
         }
         if (legs.size > 4) { Dash(); Text("…", fontSize = 13.sp, color = ink) }
+        Dash()
+        Walk()
     }
 }
 
