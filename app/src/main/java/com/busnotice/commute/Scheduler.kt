@@ -177,7 +177,9 @@ class AlarmReceiver : BroadcastReceiver() {
         val d = loc?.let { Geo.distanceM(it.latitude, it.longitude, plan.leaveLat, plan.leaveLng) }
         val slack = (loc?.accuracy ?: 0f).coerceAtMost(50f)
         if (d != null && d > plan.leaveRadiusM + slack) {
-            Diag.mark(ctx, "已离开出发地，自动启动")
+            // 带上判断依据（距离 / 精度 / 半径 / 定位来源），误启动时能从行程记录里看出是哪个定位点惹的
+            Diag.mark(ctx, "已离开出发地，自动启动（距 %d 米 · 精度 %d 米 · 半径 %d 米 · %s · %d 秒前）".format(
+                d.toInt(), loc?.accuracy?.toInt() ?: -1, plan.leaveRadiusM, loc?.provider ?: "?", (System.currentTimeMillis() - (loc?.time ?: 0L)) / 1000))
             withContext(Dispatchers.Main) { start(ctx, plan) }
         } else {
             // 人在出发地范围内：顺便记下连着的 Wi-Fi（满 2 天就当出发地 Wi-Fi 用）
