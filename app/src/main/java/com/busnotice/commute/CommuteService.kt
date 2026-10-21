@@ -274,6 +274,7 @@ class CommuteService : Service() {
         stationByTap = false; arriveAnchorAt = 0L; metroAnchorIdx = -1; metroAnchorAt = 0L
         deferredTapAt = 0L; deferredTapKind = null
         boardSnap = null; undoUntil.value = 0L; pendingLearnLeg = -1
+        metroExitSeen = false; metroExitAt = 0L
         placeStart = null; arrived = false; lastPlace = null; tail = false; tailFixes.clear(); startVoted = false
         legIdx = 0; boardedAt = 0L; nearSince = 0L; fastFixes = 0; alertedKey = null; planDone = false; planAlerted = ""
         maxStops.clear(); maxEta.clear()
@@ -537,6 +538,7 @@ class CommuteService : Service() {
         alightAt = 0L; rideLearned = false; stopAlerted = ""; stepSensor(false)
         stationByTap = false; arriveAnchorAt = 0L
         deferredTapAt = 0L; deferredTapKind = null
+        if (trip.legs[legIdx - 1].isMetroOnly()) { metroExitSeen = false; metroExitAt = 0L }
         fenceFixes.clear(); stillSince = 0L; lastFastAt = 0L
         maxStops.clear(); maxEta.clear(); speeds.clear(); routeHits.clear()
         loop?.cancel()
@@ -1549,6 +1551,9 @@ class CommuteService : Service() {
     private var restored = false
     // 刷卡时位置对不上（比如刷了卡但定位离这段站点很远）：先记下来，之后定位对上了再按刷卡时刻补上
     private var deferredTapAt = 0L
+    // 坐完地铁后有没有见过出站刷卡：地铁出站扣费也弹「消费成功」，第一次刷卡一律算出站
+    private var metroExitSeen = false
+    private var metroExitAt = 0L
     private var deferredTapKind: TransitSignal.Kind? = null
     private var stationByTap = false   // 进站时刻来自刷卡（比定位推断准）
     private var arriveAnchorAt = 0L    // 收到「准备下车」：列车刚离开下车站的前一站
@@ -1645,6 +1650,7 @@ class CommuteService : Service() {
             TransitSignal.Kind.EXIT -> {
                 val cur = trip.legs[legIdx]
                 val prevMetro = legIdx > 0 && trip.legs[legIdx - 1].isMetroOnly()
+                if (prevMetro || cur.isMetroOnly()) { metroExitSeen = true; metroExitAt = at }
                 when {
                     // 最后一段地铁：出站 = 到了
                     cur.isMetroOnly() && legIdx == last && (riding || stationAt > 0) -> {
@@ -1668,9 +1674,16 @@ class CommuteService : Service() {
                 // 余额通知只说明「刚刷了卡」：按现在在哪一段来解释成进站 / 出站 / 上公交
                 val cur = trip.legs[legIdx]
                 val prevMetro = legIdx > 0 && trip.legs[legIdx - 1].isMetroOnly()
+                val sinceExit = at - metroExitAt
                 val meaning = when {
+                    // 坐完地铁后的第一次刷卡 = 出站扣费（哪怕定位/基站已经先判了下车），不是上公交
+                    prevMetro && boardedAt > 0 && !metroExitSeen && at - boardedAt > 3 * 60_000L -> TransitSignal.Kind.EXIT
                     // 还在地铁上（换乘中没下车，或最后一段坐着）且已坐了 3 分钟以上：出站
                     prevMetro && alightAt == 0L && boardedAt > 0 && at - boardedAt > 3 * 60_000L -> TransitSignal.Kind.EXIT
+                    // 中间一段地铁：以为还在站台等车，但进站已经 3 分钟以上又刷卡 → 只能是出站
+                    cur.isMetroOnly() && !riding && legIdx < last && stationAt > 0 && at - stationAt > 3 * 60_000L -> TransitSignal.Kind.EXIT
+                    // 刚出站 1 分钟内又来一次：同一次出站的重复，不算上公交
+                    prevMetro && metroExitSeen && sinceExit < 60_000L -> return
                     riding && cur.isMetroOnly() && at - boardedAt > 3 * 60_000L -> TransitSignal.Kind.EXIT
                     // 当前段是地铁、没在车上：进站（之前的进站刷卡 10 分钟内的重复不算）
                     cur.isMetroOnly() && !riding && !(stationByTap && stationAt > 0 && at - stationAt < 10 * 60_000L) -> TransitSignal.Kind.ENTER
@@ -1682,7 +1695,10 @@ class CommuteService : Service() {
                 if (meaning != null) { applyTransit(meaning, text, at, geoChecked); return }
                 // 当成上公交之前看位置：在这段公交站/沿线附近才算；人其实在后面某段地铁站口 → 按进站算；都对不上先记下等确认
                 val fix = if (geoChecked) null else tapFix(at)
-                if (fix != null && !nearBusLeg(fix, legIdx)) {
+                // 刚出地铁：换乘站离公交站往往很近，只认公交站 150 米内（不认沿线）
+                val busOk = { l: Location -> if (prevMetro) trip.legs[legIdx].candidates.any { !it.lat.isNaN() &&
+                    Geo.distanceM(l.latitude, l.longitude, it.lat, it.lng) <= 150 + l.accuracy.coerceAtMost(50f) } else nearBusLeg(l, legIdx) }
+                if (fix != null && !busOk(fix)) {
                     val m = (legIdx + 1..last).firstOrNull { trip.legs[it].isMetroOnly() && nearMetroLeg(fix, it) }
                     if (m != null) { applyTransit(TransitSignal.Kind.ENTER, text, at, geoChecked = true); return }
                     deferTap(TransitSignal.Kind.TAP, at, "离公交站远"); return
