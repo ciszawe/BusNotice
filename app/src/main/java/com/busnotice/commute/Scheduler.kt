@@ -25,6 +25,7 @@ object Scheduler {
     fun rescheduleAll(ctx: Context) {
         TripStore.all(ctx).forEach { schedule(ctx, it) }
         PlaceSampler.ensure(ctx)
+        BusSampler.schedule(ctx)
     }
 
     fun schedule(ctx: Context, plan: Trip) {
@@ -32,6 +33,7 @@ object Scheduler {
         val pi = alarmIntent(ctx, plan.id)
         am.cancel(pi)
         GeoWatch.register(ctx, plan)
+        BusSampler.schedule(ctx)
         if (!plan.enabled || plan.dayMask == 0 || plan.legs.isEmpty()) return
         // 「离开某地才弹」：保存时正好在窗口里，一分钟后就开始留意
         if (plan.leaveMode() && inWindow(plan, LocalDateTime.now()) && !ranToday(ctx, plan.id)) {
