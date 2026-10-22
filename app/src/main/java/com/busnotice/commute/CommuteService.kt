@@ -734,6 +734,7 @@ class CommuteService : Service() {
                             val rt = runCatching {
                                 ChelaileApi.lineRealtime(c, loc?.latitude ?: c.lat, loc?.longitude ?: c.lng)
                             }.getOrNull()
+                            rt?.let { BusSampler.observe(applicationContext, c, it, "trip") }
                             Decision.Option(c, walk,
                                 rt?.buses?.map { Decision.Arrival(it.travelSec, it.stopsAway, it.busId) } ?: emptyList(),
                                 rt?.tip ?: "查询失败")
@@ -928,6 +929,7 @@ class CommuteService : Service() {
             buses.map { b ->
                 async {
                     val rt = runCatching { ChelaileApi.lineRealtime(b, b.lat, b.lng) }.getOrNull()
+                    rt?.let { BusSampler.observe(applicationContext, b, it, "plan") }
                     Decision.extendBuses(b.label(), rt?.buses?.map { it.travelSec } ?: emptyList(), b.headwayMin * 60)
                 }
             }.awaitAll().flatten()
