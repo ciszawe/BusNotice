@@ -54,6 +54,21 @@ object TapPopup {
         return null
     }
 
+    private val AGO = Regex("^\\s*(\\d+)\\s*分钟前")
+
+    /**
+     * 当时没读到、几分钟后才在通知栏看到的刷卡（「已出站 3 分钟前」「本次消费：3.60 元 3 分钟前」）：
+     * 返回过了几分钟（1–5）；没有或更旧返回 null。只看紧跟着的时间戳。
+     */
+    fun staleMinutes(text: String): Int? {
+        for (re in listOf(EXIT, SPEND)) for (m in re.findAll(text)) {
+            val a = AGO.find(text.substring(m.range.last + 1).take(12)) ?: continue
+            val n = a.groupValues[1].toIntOrNull() ?: continue
+            if (n in 1..5) return n
+        }
+        return null
+    }
+
     /** 屏幕上有刷卡字样（不管新旧）：认不出来时记一笔，方便以后查 */
     fun mentions(text: String): Boolean = EXIT.containsMatchIn(text) || ENTER.containsMatchIn(text) || SPEND_PLAIN.containsMatchIn(text) || SPEND.containsMatchIn(text)
 
