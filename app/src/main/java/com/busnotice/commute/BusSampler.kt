@@ -31,6 +31,14 @@ object BusSampler {
     private const val MAX_GAP_MS = 10 * 60_000L   // 两次采样隔太久（被系统推迟），这次不判到站
     private const val PREFS = "bus_sample"
 
+    /** 每个键最近几次「有车 ≤60 秒到 / 已到站」的查询时刻（内存里，行程中判断刷卡用） */
+    private val atStop = HashMap<String, ArrayDeque<Long>>()
+
+    /** 刷卡时刻前后 tolMs 内，这条线有没有车正在进站 / 停在站上 */
+    @Synchronized
+    fun busAtStop(c: Candidate, at: Long, tolMs: Long = 90_000L): Boolean =
+        valid(c) && atStop[key(c)]?.any { kotlin.math.abs(it - at) <= tolMs } == true
+
     /** 一条线 + 一个等车站的匿名键：日志里不出现线路、站点编号 */
     fun key(c: Candidate) = "%08x".format((c.lineId + "|" + c.stationId).hashCode())
 
@@ -108,34 +116,47 @@ object BusSampler {
             val prevT = prev.optLong("t")
             val prevBuses = HashMap<String, Int>()
             prev.optJSONObject("b")?.let { b -> b.keys().forEach { id -> prevBuses[id] = b.optInt(id, -1) } }
+            val prevZero = HashMap<String, Long>()
+            prev.optJSONObject("z")?.let { z -> z.keys().forEach { id -> prevZero[id] = z.optLong(id) } }
 
             val arr = JSONArray()
             val cur = HashMap<String, Int>()
+            val zero = HashMap<String, Long>()
             rt.buses.forEach { b ->
                 arr.put(JSONArray().put(b.busId).put(b.travelSec).put(b.stopsAway).put(b.distanceM))
-                if (b.busId.isNotBlank()) cur[b.busId] = b.travelSec
+                if (b.busId.isNotBlank()) {
+                    cur[b.busId] = b.travelSec
+                    // 第一次报「已到站」的时刻：车会在站上停一会儿，用最后一次会偏晚
+                    prevZero[b.busId]?.let { zero[b.busId] = it } ?: run { if (b.travelSec == 0) zero[b.busId] = now }
+                }
+            }
+            if (rt.buses.any { it.travelSec in 0..60 }) {
+                val q = atStop.getOrPut(k) { ArrayDeque() }
+                q.addLast(now); while (q.size > 30) q.removeFirst()
             }
             write(ctx, JSONObject().put("t", now).put("k", "bus").put("key", k).put("src", src)
                 .put("tip", rt.tip.take(40)).put("b", arr))
 
-            for ((id, est) in arrivals(prevT, prevBuses, now, cur.keys)) {
+            for ((id, est) in arrivals(prevT, prevBuses, now, cur.keys, prevZero)) {
                 write(ctx, JSONObject().put("t", now).put("k", "bus_arr").put("key", k).put("bus", id)
-                    .put("est", est).put("lastEta", prevBuses[id]).put("gapS", (now - prevT) / 1000))
+                    .put("est", est).put("lastEta", prevBuses[id]).put("gapS", (now - prevT) / 1000)
+                    .put("by", if (prevZero[id] != null) "zero" else "eta"))
             }
             val b = JSONObject(); cur.forEach { (id, s) -> b.put(id, s) }
-            prefs.edit().putString(k, JSONObject().put("t", now).put("b", b).toString()).apply()
+            val z = JSONObject(); zero.forEach { (id, t) -> z.put(id, t) }
+            prefs.edit().putString(k, JSONObject().put("t", now).put("b", b).put("z", z).toString()).apply()
         }
     }
 
     /**
      * 上次还在、这次不见了、上次预估在这段间隔内（多给 2 分钟余量）就会到的车 → 已到站，
-     * 到站时间 = 上次查询时间 + 上次预估秒数。间隔太长（被系统推迟）不判，免得把开过去很久的车也算进来。
+     * 到站时间 = 第一次报「已到站」的时刻；没赶上那一刻就用上次查询时间 + 上次预估秒数。间隔太长（被系统推迟）不判，免得把开过去很久的车也算进来。
      */
-    fun arrivals(prevT: Long, prev: Map<String, Int>, now: Long, cur: Set<String>): List<Pair<String, Long>> {
+    fun arrivals(prevT: Long, prev: Map<String, Int>, now: Long, cur: Set<String>, zero: Map<String, Long> = emptyMap()): List<Pair<String, Long>> {
         if (prevT <= 0 || now - prevT > MAX_GAP_MS || now <= prevT) return emptyList()
         val gapS = (now - prevT) / 1000
         return prev.filter { (id, eta) -> id !in cur && eta in 0..(gapS + 120) }
-            .map { (id, eta) -> id to prevT + eta * 1000L }
+            .map { (id, eta) -> id to (zero[id] ?: (prevT + eta * 1000L)) }
             .sortedBy { it.second }
     }
 
