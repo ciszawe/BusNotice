@@ -1590,6 +1590,27 @@ class CommuteService : Service() {
         scope.launch(Dispatchers.Main) { runCatching { applyTransit(kind, text, at) }.onFailure { Log.w(TAG, "出行通知处理失败", it) } }
     }
 
+    /** 当前公交段有车正在进站 / 停在站上（刷卡时刻前后 90 秒） */
+    private fun busAtStopNow(at: Long): Boolean =
+        trip.legs[legIdx].candidates.any { BusSampler.busAtStop(it, at) }
+
+    /**
+     * 通知栏里「N 分钟前」的刷卡（当时没读到）：坐完地铁、还没认出出站、也还没上公交时，
+     * 那一下就是出站；当时公交站正好有车的话按上公交算。其余情况不补，免得重复。
+     */
+    fun onStaleTap(at: Long) {
+        scope.launch(Dispatchers.Main) {
+            runCatching {
+                if (!::trip.isInitialized || tail || riding || metroExitSeen || legIdx == 0) return@runCatching
+                if (!trip.legs[legIdx - 1].isMetroOnly() || trip.legs[legIdx].isMetroOnly()) return@runCatching
+                if (boardedAt <= 0 || at - boardedAt < 3 * 60_000L) return@runCatching
+                val bus = busAtStopNow(at)
+                TraceLog.event("tap_backfill", "as" to if (bus) "BUS_BOARD" else "EXIT", "leg" to legIdx, "at" to at)
+                applyTransit(if (bus) TransitSignal.Kind.TAP else TransitSignal.Kind.EXIT, "补读刷卡", at)
+            }.onFailure { Log.w(TAG, "补读刷卡失败", it) }
+        }
+    }
+
     private fun kick() {
         if (finishing || deadlineAt <= System.currentTimeMillis()) return
         loop?.cancel(); loop = scope.launch { runLoop(deadlineAt) }
@@ -1693,8 +1714,10 @@ class CommuteService : Service() {
                 val meaning = when {
                     // 坐完地铁后的第一次刷卡 = 出站扣费（哪怕定位/基站已经先判了下车），不是上公交
                     // 例外：基站已经判了出站、又过了 2 分钟以上才刷卡 → 出站那下没读到，这次是上公交
+                    // 例外 2：这时候正好有车在公交站进站 / 停着（实时数据），或者判下车已经 8 分钟以上 → 是上公交
                     prevMetro && boardedAt > 0 && !metroExitSeen && at - boardedAt > 3 * 60_000L &&
-                        !(cellExitAt > 0 && at - cellExitAt > 2 * 60_000L) -> TransitSignal.Kind.EXIT
+                        !(cellExitAt > 0 && at - cellExitAt > 2 * 60_000L) &&
+                        !(alightAt > 0 && (busAtStopNow(at) || at - alightAt > 8 * 60_000L)) -> TransitSignal.Kind.EXIT
                     // 还在地铁上（换乘中没下车，或最后一段坐着）且已坐了 3 分钟以上：出站
                     prevMetro && alightAt == 0L && boardedAt > 0 && at - boardedAt > 3 * 60_000L -> TransitSignal.Kind.EXIT
                     // 中间一段地铁：以为还在站台等车，但进站已经 3 分钟以上又刷卡 → 只能是出站
