@@ -82,6 +82,8 @@ class TransitA11y : AccessibilityService() {
             if (TapPopup.mentions(text) && now - lastStaleAt > 60_000L) {
                 lastStaleAt = now
                 TraceLog.event("tap_stale", "ctx" to TapPopup.firstMention(text))
+                // 几分钟前没读到的那一下：交给行程补上（只补「坐完地铁还没认出出站」这种情况）
+                TapPopup.staleMinutes(text)?.let { n -> CommuteService.instance?.onStaleTap(now - n * 60_000L - 30_000L) }
             }
             return
         }
