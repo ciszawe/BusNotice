@@ -51,6 +51,10 @@
             android:exported="false" />
 
         <receiver
+            android:name=".BusSampleReceiver"
+            android:exported="false" />
+
+        <receiver
             android:name=".GeoReceiver"
             android:exported="false" />
 
