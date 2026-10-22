@@ -29,4 +29,10 @@ class TapPopupTest {
 
     // 同一笔金额作为去重签名
     @Test fun sigHasAmount() = assertEquals("TAP:2.00", TapPopup.read("消费成功 本次消费：2.00 元 刚刚")?.sig)
+
+    // 地铁出站那下当时没读到，3 分钟后在通知栏看到
+    @Test fun staleMinutesExitFare() = assertEquals(3, TapPopup.staleMinutes(
+        "快跑 · 某路 某路 3 分钟到站，步行要 3 分钟，有点悬 1 分钟前 消费成功 本次消费：3.60 元 3 分钟前 2 19 分钟前 已激活VPN"))
+    @Test fun staleMinutesTooOld() = assertNull(TapPopup.staleMinutes("交通卡 已出站 12分钟前 [表情]某群 刚刚"))
+    @Test fun staleMinutesFresh() = assertNull(TapPopup.staleMinutes("消费成功 本次消费：0.80 元 刚刚"))
 }
