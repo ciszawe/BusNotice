@@ -44,4 +44,11 @@ class BusSamplerTest {
         assertEquals(8, k.length)
         assertTrue(!k.contains("L1") && !k.contains("S1"))
     }
+
+    @Test fun firstZeroWins() {
+        val t0 = 1_000_000L
+        // 第一次报「已到站」在 t0-95 秒，最后一次 eta=0 在 t0，下一次不见了：到站按第一次算
+        val got = BusSampler.arrivals(t0, mapOf("a" to 0), t0 + 20_000L, emptySet(), mapOf("a" to t0 - 95_000L))
+        assertEquals(listOf("a" to t0 - 95_000L), got)
+    }
 }
