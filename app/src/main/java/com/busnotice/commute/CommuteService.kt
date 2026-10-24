@@ -280,6 +280,7 @@ class CommuteService : Service() {
         deferredTapAt = 0L; deferredTapKind = null
         boardSnap = null; undoUntil.value = 0L; pendingLearnLeg = -1
         metroExitSeen = false; metroExitAt = 0L
+        joinLeg = -1; joinSkip = 0; joinScale = 1.0; joinOrigStop = ""; joinStop = ""; joinCandIdx = -1; joinCandAt = 0L; pendingJoin = null
         placeStart = null; arrived = false; lastPlace = null; tail = false; tailFixes.clear(); startVoted = false
         legIdx = 0; boardedAt = 0L; nearSince = 0L; fastFixes = 0; alertedKey = null; planDone = false; planAlerted = ""
         maxStops.clear(); maxEta.clear()
@@ -321,7 +322,7 @@ class CommuteService : Service() {
 
     /** 这段大概坐多久：实测攒够 3 次用实测中位数，否则用手填的 */
     private fun rideMs(i: Int): Long {
-        Learn.rideMin(this, trip.id, i)?.let { return it * 60_000L }
+        Learn.rideMin(this, trip.id, i)?.let { return (it * 60_000L * (if (i == joinLeg) joinScale else 1.0)).toLong() }
         metroRideSec[i]?.let { return it * 1000L }
         return trip.legs[i].rideMin * 60_000L
     }
@@ -378,7 +379,7 @@ class CommuteService : Service() {
     /** 进站时刻之后（留 1 分钟走到站台），第一班车几点到；拿不到班次返回 null */
     private fun nextTrainAfter(leg: Leg, atMillis: Long): Long? {
         val c = leg.candidates.firstOrNull { it.isMetro() } ?: return null
-        val dirs = metroDirs["${c.stopName}|${c.name}"]?.filter { c.metroDir.isEmpty() || it.dest == c.metroDir } ?: return null
+        val dirs = metroDirs[dirKey(c)]?.filter { c.metroDir.isEmpty() || it.dest == c.metroDir } ?: return null
         val at = java.time.Instant.ofEpochMilli(atMillis + 60_000).atZone(ZoneId.systemDefault())
         val sec = at.toLocalTime().toSecondOfDay()
         val weekday = at.dayOfWeek.value <= 5
@@ -413,6 +414,7 @@ class CommuteService : Service() {
         val progressed = legIdx > 0 && (alightAt > 0 || riding || legIdx > 1)
         if (!moved && !progressed) return
         boardCommitted = true
+        if (joinLeg >= 0) return   // 半路上车：上车时刻不代表平时什么时候出发，不学
         Learn.record(this, trip.id, pendingBoardAt)
         Learn.autoAdjust(this, trip)?.let { Scheduler.schedule(this, it) }
         Log.i(TAG, "记下一次真实乘车：${if (moved) "位移" else "到了下一段"}")
@@ -610,6 +612,9 @@ class CommuteService : Service() {
         // 第一段还没上车（在家/公司里不动）：没有新定位时试系统缓存位置，再不行且手机一直没动就沿用上一次的好定位
         val loc = fresh ?: if (legIdx == 0 && boardedAt == 0L) walkPhaseLoc(now) else null
 
+        pendingJoin?.let { (i, j) -> if (metroRoutes[i] != null) { pendingJoin = null; applyJoin(i, j) } }
+        // 半路上车：人在这段地铁沿线后面某站附近（不是配置的上车站）→ 从那站算起
+        fresh?.let { tryJoin(it, legIdx, now, byTap = false) }
         // 按位置纠正进度：人已经在后面某一段的上车站附近、离当前这段的站很远，说明前面几段已经坐完了（没识别到上车）
         jumpByLocation(now)?.let { return it }
 
@@ -628,7 +633,7 @@ class CommuteService : Service() {
             // 换乘到了：记下上一段实际坐了多久，下次推算换乘更准
             if (prev != null && boardedAt > 0 && !rideLearned) {
                 rideLearned = true
-                Learn.recordRide(this, trip.id, legIdx - 1, ((now - boardedAt) / 60_000L).toInt() - prev.transferWalkMin)
+                learnRide(legIdx - 1, ((now - boardedAt) / 60_000L).toInt() - prev.transferWalkMin)
             }
         }
 
@@ -696,7 +701,7 @@ class CommuteService : Service() {
                 TraceLog.event("alight_detect", "leg" to legIdx - 1, "by" to by, "at" to at)
                 if (by != "time" && !rideLearned) {
                     rideLearned = true
-                    Learn.recordRide(this, trip.id, legIdx - 1, ((at - boardedAt) / 60_000L).toInt())
+                    learnRide(legIdx - 1, ((at - boardedAt) / 60_000L).toInt())
                 }
             }
         }
@@ -918,7 +923,7 @@ class CommuteService : Service() {
         val buses = next.candidates.filter { it.type == Candidate.Type.BUS }
         if (buses.isEmpty()) return null
         val c = leg.candidates.first()
-        val dirs = metroDirs["${c.stopName}|${c.name}"]?.filter { c.metroDir.isEmpty() || it.dest == c.metroDir } ?: return null
+        val dirs = metroDirs[dirKey(c)]?.filter { c.metroDir.isEmpty() || it.dest == c.metroDir } ?: return null
         if (dirs.size != 1) return null // 方向不确定就不推，免得算错
         val d = dirs.first()
         val weekday = LocalDate.now().dayOfWeek.value <= 5
@@ -1140,7 +1145,7 @@ class CommuteService : Service() {
             if (byLoc && metro && boardedAt > 0) {
                 val min = ((now - boardedAt) / 60_000L).toInt()
                 val plan = (rideMs(legIdx) / 60_000L).toInt()
-                if (min >= 3 && min in plan / 2..plan * 2 + 5) Learn.recordRide(this, trip.id, legIdx, min)
+                if (min >= 3 && min in plan / 2..plan * 2 + 5) learnRide(legIdx, min)
             }
             arrived = true
             endTrip("ride_" + (if (byLoc) "loc" else "time")); return 30_000L
@@ -1495,7 +1500,7 @@ class CommuteService : Service() {
             .putBoolean("riding", riding).putLong("alightAt", alightAt).putLong("deadline", deadline).putLong("anchorAt", arriveAnchorAt)
             .putString("ridingCand", ridingCand?.let { "${it.name}|${it.stopName}" } ?: "")
             .putBoolean("manual", manualRun)
-            .putInt("busSeg", busMaxSeg)
+            .putInt("busSeg", busMaxSeg).putInt("joinLeg", joinLeg).putInt("joinSkip", joinSkip)
             .putInt("mAnchorIdx", metroAnchorIdx).putLong("mAnchorAt", metroAnchorAt)
             .putLong("pendBoard", pendingBoardAt).putBoolean("boardDone", boardCommitted)
             .putString("pendLoc", pendingBoardLoc?.let { "${it.latitude},${it.longitude}" } ?: "").apply()
@@ -1526,6 +1531,7 @@ class CommuteService : Service() {
             if (la == null || lo == null) null else Location("saved").apply { latitude = la; longitude = lo }
         }
         rideLearned = true // 中断过的这趟不再学乘车时长，免得样本不准
+        p.getInt("joinLeg", -1).takeIf { it in t.legs.indices }?.let { pendingJoin = it to p.getInt("joinSkip", 0) }
         metroAnchorIdx = p.getInt("mAnchorIdx", -1); metroAnchorAt = p.getLong("mAnchorAt", 0L)
         busMaxSeg = p.getInt("busSeg", -1); busSeg = busMaxSeg   // 站点列表不存，恢复后重新取
         restored = true
@@ -1588,6 +1594,72 @@ class CommuteService : Service() {
     /** 别的 App 的出行通知（NFC 刷卡进/出站、系统到站提醒）：比定位和时间推算都准，直接校准进度 */
     fun onTransitSignal(kind: TransitSignal.Kind, text: String, at: Long) {
         scope.launch(Dispatchers.Main) { runCatching { applyTransit(kind, text, at) }.onFailure { Log.w(TAG, "出行通知处理失败", it) } }
+    }
+
+    // ---------- 半路上车：从地铁段沿线后面某一站进站 ----------
+    private var joinLeg = -1          // 改过上车站的那段；-1 = 按配置的上车站
+    private var joinSkip = 0          // 跳过了前面几站
+    private var joinScale = 1.0       // 剩下的站数 / 全程站数
+    private var joinOrigStop = ""     // 原来配置的上车站（查首末班用）
+    private var joinStop = ""
+    private var joinCandIdx = -1      // 定位第一次贴近的沿线站（要停留确认）
+    private var joinCandAt = 0L
+    private var pendingJoin: Pair<Int, Int>? = null   // 被杀重启后，等途经站查到再恢复
+
+    private fun dirKey(c: Candidate) =
+        "${if (joinOrigStop.isNotEmpty() && c.stopName == joinStop) joinOrigStop else c.stopName}|${c.name}"
+
+    private fun learnRide(i: Int, minutes: Int) {
+        if (i == joinLeg) return   // 只坐了一部分，不学这段乘车时长
+        Learn.recordRide(this, trip.id, i, minutes)
+    }
+
+    /**
+     * 第 i 段地铁还没上车时，人离配置的上车站 600 米以上、却在沿线后面某站 300 米内：
+     * 定位要隔 45 秒两次都贴着同一站才认（路过不算）；刷卡进站时位置对上直接认。
+     */
+    private fun tryJoin(loc: Location, i: Int, now: Long, byTap: Boolean): Boolean {
+        if (joinLeg >= 0 || i !in trip.legs.indices || i < legIdx) return false
+        val leg = trip.legs[i]
+        if (!leg.isMetroOnly() || (i == legIdx && (riding || stationByTap))) return false
+        if (i == legIdx && i > 0 && boardedAt > 0 && alightAt == 0L) return false   // 还在上一段车上
+        val r = metroRoutes[i] ?: return false
+        if (r.stations.size < 3) return false
+        val c = leg.candidates.firstOrNull { it.isMetro() } ?: return false
+        val slack = loc.accuracy.coerceAtMost(150f)
+        if (Geo.distanceM(loc.latitude, loc.longitude, c.lat, c.lng) < 600) return false
+        val j = JoinPick.pick(r.stations.map { it.lat to it.lng }, loc.latitude, loc.longitude, 300.0 + slack) ?: run { joinCandIdx = -1; return false }
+        if (!byTap) {
+            if (joinCandIdx != j) { joinCandIdx = j; joinCandAt = now; return false }
+            if (now - joinCandAt < 45_000L) return false
+        }
+        applyJoin(i, j)
+        return true
+    }
+
+    private fun applyJoin(i: Int, j: Int) {
+        val r = metroRoutes[i] ?: return
+        if (j < 1 || j >= r.stations.size - 1) return
+        val st = r.stations[j]
+        val leg = trip.legs[i]
+        joinScale = (r.hops - j).toDouble() / r.hops
+        joinOrigStop = leg.candidates.firstOrNull { it.isMetro() }?.stopName ?: ""
+        joinStop = st.name
+        joinLeg = i; joinSkip = j
+        val legs = trip.legs.toMutableList()
+        legs[i] = leg.copy(
+            candidates = leg.candidates.map { if (it.isMetro()) it.copy(stopName = st.name, lat = st.lat, lng = st.lng) else it },
+            rideMin = (leg.rideMin * joinScale).toInt().coerceAtLeast(1),
+        )
+        trip = trip.copy(legs = legs)
+        val sub = ChelaileApi.MetroRoute(r.stations.drop(j), (r.durSec * joinScale).toInt())
+        metroRoutes[i] = sub; metroRideSec[i] = sub.durSec
+        if (i == 0) firstWalkDone = true   // 不是从平常的地方出发，首段步行不学
+        nearSince = 0L
+        TraceLog.event("join", "leg" to i, "skip" to j, "left" to sub.hops)
+        Diag.mark(this, "从沿线 ${st.name} 上车，按剩下 ${sub.hops} 站算")
+        saveRun(deadlineAt)
+        kick()
     }
 
     /** 当前公交段有车正在进站 / 停在站上（刷卡时刻前后 90 秒） */
@@ -1671,7 +1743,7 @@ class CommuteService : Service() {
                 // 地理围栏：刷卡时有可靠定位、且离要切到的那段地铁站很远 → 先不认，等定位确认
                 val target = if (trip.legs[legIdx].isMetroOnly()) legIdx else (legIdx + 1..last).firstOrNull { trip.legs[it].isMetroOnly() } ?: return
                 val fix = if (geoChecked) null else tapFix(at)
-                if (fix != null && !nearMetroLeg(fix, target)) { deferTap(TransitSignal.Kind.ENTER, at, "离地铁站远"); return }
+                if (fix != null && !nearMetroLeg(fix, target) && !tryJoin(fix, target, at, byTap = true)) { deferTap(TransitSignal.Kind.ENTER, at, "离地铁站远"); return }
                 if (!trip.legs[legIdx].isMetroOnly()) {
                     val k = target
                     val firstAt = if (legIdx == 0 && boardedAt == 0L) at - rideMs(0) else at
@@ -1690,7 +1762,7 @@ class CommuteService : Service() {
                 when {
                     // 最后一段地铁：出站 = 到了
                     cur.isMetroOnly() && legIdx == last && (riding || stationAt > 0) -> {
-                        if (riding && !restored && boardedAt > 0) Learn.recordRide(this, trip.id, legIdx, ((at - boardedAt) / 60_000L).toInt())
+                        if (riding && !restored && boardedAt > 0) learnRide(legIdx, ((at - boardedAt) / 60_000L).toInt())
                         Diag.mark(this, "刷卡出站，行程结束")
                         arrived = true
                         endTrip("tap_exit")
@@ -1887,7 +1959,7 @@ class CommuteService : Service() {
         val l = tacLearner ?: return
         val tac = l.endRide()
         MetroCells.save(this, l)
-        fpRec.finish()?.let { seq ->
+        fpRec.finish()?.takeIf { joinLeg < 0 }?.let { seq ->
             MetroCells.appendRide(this, metroRideKey, org.json.JSONObject()
                 .put("start", metroRideStart).put("end", System.currentTimeMillis())
                 .put("board", boardedAt).put("tacOk", tac != null).put("seq", seq))
@@ -1902,7 +1974,7 @@ class CommuteService : Service() {
         TraceLog.event("alight_detect", "leg" to legIdx - 1, "by" to by, "at" to at)
         if (!rideLearned && !restored && boardedAt > 0) {
             rideLearned = true
-            Learn.recordRide(this, trip.id, legIdx - 1, ((at - boardedAt) / 60_000L).toInt())
+            learnRide(legIdx - 1, ((at - boardedAt) / 60_000L).toInt())
         }
         Diag.mark(this, if (by == "tap") "刷卡出站，开始换乘" else "已到换乘点，开始换乘")
         saveRun(deadlineAt)
