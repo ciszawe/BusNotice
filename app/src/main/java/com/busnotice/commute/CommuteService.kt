@@ -280,7 +280,7 @@ class CommuteService : Service() {
         deferredTapAt = 0L; deferredTapKind = null
         boardSnap = null; undoUntil.value = 0L; pendingLearnLeg = -1
         metroExitSeen = false; metroExitAt = 0L
-        joinLeg = -1; joinSkip = 0; joinScale = 1.0; joinOrigStop = ""; joinStop = ""; joinCandIdx = -1; joinCandAt = 0L; pendingJoin = null
+        joinLeg = -1; joinSkip = 0; joinScale = 1.0; joinOrigStop = ""; joinStop = ""; joinCandIdx = -1; joinCandAt = 0L; joinCandFixT = 0L; pendingJoin = null
         placeStart = null; arrived = false; lastPlace = null; tail = false; tailFixes.clear(); startVoted = false
         legIdx = 0; boardedAt = 0L; nearSince = 0L; fastFixes = 0; alertedKey = null; planDone = false; planAlerted = ""
         maxStops.clear(); maxEta.clear()
@@ -614,7 +614,11 @@ class CommuteService : Service() {
 
         pendingJoin?.let { (i, j) -> if (metroRoutes[i] != null) { pendingJoin = null; applyJoin(i, j) } }
         // 半路上车：人在这段地铁沿线后面某站附近（不是配置的上车站）→ 从那站算起
-        fresh?.let { tryJoin(it, legIdx, now, byTap = false) }
+        if (fresh != null) tryJoin(fresh, legIdx, now, byTap = false)
+        else if (stationAt > 0 && !stationByTap) {
+            // 基站已认出在地下、还没上车：没有准定位时退一步用 500 米内的网络定位
+            best?.takeIf { it.accuracy <= 500 && now - it.time < 90_000 }?.let { tryJoin(it, legIdx, now, byTap = false, coarse = true) }
+        }
         // 按位置纠正进度：人已经在后面某一段的上车站附近、离当前这段的站很远，说明前面几段已经坐完了（没识别到上车）
         jumpByLocation(now)?.let { return it }
 
@@ -896,6 +900,8 @@ class CommuteService : Service() {
         val b = best
         if (st != null && b != null && b.time > stationAt && b.accuracy <= 1_000 &&
             Geo.distanceM(b.latitude, b.longitude, st.lat, st.lng) - b.accuracy > 500) {
+            // 可能是从沿线后面某站进的：先等最多 90 秒确认半路上车，别急着按「离开上车站」判上车
+            if (joinLeg < 0 && joinCandIdx >= 0 && now - joinCandAt < 90_000L) return null
             val at = minOf(fallbackAt, b.time)
             TraceLog.event("metro_board", "by" to "moved", "at" to at, "dep" to dep, "walkEnd" to walkEnd)
             return at
@@ -1604,6 +1610,7 @@ class CommuteService : Service() {
     private var joinStop = ""
     private var joinCandIdx = -1      // 定位第一次贴近的沿线站（要停留确认）
     private var joinCandAt = 0L
+    private var joinCandFixT = 0L
     private var pendingJoin: Pair<Int, Int>? = null   // 被杀重启后，等途经站查到再恢复
 
     private fun dirKey(c: Candidate) =
@@ -1618,7 +1625,7 @@ class CommuteService : Service() {
      * 第 i 段地铁还没上车时，人离配置的上车站 600 米以上、却在沿线后面某站 300 米内：
      * 定位要隔 45 秒两次都贴着同一站才认（路过不算）；刷卡进站时位置对上直接认。
      */
-    private fun tryJoin(loc: Location, i: Int, now: Long, byTap: Boolean): Boolean {
+    private fun tryJoin(loc: Location, i: Int, now: Long, byTap: Boolean, coarse: Boolean = false): Boolean {
         if (joinLeg >= 0 || i !in trip.legs.indices || i < legIdx) return false
         val leg = trip.legs[i]
         if (!leg.isMetroOnly() || (i == legIdx && (riding || stationByTap))) return false
@@ -1626,12 +1633,15 @@ class CommuteService : Service() {
         val r = metroRoutes[i] ?: return false
         if (r.stations.size < 3) return false
         val c = leg.candidates.firstOrNull { it.isMetro() } ?: return false
-        val slack = loc.accuracy.coerceAtMost(150f)
-        if (Geo.distanceM(loc.latitude, loc.longitude, c.lat, c.lng) < 600) return false
+        val slack = loc.accuracy.coerceAtMost(if (coarse) 500f else 150f)
+        val fromOrigin = Geo.distanceM(loc.latitude, loc.longitude, c.lat, c.lng)
+        if (fromOrigin < 600 || (coarse && fromOrigin - loc.accuracy < 500)) return false
         val j = JoinPick.pick(r.stations.map { it.lat to it.lng }, loc.latitude, loc.longitude, 300.0 + slack) ?: run { joinCandIdx = -1; return false }
         if (!byTap) {
-            if (joinCandIdx != j) { joinCandIdx = j; joinCandAt = now; return false }
-            if (now - joinCandAt < 45_000L) return false
+            // 粗定位：两次不同时刻的定位（隔 20 秒以上）指向同一站；准定位：贴着同一站 45 秒
+            if (joinCandIdx != j) { joinCandIdx = j; joinCandAt = now; joinCandFixT = loc.time; return false }
+            if (coarse) { if (loc.time - joinCandFixT < 20_000L) return false }
+            else if (now - joinCandAt < 45_000L) return false
         }
         applyJoin(i, j)
         return true
