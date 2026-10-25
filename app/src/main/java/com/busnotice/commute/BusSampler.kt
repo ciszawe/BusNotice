@@ -101,6 +101,7 @@ object BusSampler {
             val rt = runCatching { ChelaileApi.lineRealtime(c, c.lat, c.lng) }.getOrNull()
             if (rt == null) { write(ctx, JSONObject().put("t", now).put("k", "bus_fail").put("key", k)); continue }
             observe(ctx, c, rt, "bg")
+            DepartAdvisor.onRealtime(ctx, c, rt, now)
         }
     }
 
@@ -160,7 +161,7 @@ object BusSampler {
             .sortedBy { it.second }
     }
 
-    private fun write(ctx: Context, o: JSONObject) {
+    fun write(ctx: Context, o: JSONObject) {
         runCatching {
             val dir = File(ctx.filesDir, "traces").apply { mkdirs() }
             File(dir, "${LocalDate.now()}_bus.jsonl").appendText(o.toString() + "\n")
