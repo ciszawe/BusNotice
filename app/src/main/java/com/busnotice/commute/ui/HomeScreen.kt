@@ -114,6 +114,7 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
     var version by remember { mutableStateOf(0) }
     val trips = remember(resumeTick, version) { TripStore.all(ctx) }
     val live by LiveState.snapshot.collectAsState()
+    val demo by com.busnotice.commute.DemoPlayer.snapshot.collectAsState()
     val adviceFlow by com.busnotice.commute.DepartAdvisor.current.collectAsState()
     var nowTick by remember { mutableStateOf(System.currentTimeMillis()) }
     // 出发建议卡片：每 20 秒刷新倒计时；过期 / 行程开始了就自动消失
@@ -220,6 +221,14 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
                                     text = { Text("导出行程记录（${days} 天）") },
                                     onClick = { menuOpen = false; com.busnotice.commute.TraceLog.share(ctx) },
                                 )
+                                if (com.busnotice.commute.CommuteService.instance == null) {
+                                    listOf(30, 60).forEach { sp ->
+                                        DropdownMenuItem(
+                                            text = { Text("演示：真实记录回放（${sp}×）") },
+                                            onClick = { menuOpen = false; com.busnotice.commute.DemoPlayer.start(ctx, sp) },
+                                        )
+                                    }
+                                }
                                 DropdownMenuItem(
                                     text = { Text("重置常去地点") },
                                     onClick = {
@@ -242,8 +251,13 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
                     placeText?.let { PlaceChip(it, dark) }
                   }
                 }
-                val board = live
-                if (board == null && pendingTrip == null && advice != null) {
+                val demoBoard = demo
+                if (demoBoard != null) {
+                    item(key = "demo-badge") { PlaceChip(com.busnotice.commute.DemoPlayer.BADGE, dark) }
+                    item(key = "demo") { LiveBoard(demoBoard, com.busnotice.commute.DemoPlayer.trip, dark) }
+                }
+                val board = if (demoBoard != null) null else live
+                if (demoBoard == null && board == null && pendingTrip == null && advice != null) {
                     item(key = "depart") { DepartBoard(advice!!, nowTick, dark) }
                 }
                 if (board != null && pendingTrip == null) {
