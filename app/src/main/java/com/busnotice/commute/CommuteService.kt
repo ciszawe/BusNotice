@@ -530,6 +530,7 @@ class CommuteService : Service() {
             if (alight == null && trip.legs[legIdx].candidates.none { it.alightName.isNotEmpty() || !it.alightLat.isNaN() }) { finish(); return }
             riding = true; boardedAt = now; arriveAlertedAt = 0L; resetBusRide(); metroAnchorIdx = -1; metroAnchorAt = 0L
             val l = trip.legs[legIdx]
+            busBoardGuessed = !manual && !boardingByTap && !l.isMetroOnly()
             ridingCand = l.candidates.firstOrNull { it.isMetro() }.takeIf { l.isMetroOnly() } ?: lastCand ?: l.candidates.firstOrNull()
             speeds.clear(); routeHits.clear()
             loop?.cancel()
@@ -1369,6 +1370,13 @@ class CommuteService : Service() {
     private var lastFixForSpeed: Location? = null
 
     /** 网络/融合定位常常不带速度：用前后两次定位自己算 */
+    private var lastSpeedFixT = 0L
+    /** 最后一段公交是靠速度/位置自动判的上车（不是刷卡、不是手点）：之后几分钟内来了公交刷卡，以刷卡为准 */
+    private var busBoardGuessed = false
+    private var boardingByTap = false
+    /** 基站确认是在这段的配置上车站进的站（不是半路上车） */
+    private var originCellLeg = -1
+
     private fun speedOf(loc: Location): Float? {
         if (loc.hasSpeed()) return loc.speed
         val p = lastFixForSpeed
@@ -1476,8 +1484,11 @@ class CommuteService : Service() {
         }
         if (!::trip.isInitialized || riding) return
 
+        // 判上车用的速度只信 GPS（精度 ≤30 米、每个定位时刻只算一次）：网络定位常报假速度，出地铁口时尤其多
+        val trusted = loc.provider == LocationManager.GPS_PROVIDER && loc.accuracy <= 30f && loc.time != lastSpeedFixT
+        if (trusted) lastSpeedFixT = loc.time
         // 中途才打开：还没到过上车点、但速度像坐车且贴着这条线走 → 说明已经在车上了
-        if (spd != null) {
+        if (spd != null && trusted) {
             speeds.addLast(spd); if (speeds.size > 5) speeds.removeFirst()
             routeHits.addLast(onRoute(loc, trip.legs[legIdx])); if (routeHits.size > 5) routeHits.removeFirst()
             val onLine = routeHits.size >= 3 && routeHits.toList().takeLast(3).all { it }
@@ -1489,10 +1500,10 @@ class CommuteService : Service() {
         }
 
         // 到过上车点、现在速度很快 → 大概率上车了
-        if (nearSince > 0 && spd != null && spd > 6f) {
+        if (nearSince > 0 && spd != null && trusted && spd > 6f) {
             fastFixes++
             if (fastFixes >= 3) onBoarded(manual = false)
-        } else if (spd != null) {
+        } else if (spd != null && trusted) {
             fastFixes = 0
         }
     }
@@ -1627,6 +1638,8 @@ class CommuteService : Service() {
      */
     private fun tryJoin(loc: Location, i: Int, now: Long, byTap: Boolean, coarse: Boolean = false): Boolean {
         if (joinLeg >= 0 || i !in trip.legs.indices || i < legIdx) return false
+        // 基站已确认在配置的上车站进站：之后人在沿线别的站附近只是车开过去了，不是半路上车
+        if (originCellLeg == i && !byTap) return false
         val leg = trip.legs[i]
         if (!leg.isMetroOnly() || (i == legIdx && (riding || stationByTap))) return false
         if (i == legIdx && i > 0 && boardedAt > 0 && alightAt == 0L) return false   // 还在上一段车上
@@ -1811,6 +1824,12 @@ class CommuteService : Service() {
                     cur.isMetroOnly() && !riding && !(stationByTap && stationAt > 0 && at - stationAt < 10 * 60_000L) -> TransitSignal.Kind.ENTER
                     // 当前段是公交、还没上：刷卡 = 上车（交通卡只在乘车时刷，不再要求先走到站牌边）
                     !cur.isMetroOnly() && !riding -> null
+                    // 自动判的上公交 5 分钟内来了刷卡：之前判早了，上车时刻改成刷卡这一刻
+                    !cur.isMetroOnly() && riding && busBoardGuessed && at >= boardedAt && at - boardedAt < 5 * 60_000L -> {
+                        TraceLog.event("tap_reanchor", "leg" to legIdx, "was" to boardedAt, "at" to at)
+                        Diag.mark(this, "刷卡确认上公交，上车时刻按刷卡校正")
+                        busBoardGuessed = false; boardedAt = at; resetBusRide(); kick(); return
+                    }
                     else -> return
                 }
                 TraceLog.event("tap", "as" to (meaning?.name ?: "BUS_BOARD"), "leg" to legIdx)
@@ -1826,7 +1845,8 @@ class CommuteService : Service() {
                     deferTap(TransitSignal.Kind.TAP, at, "离公交站远"); return
                 }
                 Diag.mark(this, "刷卡上公交")
-                onBoarded(manual = false, at = at)
+                boardingByTap = true
+                try { onBoarded(manual = false, at = at) } finally { boardingByTap = false }
                 kick()
             }
             TransitSignal.Kind.ARRIVE -> {
@@ -1937,7 +1957,10 @@ class CommuteService : Service() {
                 val fix = best?.takeIf { it.accuracy < 200 && s.t - it.time < 60_000 }
                 if (fix != null && !nearMetroLeg(fix, legIdx)) { TraceLog.event("cell_enter_skip", "leg" to legIdx); return }
                 stationAt = edge.second; stationByTap = false
-                TraceLog.event("cell_enter", "leg" to legIdx)
+                val origin = cur.candidates.firstOrNull { it.isMetro() }
+                if (fix != null && origin != null && Geo.distanceM(fix.latitude, fix.longitude, origin.lat, origin.lng) < 600 + fix.accuracy.coerceAtMost(200f))
+                    originCellLeg = legIdx
+                TraceLog.event("cell_enter", "leg" to legIdx, "origin" to (originCellLeg == legIdx))
                 Diag.mark(this, "连上地铁里的基站，判断已进站")
                 saveRun(deadlineAt); kick()
             }
