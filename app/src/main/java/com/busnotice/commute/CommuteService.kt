@@ -2042,6 +2042,11 @@ class ActionReceiver : BroadcastReceiver() {
 
     override fun onReceive(ctx: Context, intent: Intent) {
         val svc = CommuteService.instance
+        // 演示回放中：「关闭」结束回放，其他按钮不做事（不能去碰真实行程）
+        if (svc == null && DemoPlayer.running) {
+            if (intent.action == ACTION_STOP) DemoPlayer.stop(ctx)
+            return
+        }
         when {
             intent.action == ACTION_BOARDED && svc != null -> svc.onBoarded()
             intent.action == ACTION_DISMISSED -> {
