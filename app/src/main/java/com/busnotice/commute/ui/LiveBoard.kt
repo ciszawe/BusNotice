@@ -191,7 +191,8 @@ fun LiveBoard(s: LiveSnapshot, trip: Trip?, dark: Boolean) {
                 Pill("已上车", Fuse.Yellow, Color(0xFF111111), null, Modifier.weight(1f)) { CommuteService.instance?.onBoarded() }
             }
             Pill("结束", Color.White.copy(alpha = 0.12f), Color.White, Color.White.copy(alpha = 0.2f), Modifier.weight(1f)) {
-                CommuteService.stop(ctx)
+                if (s.tripId == com.busnotice.commute.DemoPlayer.TRIP_ID) com.busnotice.commute.DemoPlayer.stop(ctx)
+                else CommuteService.stop(ctx)
             }
         }
     }
