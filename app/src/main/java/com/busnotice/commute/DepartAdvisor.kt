@@ -35,16 +35,22 @@ object DepartAdvisor {
         val total get() = firstWalkMin + beforeMin + transferWalkMin + BUFFER_MIN
     }
 
-    data class Plan(val busAt: Long, val leaveAt: Long, val projected: Boolean)
+    /** basis：rt = 实时看到的车；sched = 往日同一时段的到站时刻；gap = 按车间隔推算 */
+    data class Plan(val busAt: Long, val leaveAt: Long, val projected: Boolean, val basis: String = if (projected) "gap" else "rt")
 
     /**
      * 纯逻辑：给出当前看得到的车到站时刻（毫秒，升序前已乱序也行），算出最近一个能接上的班次。
      * earliest = 最早能出发的时刻；horizonMs 之外不推算。
      */
-    fun plan(arrivals: List<Long>, leadMin: Int, earliest: Long, horizonMs: Long = 90 * 60_000L): Plan? {
+    fun plan(arrivals: List<Long>, leadMin: Int, earliest: Long, horizonMs: Long = 90 * 60_000L,
+             scheduled: List<Long> = emptyList()): Plan? {
         val lead = leadMin * 60_000L
         val seen = arrivals.filter { it > 0 }.sorted().distinct()
         seen.firstOrNull { it - lead >= earliest }?.let { return Plan(it, it - lead, projected = false) }
+        // 实时看不到那么远：用往日时刻表里、比实时最后一辆晚 5 分钟以上的班次（同一班不重复算）
+        val after = (seen.lastOrNull() ?: 0L) + 5 * 60_000L
+        scheduled.filter { it >= after }.sorted().firstOrNull { it - lead >= earliest && it - earliest - lead <= horizonMs }
+            ?.let { return Plan(it, it - lead, projected = true, basis = "sched") }
         if (seen.isEmpty()) return null
         val gaps = seen.zipWithNext { a, b -> b - a }.filter { it >= 3 * 60_000L }
         val headway = gaps.sorted().let { if (it.isEmpty()) DEFAULT_HEADWAY_MIN * 60_000L else it[it.size / 2] }
@@ -55,6 +61,53 @@ object DepartAdvisor {
         }
         return Plan(t, t - lead, projected = true)
     }
+
+    /**
+     * 往日到站时刻表：最近 21 天里和今天同类（工作日 / 周末）的日子，这个站这条线记下的到站时刻，
+     * 6 分钟内的归成一班，至少 2 天都出现过才算，取中位数。返回今天对应的毫秒时刻。
+     */
+    fun timetable(minutesByDay: List<List<Double>>, minDays: Int = 2): List<Double> {
+        val pts = minutesByDay.flatMapIndexed { d, l -> l.map { it to d } }.sortedBy { it.first }
+        val out = ArrayList<Double>()
+        var cur = ArrayList<Pair<Double, Int>>()
+        fun flush() {
+            if (cur.map { it.second }.distinct().size >= minDays) {
+                val s = cur.map { it.first }.sorted(); out += s[s.size / 2]
+            }
+            cur = ArrayList()
+        }
+        for (p in pts) {
+            if (cur.isNotEmpty() && p.first - cur.last().first > 6.0) flush()
+            cur += p
+        }
+        if (cur.isNotEmpty()) flush()
+        return out
+    }
+
+    private val ttCache = HashMap<String, Pair<Long, List<Double>>>()
+
+    fun scheduledToday(ctx: Context, c: Candidate, today: LocalDate, zone: ZoneId): List<Long> = runCatching {
+        val key = BusSampler.key(c)
+        val ck = "$key|$today"
+        val mins = ttCache[ck]?.takeIf { System.currentTimeMillis() - it.first < 3600_000L }?.second ?: run {
+            val weekend = today.dayOfWeek.value >= 6
+            val dir = java.io.File(ctx.filesDir, "traces")
+            val days = (1..21).map { today.minusDays(it.toLong()) }.filter { (it.dayOfWeek.value >= 6) == weekend }
+            val per = days.mapNotNull { d ->
+                val f = java.io.File(dir, "${d}_bus.jsonl")
+                if (!f.exists()) return@mapNotNull null
+                f.readLines().mapNotNull { l ->
+                    val o = runCatching { JSONObject(l) }.getOrNull() ?: return@mapNotNull null
+                    if (o.optString("k") != "bus_arr" || o.optString("key") != key) return@mapNotNull null
+                    val t = Instant.ofEpochMilli(o.optLong("est")).atZone(zone)
+                    if (t.toLocalDate() != d) null else t.hour * 60 + t.minute + t.second / 60.0
+                }.takeIf { it.isNotEmpty() }
+            }
+            timetable(per).also { ttCache[ck] = System.currentTimeMillis() to it }
+        }
+        val base = today.atStartOfDay(zone).toInstant().toEpochMilli()
+        mins.map { base + (it * 60_000L).toLong() }
+    }.getOrDefault(emptyList())
 
     /** 换乘公交之前的段要花多久（不含公交这段） */
     fun lead(ctx: Context, trip: Trip, busLeg: Int): Lead {
@@ -78,14 +131,16 @@ object DepartAdvisor {
     data class Advice(
         val day: Long, val tripId: String, val tripName: String, val line: String, val stop: String,
         val busAt: Long, val leaveAt: Long, val projected: Boolean, val missedLeaveAt: Long, val at: Long,
+        val basis: String = if (projected) "gap" else "rt",
     ) {
         fun toJson(): JSONObject = JSONObject().put("day", day).put("trip", tripId).put("name", tripName)
             .put("line", line).put("stop", stop).put("bus", busAt).put("leave", leaveAt)
-            .put("proj", projected).put("missed", missedLeaveAt).put("at", at)
+            .put("proj", projected).put("missed", missedLeaveAt).put("at", at).put("basis", basis)
         companion object {
             fun from(o: JSONObject) = Advice(o.optLong("day"), o.optString("trip"), o.optString("name"),
                 o.optString("line"), o.optString("stop"), o.optLong("bus"), o.optLong("leave"),
-                o.optBoolean("proj"), o.optLong("missed"), o.optLong("at"))
+                o.optBoolean("proj"), o.optLong("missed"), o.optLong("at"),
+                o.optString("basis").ifEmpty { if (o.optBoolean("proj")) "gap" else "rt" })
         }
     }
 
@@ -135,9 +190,10 @@ object DepartAdvisor {
                 val ld = lead(ctx, trip, bl)
                 val startMs = today.atStartOfDay(zone).toInstant().toEpochMilli() + trip.startMinute * 60_000L
                 val arr = rt.buses.filter { it.travelSec >= 0 }.map { now + it.travelSec * 1000L }
-                val p = plan(arr, ld.total, maxOf(now, startMs)) ?: continue
+                val sched = scheduledToday(ctx, c, today, zone)
+                val p = plan(arr, ld.total, maxOf(now, startMs), scheduled = sched) ?: continue
                 BusSampler.write(ctx, JSONObject().put("t", now).put("k", "depart_plan").put("trip", trip.name)
-                    .put("bus", p.busAt).put("leave", p.leaveAt).put("proj", p.projected).put("lead", ld.total)
+                    .put("bus", p.busAt).put("leave", p.leaveAt).put("proj", p.projected).put("basis", p.basis).put("sched", sched.size).put("lead", ld.total)
                     .put("first", ld.firstWalkMin).put("before", ld.beforeMin).put("xfer", ld.transferWalkMin).put("n", arr.size))
 
                 val prev = runCatching { Advice.from(JSONObject(prefs.getString("cur", "") ?: "")) }.getOrNull()
@@ -150,7 +206,7 @@ object DepartAdvisor {
                     prev.leaveAt < now - 60_000L -> prev.leaveAt
                     else -> 0L
                 }
-                val a = Advice(today.toEpochDay(), trip.id, trip.name, c.name, c.stopName, p.busAt, p.leaveAt, p.projected, missed, now)
+                val a = Advice(today.toEpochDay(), trip.id, trip.name, c.name, c.stopName, p.busAt, p.leaveAt, p.projected, missed, now, p.basis)
                 prefs.edit().putString("cur", a.toJson().toString()).apply()
                 current.value = a
 
@@ -181,7 +237,7 @@ object DepartAdvisor {
 
     fun detail(a: Advice): String =
         (if (a.missedLeaveAt > 0) "错过 ${hm(a.missedLeaveAt)} 那班 · " else "") +
-            "${hm(a.leaveAt)} 出发，接 ${hm(a.busAt)} 到${a.stop}的 ${a.line}" + if (a.projected) "（按间隔推算）" else ""
+            "${hm(a.leaveAt)} 出发，接 ${hm(a.busAt)} 到${a.stop}的 ${a.line}" + when (a.basis) { "sched" -> "（按往日到站时刻）"; "gap" -> "（按间隔推算）"; else -> "" }
 
     /** 流体云：和行程胶囊同一个通知位，行程一开始就被胶囊本身接替 */
     private fun showCapsule(ctx: Context, a: Advice, now: Long, loud: Boolean) {
