@@ -2049,6 +2049,7 @@ class ActionReceiver : BroadcastReceiver() {
                 Diag.mark(ctx, "胶囊被移除（划掉或系统移除），行程继续在后台")
                 if (svc != null) LiveNotifier.hidden = true
             }
+            intent.action == DepartAdvisor.ACTION_MUTE -> DepartAdvisor.mute(ctx)
             intent.action == ACTION_STOP -> CommuteService.stop(ctx)
             else -> CommuteService.stop(ctx)
         }
