@@ -81,6 +81,11 @@ object Scheduler {
         return plan.dayMask and bit != 0 && m >= plan.startMinute && m < plan.endMinute
     }
 
+    /** Wi-Fi 断开回调：马上看一次 */
+    fun watchNow(ctx: Context, planId: String) {
+        runCatching { watchIntent(ctx, planId).send() }
+    }
+
     /** 窗口内的下一次「看看离开没有」 */
     fun scheduleWatch(ctx: Context, plan: Trip, atMillis: Long) {
         val am = ctx.getSystemService(AlarmManager::class.java)
@@ -162,24 +167,45 @@ class AlarmReceiver : BroadcastReceiver() {
         }
         // 出发地 Wi-Fi：还连着 → 人还在，不用定位；刚才还连着、现在断了 → 已经离开
         val ssid = OfficeWifi.current(ctx)
+        fun log(what: String, vararg kv: Pair<String, Any?>) = BusSampler.write(ctx, org.json.JSONObject()
+            .put("t", System.currentTimeMillis()).put("k", "watch").put("trip", plan.name).put("what", what)
+            .apply { kv.forEach { (k, v) -> put(k, v ?: org.json.JSONObject.NULL) } })
         if (ssid != null && OfficeWifi.known(ctx, plan.id, ssid)) {
-            OfficeWifi.markOn(ctx, plan.id)
+            OfficeWifi.markOn(ctx, plan.id); OfficeWifi.clearLost(ctx, plan.id)
+            OfficeWifi.listen(ctx, plan.id)
+            log("on_wifi")
             Scheduler.scheduleWatch(ctx, plan, System.currentTimeMillis() + Scheduler.WATCH_EVERY_MS)
             return
         }
+        // 出发地 Wi-Fi 断了：可能只是切了流量。先记下断开时的步数，之后走了 30 步以上才算离开；没走动就继续按定位判断
         if (ssid == null && OfficeWifi.wasOnRecently(ctx, plan.id)) {
-            OfficeWifi.clearOn(ctx, plan.id)
-            TraceLog.event("leave_by_wifi")
-            Diag.mark(ctx, "出发地 Wi-Fi 断开，判断已离开，自动启动")
-            withContext(Dispatchers.Main) { start(ctx, plan) }
-            return
+            val steps = StepCount.read(ctx)
+            val lost = OfficeWifi.lost(ctx, plan.id)
+            if (lost == null) {
+                OfficeWifi.markLost(ctx, plan.id, System.currentTimeMillis(), steps ?: -1f)
+                log("wifi_lost", "steps" to steps)
+                Scheduler.scheduleWatch(ctx, plan, System.currentTimeMillis() + 45_000L)
+                return
+            }
+            val walked = if (steps != null && lost.second >= 0f) steps - lost.second else null
+            if (walked != null && walked >= 30f) {
+                OfficeWifi.clearOn(ctx, plan.id); OfficeWifi.clearLost(ctx, plan.id); OfficeWifi.unlisten(ctx)
+                TraceLog.event("leave_by_wifi")
+                log("leave_by_wifi", "walked" to walked, "sinceLostS" to (System.currentTimeMillis() - lost.first) / 1000)
+                Diag.mark(ctx, "出发地 Wi-Fi 断开并且走动了 ${walked.toInt()} 步，判断已离开，自动启动")
+                withContext(Dispatchers.Main) { start(ctx, plan) }
+                return
+            }
+            log("wifi_lost_wait", "walked" to walked)
         }
         // 外层超时要比 Loc.current 里的 8 秒长，否则现取的位置永远拿不到；超过 2 分钟的旧位置不算数
         val loc = withTimeoutOrNull(12_000) { Loc.current(ctx) }
             ?.takeIf { System.currentTimeMillis() - it.time < 120_000 }
         val d = loc?.let { Geo.distanceM(it.latitude, it.longitude, plan.leaveLat, plan.leaveLng) }
         val slack = (loc?.accuracy ?: 0f).coerceAtMost(50f)
+        log("loc", "d" to d?.toInt(), "acc" to loc?.accuracy?.toInt(), "p" to loc?.provider)
         if (d != null && d > plan.leaveRadiusM + slack) {
+            OfficeWifi.clearLost(ctx, plan.id); OfficeWifi.unlisten(ctx)
             // 带上判断依据（距离 / 精度 / 半径 / 定位来源），误启动时能从行程记录里看出是哪个定位点惹的
             Diag.mark(ctx, "已离开出发地，自动启动（距 %d 米 · 精度 %d 米 · 半径 %d 米 · %s · %d 秒前）".format(
                 d.toInt(), loc?.accuracy?.toInt() ?: -1, plan.leaveRadiusM, loc?.provider ?: "?", (System.currentTimeMillis() - (loc?.time ?: 0L)) / 1000))
@@ -188,7 +214,8 @@ class AlarmReceiver : BroadcastReceiver() {
             // 人在出发地范围内：顺便记下连着的 Wi-Fi（满 2 天就当出发地 Wi-Fi 用）
             if (d != null && ssid != null) OfficeWifi.observe(ctx, plan.id, ssid)
             if (loc == null) Diag.mark(ctx, "留意离开中：这次没拿到位置")
-            Scheduler.scheduleWatch(ctx, plan, System.currentTimeMillis() + Scheduler.WATCH_EVERY_MS)
+            val soon = OfficeWifi.lost(ctx, plan.id) != null && OfficeWifi.wasOnRecently(ctx, plan.id)
+            Scheduler.scheduleWatch(ctx, plan, System.currentTimeMillis() + if (soon) 45_000L else Scheduler.WATCH_EVERY_MS)
         }
     }
 
