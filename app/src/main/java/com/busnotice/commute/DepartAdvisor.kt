@@ -10,6 +10,9 @@ import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import kotlinx.coroutines.flow.MutableStateFlow
+import org.json.JSONObject
+import kotlin.math.abs
 
 /**
  * 出发提醒（第一版，粗估）：行程还没开始、在时间窗里时，
@@ -71,12 +74,57 @@ object DepartAdvisor {
         trip.legs.indexOfFirst { l -> l.candidates.any { it.type == Candidate.Type.BUS && it.lineId.isNotBlank() } }
             .takeIf { it >= 1 }
 
-    /** 后台采样拿到某条线的实时后调用：判断要不要发 / 更新出发提醒 */
+    /** 当前这条出发建议（App 首页卡片和流体云共用），只存本机 */
+    data class Advice(
+        val day: Long, val tripId: String, val tripName: String, val line: String, val stop: String,
+        val busAt: Long, val leaveAt: Long, val projected: Boolean, val missedLeaveAt: Long, val at: Long,
+    ) {
+        fun toJson(): JSONObject = JSONObject().put("day", day).put("trip", tripId).put("name", tripName)
+            .put("line", line).put("stop", stop).put("bus", busAt).put("leave", leaveAt)
+            .put("proj", projected).put("missed", missedLeaveAt).put("at", at)
+        companion object {
+            fun from(o: JSONObject) = Advice(o.optLong("day"), o.optString("trip"), o.optString("name"),
+                o.optString("line"), o.optString("stop"), o.optLong("bus"), o.optLong("leave"),
+                o.optBoolean("proj"), o.optLong("missed"), o.optLong("at"))
+        }
+    }
+
+    val current = MutableStateFlow<Advice?>(null)
+
+    /** 今天还有效的建议（行程没开始、没被「今天不提醒」、目标车还没开走太久） */
+    fun load(ctx: Context, now: Long = System.currentTimeMillis()): Advice? {
+        val p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val a = runCatching { Advice.from(JSONObject(p.getString("cur", null) ?: return null)) }.getOrNull() ?: return null
+        val ok = a.day == LocalDate.now().toEpochDay() && p.getLong("mute", -1) != a.day &&
+            !Scheduler.ranToday(ctx, a.tripId) && CommuteService.instance == null && now < a.busAt + 2 * 60_000L
+        return a.takeIf { ok }.also { current.value = it }
+    }
+
+    /** 通知上点「今天不提醒」 */
+    fun mute(ctx: Context) {
+        ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putLong("mute", LocalDate.now().toEpochDay()).apply()
+        clear(ctx)
+    }
+
+    /** 行程开始了（离开公司 / 手动开始）：建议交给胶囊本身，不再单独显示 */
+    fun clear(ctx: Context) {
+        current.value = null
+        val p = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        if (p.getLong("shown", -1) == LocalDate.now().toEpochDay() && CommuteService.instance == null) {
+            runCatching { NotificationManagerCompat.from(ctx).cancel(LiveNotifier.LIVE_ID) }
+        }
+        runCatching { NotificationManagerCompat.from(ctx).cancel(NOTIF_ID) }
+        p.edit().putLong("shown", -1).apply()
+    }
+
+    /** 后台采样拿到某条线的实时后调用：更新出发建议，必要时发流体云 */
     fun onRealtime(ctx: Context, c: Candidate, rt: ChelaileApi.LineRealtime, now: Long = System.currentTimeMillis()) {
         runCatching {
             if (CommuteService.instance != null) return
             val zone = ZoneId.systemDefault()
             val today = LocalDate.now(zone)
+            val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            if (prefs.getLong("mute", -1) == today.toEpochDay()) return
             val nowMin = LocalDateTime.ofInstant(Instant.ofEpochMilli(now), zone).let { it.hour * 60 + it.minute }
             for (trip in TripStore.all(ctx)) {
                 if (!trip.enabled || Scheduler.ranToday(ctx, trip.id)) continue
@@ -88,43 +136,79 @@ object DepartAdvisor {
                 val startMs = today.atStartOfDay(zone).toInstant().toEpochMilli() + trip.startMinute * 60_000L
                 val arr = rt.buses.filter { it.travelSec >= 0 }.map { now + it.travelSec * 1000L }
                 val p = plan(arr, ld.total, maxOf(now, startMs)) ?: continue
-                val inMin = ((p.leaveAt - now) / 60_000L).toInt()
-                BusSampler.write(ctx, org.json.JSONObject().put("t", now).put("k", "depart_plan").put("trip", trip.name)
+                BusSampler.write(ctx, JSONObject().put("t", now).put("k", "depart_plan").put("trip", trip.name)
                     .put("bus", p.busAt).put("leave", p.leaveAt).put("proj", p.projected).put("lead", ld.total)
                     .put("first", ld.firstWalkMin).put("before", ld.beforeMin).put("xfer", ld.transferWalkMin).put("n", arr.size))
-                if (inMin > NOTIFY_AHEAD_MIN) continue
-                notify(ctx, trip, c, p, inMin)
+
+                val prev = runCatching { Advice.from(JSONObject(prefs.getString("cur", "") ?: "")) }.getOrNull()
+                    ?.takeIf { it.day == today.toEpochDay() && it.tripId == trip.id }
+                val sameBus = prev != null && abs(prev.busAt - p.busAt) < 3 * 60_000L
+                // 上一条建议的出发时刻已经过了、目标换成了后一班 → 记为错过，卡片和胶囊上写出来
+                val missed = when {
+                    prev == null -> 0L
+                    sameBus -> prev.missedLeaveAt
+                    prev.leaveAt < now - 60_000L -> prev.leaveAt
+                    else -> 0L
+                }
+                val a = Advice(today.toEpochDay(), trip.id, trip.name, c.name, c.stopName, p.busAt, p.leaveAt, p.projected, missed, now)
+                prefs.edit().putString("cur", a.toJson().toString()).apply()
+                current.value = a
+
+                val inMin = ((p.leaveAt - now) / 60_000L).toInt()
+                val shown = prefs.getLong("shown", -1) == today.toEpochDay()
+                // 第一次进入出发前 15 分钟才弹；弹过之后一直跟着更新（错过了就换成下一班）
+                if (inMin > NOTIFY_AHEAD_MIN && !shown) continue
+                val loud = !sameBus && inMin <= NOTIFY_AHEAD_MIN
+                showCapsule(ctx, a, now, loud)
+                prefs.edit().putLong("shown", today.toEpochDay()).apply()
+                BusSampler.write(ctx, JSONObject().put("t", now).put("k", "depart_notify")
+                    .put("trip", trip.name).put("in", inMin).put("bus", p.busAt).put("loud", loud).put("missed", missed))
             }
         }
     }
 
     private val HM = DateTimeFormatter.ofPattern("HH:mm")
-    private fun hm(ms: Long) = Instant.ofEpochMilli(ms).atZone(ZoneId.systemDefault()).format(HM)
+    fun hm(ms: Long): String = Instant.ofEpochMilli(ms).atZone(ZoneId.systemDefault()).format(HM)
 
-    private fun notify(ctx: Context, trip: Trip, c: Candidate, p: Plan, inMin: Int) {
-        val prefs = ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val day = LocalDate.now().toEpochDay()
-        val lastBus = if (prefs.getLong("day", -1) == day) prefs.getLong("bus", 0) else 0
-        // 同一班车（前后 3 分钟内算同一班）不重复响，只静默更新文字
-        val same = lastBus > 0 && kotlin.math.abs(lastBus - p.busAt) < 3 * 60_000L
-        prefs.edit().putLong("day", day).putLong("bus", p.busAt).apply()
-        val title = if (inMin <= 0) "现在出发，刚好接上 ${c.name}" else "约 $inMin 分钟后出发（${hm(p.leaveAt)}）"
-        val text = "${c.name} 预计 ${hm(p.busAt)} 到 ${c.stopName}" + if (p.projected) " · 按间隔推算" else ""
-        val open = PendingIntent.getActivity(ctx, 0, Intent(ctx, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
-        LiveNotifier.ensureChannels(ctx)
-        val n = NotificationCompat.Builder(ctx, LiveNotifier.CHANNEL_ALERT)
-            .setSmallIcon(R.drawable.ic_bus)
-            .setContentTitle(title).setContentText(text)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .setCategory(NotificationCompat.CATEGORY_REMINDER)
-            .setOnlyAlertOnce(true).setSilent(same)
-            .setAutoCancel(true)
-            .setTimeoutAfter(maxOf(p.leaveAt - System.currentTimeMillis(), 0L) + 5 * 60_000L)
-            .setContentIntent(open)
-            .build()
-        try { NotificationManagerCompat.from(ctx).notify(NOTIF_ID, n) } catch (_: SecurityException) { }
-        BusSampler.write(ctx, org.json.JSONObject().put("t", System.currentTimeMillis()).put("k", "depart_notify")
-            .put("trip", trip.name).put("in", inMin).put("bus", p.busAt).put("silent", same))
+    /** 卡片 / 胶囊共用的文案 */
+    fun headline(a: Advice, now: Long): String {
+        val inMin = ((a.leaveAt - now + 30_000L) / 60_000L).toInt()
+        return when {
+            inMin <= 0 -> "现在出发，刚好接上"
+            else -> "约 $inMin 分钟后出发"
+        }
     }
+
+    fun detail(a: Advice): String =
+        (if (a.missedLeaveAt > 0) "错过 ${hm(a.missedLeaveAt)} 那班 · " else "") +
+            "${hm(a.leaveAt)} 出发，接 ${hm(a.busAt)} 到${a.stop}的 ${a.line}" + if (a.projected) "（按间隔推算）" else ""
+
+    /** 流体云：和行程胶囊同一个通知位，行程一开始就被胶囊本身接替 */
+    private fun showCapsule(ctx: Context, a: Advice, now: Long, loud: Boolean) {
+        LiveNotifier.ensureChannels(ctx)
+        val nm = NotificationManagerCompat.from(ctx)
+        if (!nm.areNotificationsEnabled()) return
+        val open = PendingIntent.getActivity(ctx, 0,
+            Intent(ctx, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val mute = PendingIntent.getBroadcast(ctx, ACTION_MUTE.hashCode(),
+            Intent(ctx, ActionReceiver::class.java).setAction(ACTION_MUTE),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val b = NotificationCompat.Builder(ctx, if (loud) LiveNotifier.CHANNEL_POP else LiveNotifier.CHANNEL_LIVE)
+            .setSmallIcon(R.drawable.ic_bus).setColor(LiveNotifier.BLUE)
+            .setContentTitle(headline(a, now)).setContentText(detail(a))
+            .setStyle(NotificationCompat.BigTextStyle().bigText(detail(a)))
+            .setShortCriticalText(if (a.leaveAt > now) "${hm(a.leaveAt)}走" else "该走了")
+            .setOngoing(true).setRequestPromotedOngoing(true)
+            .setCategory(NotificationCompat.CATEGORY_NAVIGATION)
+            .setOnlyAlertOnce(!loud).setSilent(!loud)
+            .setContentIntent(open)
+            .addAction(0, "今天不提醒", mute)
+            .setTimeoutAfter(maxOf(a.busAt - now, 0L) + 3 * 60_000L)
+        if (a.leaveAt > now) b.setWhen(a.leaveAt).setShowWhen(true).setUsesChronometer(true).setChronometerCountDown(true)
+        else b.setShowWhen(false)
+        try { nm.cancel(NOTIF_ID); nm.notify(LiveNotifier.LIVE_ID, b.build()) } catch (_: SecurityException) { }
+    }
+
+    const val ACTION_MUTE = "com.busnotice.commute.DEPART_MUTE"
 }
