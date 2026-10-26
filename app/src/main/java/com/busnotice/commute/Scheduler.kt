@@ -52,6 +52,7 @@ object Scheduler {
     /** 这趟今天已经跑过（自动或手动启动过）：当天不再「留意离开」自动拉起，免得到家后又被重新开始 */
     fun markRan(ctx: Context, planId: String) {
         ctx.getSharedPreferences("ran_day", Context.MODE_PRIVATE).edit().putLong(planId, LocalDate.now().toEpochDay()).apply()
+        DepartAdvisor.current.value = null
     }
 
     fun ranToday(ctx: Context, planId: String): Boolean =
