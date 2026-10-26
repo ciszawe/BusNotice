@@ -114,6 +114,17 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
     var version by remember { mutableStateOf(0) }
     val trips = remember(resumeTick, version) { TripStore.all(ctx) }
     val live by LiveState.snapshot.collectAsState()
+    val adviceFlow by com.busnotice.commute.DepartAdvisor.current.collectAsState()
+    var nowTick by remember { mutableStateOf(System.currentTimeMillis()) }
+    // 出发建议卡片：每 20 秒刷新倒计时；过期 / 行程开始了就自动消失
+    LaunchedEffect(resumeTick) {
+        while (true) {
+            nowTick = System.currentTimeMillis()
+            com.busnotice.commute.DepartAdvisor.load(ctx, nowTick)
+            delay(20_000L)
+        }
+    }
+    val advice = adviceFlow?.takeIf { nowTick < it.busAt + 2 * 60_000L }
     var confirmDelete by remember { mutableStateOf<Trip?>(null) }
     var confirmSwitch by remember { mutableStateOf<Trip?>(null) }
     var confirmRestart by remember { mutableStateOf<Trip?>(null) }
@@ -232,6 +243,9 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
                   }
                 }
                 val board = live
+                if (board == null && pendingTrip == null && advice != null) {
+                    item(key = "depart") { DepartBoard(advice!!, nowTick, dark) }
+                }
                 if (board != null && pendingTrip == null) {
                     item(key = "live") { LiveBoard(board, trips.firstOrNull { it.id == board.tripId }, dark) }
                 } else if (pendingTrip != null && !pendingExpired) {
@@ -587,4 +601,25 @@ private fun permChecks(ctx: Context, request: (Array<String>) -> Unit): List<Per
         open(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
     }
     return out
+}
+
+/** 下班出发建议：「约 8 分钟后出发」+ 几点走、接哪班车；错过了会写「错过 18:47 那班」 */
+@Composable
+private fun DepartBoard(a: com.busnotice.commute.DepartAdvisor.Advice, now: Long, dark: Boolean) {
+    val ink = Fuse.ink(dark)
+    val dimColor = Fuse.dim(dark)
+    val D = com.busnotice.commute.DepartAdvisor
+    Column(Modifier.fillMaxWidth().glass(dark).padding(horizontal = 16.dp, vertical = 16.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(Modifier.size(7.dp).clip(CircleShape).background(if (a.missedLeaveAt > 0) Fuse.Amber else Fuse.BusGreen))
+            Spacer(Modifier.width(8.dp))
+            Text("${a.tripName} · 出发建议", fontSize = 13.sp, color = dimColor)
+            Spacer(Modifier.weight(1f))
+            Text("${D.hm(a.leaveAt)} 走", fontSize = 13.sp, color = dimColor, style = TextStyle(fontFeatureSettings = "tnum"))
+        }
+        Spacer(Modifier.height(8.dp))
+        Text(D.headline(a, now), fontSize = 22.sp, fontWeight = FontWeight.Bold, color = ink)
+        Spacer(Modifier.height(4.dp))
+        Text(D.detail(a), fontSize = 13.sp, color = dimColor, style = TextStyle(fontFeatureSettings = "tnum"))
+    }
 }
