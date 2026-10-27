@@ -1045,6 +1045,11 @@ class CommuteService : Service() {
         // 已经按定位对上过第 2 站以后：用实际走过的速度（上车到锚点平均每站多久）；只往慢里调，免得提前说快到了
         val observed = if (metroAnchorIdx >= 2 && metroAnchorAt > boardedAt) (metroAnchorAt - boardedAt) / metroAnchorIdx else 0L
         val perHop = maxOf(planned, observed.coerceAtMost(240_000L))
+        // E1：有按基站学到的到站时刻就用它，已过几站按剩余时间倒推（区间长短不一，可能差一站）
+        if (fpEtaAt > 0 && fpEtaAt > boardedAt) {
+            val left = ((fpEtaAt - now).coerceAtLeast(0L) + planned - 1) / planned
+            return (hops - left.toInt()).coerceIn(0, hops - 1) to fpEtaAt
+        }
         return if (metroAnchorIdx >= 0 && metroAnchorAt > 0) {
             val passed = (metroAnchorIdx + ((now - metroAnchorAt) / perHop).toInt()).coerceIn(0, hops - 1)
             passed to (metroAnchorAt + (hops - metroAnchorIdx) * perHop)
@@ -1912,6 +1917,10 @@ class CommuteService : Service() {
     private var tacLearner: MetroTacLearner? = null
     private val metroGate = MetroGate { tac -> tacLearner?.isMetroTac(tac) == true }
     private val fpRec = MetroFpRecorder()
+    private var fpEta: Map<Long, Long> = emptyMap()
+    private val fpSeen = HashSet<Long>()
+    /** E1：按基站学到的预计到下车站时刻（0 = 没有） */
+    private var fpEtaAt = 0L
     private var metroRideOn = false
     private var metroRideKey = ""
     private var metroRideStart = 0L
@@ -1940,8 +1949,19 @@ class CommuteService : Service() {
             if (!metroRideOn) {
                 metroRideOn = true; metroRideStart = s.t
                 metroRideKey = trip.id.take(8) + ":" + (if (riding) legIdx else legIdx - 1)
+                fpEta = MetroCells.eta(this, metroRideKey); fpSeen.clear(); fpEtaAt = 0L
+                TraceLog.event("fp_eta_load", "key" to metroRideKey, "cells" to fpEta.size)
             }
-            l.sampleRide(s); fpRec.sample(s)
+            val underground = l.isMetroTac(s.nrTac)
+            l.sampleRide(s); fpRec.sample(s, underground)
+            // E1：地下见到一个新基站、学过它离下车站还有多久 → 用它校准到站时刻
+            val e = s.enb?.toLong()
+            val firstCell = fpSeen.isEmpty()
+            // 这一趟的第一个基站是上车站（含站台等车），等多久不定，不拿来校准
+            if (underground && e != null && fpSeen.add(e) && !firstCell) fpEta[e]?.let { rem ->
+                fpEtaAt = s.t + rem
+                TraceLog.event("fp_eta", "enb" to e, "remS" to rem / 1000, "eta" to fpEtaAt)
+            }
         } else if (metroRideOn) endMetroRide()
         if (busMoving(s.t)) { busMovingOn = true; l.sampleSurface(s) }
         else if (busMovingOn) { busMovingOn = false; l.endSurface(); MetroCells.save(this, l) }
@@ -1992,10 +2012,12 @@ class CommuteService : Service() {
         val l = tacLearner ?: return
         val tac = l.endRide()
         MetroCells.save(this, l)
-        fpRec.finish()?.takeIf { joinLeg < 0 }?.let { seq ->
+        fpEtaAt = 0L; fpSeen.clear()
+        // 半路上车的也存：E1 只看到终点还剩多久，从哪站上都一样
+        fpRec.finish()?.let { seq ->
             MetroCells.appendRide(this, metroRideKey, org.json.JSONObject()
                 .put("start", metroRideStart).put("end", System.currentTimeMillis())
-                .put("board", boardedAt).put("tacOk", tac != null).put("seq", seq))
+                .put("board", boardedAt).put("tacOk", tac != null).put("mt", true).put("join", joinLeg >= 0).put("seq", seq))
         }
         TraceLog.event("metro_cells", "tacOk" to (tac != null), "learned" to l.hasLearned(), "rides" to MetroCells.rideCount(this))
     }
