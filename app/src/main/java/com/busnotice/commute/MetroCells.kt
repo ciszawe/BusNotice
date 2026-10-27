@@ -105,7 +105,9 @@ class MetroGate(private val isMetro: (Int?) -> Boolean) {
 class MetroFpRecorder {
     private val seq = ArrayList<LongArray>()
 
-    fun sample(s: CellSnap) {
+    /** metro = 这次采样连着地铁地下区号；只记地下的，出站后地面的基站不混进来 */
+    fun sample(s: CellSnap, metro: Boolean = true) {
+        if (!metro) return
         val e = s.enb?.toLong() ?: return
         val last = seq.lastOrNull()
         if (last != null && last[0] == e) last[2] = s.t else seq += longArrayOf(e, s.t, s.t)
@@ -118,6 +120,37 @@ class MetroFpRecorder {
         val out = if (seq.size >= 3) JSONArray().apply { seq.forEach { put(JSONArray().put(it[0]).put(it[1]).put(it[2])) } } else null
         seq.clear()
         return out
+    }
+}
+
+/**
+ * E1：按基站估「离下车站还有多久」（纯逻辑）。
+ * 每趟只看地下区号里的基站，最后出现的那个基站就是下车站；各趟里「最后一个」出现最多的当终点。
+ * 每个基站：终点第一次出现 - 它第一次出现，取各趟中位数；至少 2 趟见过才用。
+ */
+object MetroEta {
+    const val MIN_RIDES = 3
+
+    /** rides：每趟按顺序的 (基站号, 第一次见到的毫秒) */
+    fun build(rides: List<List<Pair<Long, Long>>>): Map<Long, Long> {
+        val ok = rides.filter { it.size >= 3 }
+        if (ok.size < MIN_RIDES) return emptyMap()
+        val term = ok.groupingBy { it.last().first }.eachCount().maxByOrNull { it.value } ?: return emptyMap()
+        if (term.value * 10 < ok.size * 6) return emptyMap()   // 终点不稳定（60% 以下）不学
+        val rem = HashMap<Long, MutableList<Long>>()
+        for (r in ok) {
+            val tEnd = r.firstOrNull { it.first == term.key }?.second ?: continue
+            for ((e, t) in r) if (t <= tEnd) rem.getOrPut(e) { ArrayList() } += tEnd - t
+        }
+        return rem.filterValues { it.size >= 2 }.mapValues { (_, v) -> v.sorted()[v.size / 2] }
+    }
+
+    fun parse(ride: JSONObject): List<Pair<Long, Long>>? {
+        if (!ride.optBoolean("mt")) return null   // 旧版记录混着地面基站，不用
+        val a = ride.optJSONArray("seq") ?: return null
+        val seen = HashSet<Long>()
+        return (0 until a.length()).mapNotNull { i -> a.optJSONArray(i)?.let { x -> x.optLong(0) to x.optLong(1) } }
+            .filter { seen.add(it.first) }
     }
 }
 
@@ -146,6 +179,13 @@ object MetroCells {
         all.put(key, arr)
         f.writeText(all.toString())
     }
+
+    /** E1 用：这一段学到的「基站 → 离下车站还有多少毫秒」 */
+    fun eta(ctx: Context, key: String): Map<Long, Long> = runCatching {
+        val f = fpFile(ctx); if (!f.exists()) return emptyMap()
+        val arr = JSONObject(f.readText()).optJSONArray(key) ?: return emptyMap()
+        MetroEta.build((0 until arr.length()).mapNotNull { arr.optJSONObject(it)?.let(MetroEta::parse) })
+    }.getOrDefault(emptyMap())
 
     fun rideCount(ctx: Context): Int = runCatching {
         val f = fpFile(ctx); if (!f.exists()) return 0
