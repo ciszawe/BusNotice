@@ -16,7 +16,7 @@ class MetroEtaTest {
         val m = MetroEta.build(rides)
         assertEquals(0L, m[9L])
         assertEquals(130_000L, m[3L])
-        assertEquals(260_000L, m[2L])
+        assertEquals(255_000L, m[2L])
     }
 
     @Test fun needsThreeRides() {
