@@ -145,6 +145,32 @@ object MetroEta {
         return rem.filterValues { it.size >= 2 }.mapValues { (_, v) -> v.sorted()[v.size / 2] }
     }
 
+    /** 一天的行程记录 → 地下基站序列（按时间，每个基站第一次出现）；地下样本间隔超过 10 分钟就分段，取最长的一段 */
+    fun traceRide(lines: List<String>, isMetroTac: (Int?) -> Boolean): List<Pair<Long, Long>>? {
+        val segs = ArrayList<ArrayList<Pair<Long, Long>>>()
+        var lastT = 0L
+        for (l in lines) {
+            if (!l.contains("\"cell\"")) continue
+            val o = runCatching { JSONObject(l) }.getOrNull() ?: continue
+            if (o.optString("k") != "cell") continue
+            val cells = o.optJSONArray("cells") ?: continue
+            var nrTac: Int? = null; var lte: Long? = null
+            for (i in 0 until cells.length()) {
+                val c = cells.optJSONObject(i) ?: continue
+                if (nrTac == null && c.optString("type") == "nr") nrTac = c.optInt("tac")
+                if (lte == null && c.optString("type") == "lte") lte = c.optLong("id").takeIf { it in 1L..0x0FFFFFFFL }
+            }
+            if (!isMetroTac(nrTac) || lte == null) continue
+            val t = o.optLong("t")
+            if (segs.isEmpty() || t - lastT > 10 * 60_000L) segs += ArrayList()
+            lastT = t
+            val e = lte ushr 8
+            val cur = segs.last()
+            if (cur.none { it.first == e }) cur += e to t
+        }
+        return segs.maxByOrNull { it.size }?.takeIf { it.size >= 3 }
+    }
+
     fun parse(ride: JSONObject): List<Pair<Long, Long>>? {
         if (!ride.optBoolean("mt")) return null   // 旧版记录混着地面基站，不用
         val a = ride.optJSONArray("seq") ?: return null
@@ -180,12 +206,34 @@ object MetroCells {
         f.writeText(all.toString())
     }
 
-    /** E1 用：这一段学到的「基站 → 离下车站还有多少毫秒」 */
-    fun eta(ctx: Context, key: String): Map<Long, Long> = runCatching {
-        val f = fpFile(ctx); if (!f.exists()) return emptyMap()
-        val arr = JSONObject(f.readText()).optJSONArray(key) ?: return emptyMap()
-        MetroEta.build((0 until arr.length()).mapNotNull { arr.optJSONObject(it)?.let(MetroEta::parse) })
+    /**
+     * E1 用：这一段学到的「基站 → 离下车站还有多少毫秒」。
+     * [isMetroTac] 不为空（这趟行程只有一段地铁）时，再从每天的行程记录里补：只取连着地铁地下区号的基站，
+     * 这样旧版没打标记的历史也能用上，不用重新攒。
+     */
+    fun eta(ctx: Context, key: String, isMetroTac: ((Int?) -> Boolean)? = null): Map<Long, Long> = runCatching {
+        val rides = ArrayList<List<Pair<Long, Long>>>()
+        val days = HashSet<String>()
+        val f = fpFile(ctx)
+        if (f.exists()) JSONObject(f.readText()).optJSONArray(key)?.let { arr ->
+            for (i in 0 until arr.length()) arr.optJSONObject(i)?.let(MetroEta::parse)?.let {
+                rides += it; days += java.time.Instant.ofEpochMilli(it.first().second).atZone(java.time.ZoneId.systemDefault()).toLocalDate().toString()
+            }
+        }
+        if (isMetroTac != null) rides += fromTraces(ctx, key.substringBefore(':'), isMetroTac, days)
+        MetroEta.build(rides)
     }.getOrDefault(emptyMap())
+
+    /** 从 traces/日期_行程.jsonl 里抽出每天这趟地铁的地下基站序列（今天的不算，可能还没坐完） */
+    fun fromTraces(ctx: Context, trip8: String, isMetroTac: (Int?) -> Boolean, skipDays: Set<String>): List<List<Pair<Long, Long>>> {
+        val today = java.time.LocalDate.now().toString()
+        val files = File(ctx.filesDir, "traces").listFiles { x -> x.name.endsWith("_$trip8.jsonl") } ?: return emptyList()
+        return files.mapNotNull { file ->
+            val day = file.name.substringBefore('_')
+            if (day == today || day in skipDays) return@mapNotNull null
+            runCatching { MetroEta.traceRide(file.readLines(), isMetroTac) }.getOrNull()
+        }
+    }
 
     fun rideCount(ctx: Context): Int = runCatching {
         val f = fpFile(ctx); if (!f.exists()) return 0
