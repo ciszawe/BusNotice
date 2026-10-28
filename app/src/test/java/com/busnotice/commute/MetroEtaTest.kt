@@ -29,4 +29,22 @@ class MetroEtaTest {
         )
         assertTrue(MetroEta.build(rides).isEmpty())
     }
+
+    private fun cell(t: Long, tac: Int, lte: Long) =
+        """{"cells":[{"type":"nr","id":1,"tac":$tac},{"type":"lte","id":$lte,"tac":9}],"t":$t,"k":"cell"}"""
+
+    @Test fun traceRideKeepsUndergroundOnly() {
+        val ug = 7
+        val lines = listOf(
+            cell(0, 5, 100L shl 8),                 // 地面：不算
+            cell(1_000, ug, 200L shl 8),
+            cell(30_000, ug, (200L shl 8) or 3L),      // 同一基站换扇区：不重复
+            cell(60_000, ug, 300L shl 8),
+            cell(90_000, ug, 400L shl 8),
+            """{"e":"a11y","k":"ev","t":1}""",
+            cell(120_000, 5, 500L shl 8),            // 出站后地面
+        )
+        val r = MetroEta.traceRide(lines) { it == ug }!!
+        assertEquals(listOf(200L to 1_000L, 300L to 60_000L, 400L to 90_000L), r)
+    }
 }
