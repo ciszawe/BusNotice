@@ -162,7 +162,7 @@ object MetroEta {
             }
             if (!isMetroTac(nrTac) || lte == null) continue
             val t = o.optLong("t")
-            if (segs.isEmpty() || t - lastT > 10 * 60_000L) segs += ArrayList()
+            if (segs.isEmpty() || t - lastT > 10 * 60_000L) segs.add(ArrayList())
             lastT = t
             val e = lte ushr 8
             val cur = segs.last()
