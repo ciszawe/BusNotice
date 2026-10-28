@@ -63,6 +63,23 @@ object TraceLog {
 
     // 最近约 15 分钟的窗口，给下车判断用
     private val recent = ArrayDeque<AccMotion.Win>()
+    /** 最近 5 分钟的磁场波动（时刻, msd）：列车牵引电机一开，磁场会持续大幅抖动 */
+    private val magRing = ArrayDeque<Pair<Long, Double>>()
+
+    /**
+     * [since] 之后第一次出现「列车在跑」的磁场特征：连续 60 秒窗口里至少 40% 的 2 秒样本 msd ≥ 8 μT，返回窗口开头。
+     * 站台上、走路时一般 < 7；坐在车上 5–50 来回跳（按 10 月十几趟地铁记录定的门槛）。
+     */
+    fun magTrainAt(since: Long): Long? {
+        val xs = synchronized(magRing) { magRing.filter { it.first >= since } }
+        if (xs.size < 25) return null
+        for (i in 0..xs.size - 25) {
+            val end = xs[i].first + 60_000L
+            val w = xs.subList(i, xs.size).takeWhile { it.first < end }
+            if (w.size >= 25 && w.count { it.second >= 8.0 } * 10 >= w.size * 4) return xs[i].first
+        }
+        return null
+    }
     private const val RECENT_MAX = 450   // 约 15 分钟：等车上车的判断要回看进站以来的全部窗口
 
     fun recentWindows(): List<AccMotion.Win> = synchronized(recent) { recent.toList() }
@@ -133,7 +150,9 @@ object TraceLog {
                 val o = JSONObject().put("ts", t)
                 if (mn > 0) {
                     val mean = msum / mn
-                    o.put("mm", r(mean, 10.0)).put("msd", r(sqrt((msq / mn - mean * mean).coerceAtLeast(0.0)), 100.0))
+                    val sd = sqrt((msq / mn - mean * mean).coerceAtLeast(0.0))
+                    o.put("mm", r(mean, 10.0)).put("msd", r(sd, 100.0))
+                    synchronized(magRing) { magRing.addLast(t to sd); while (magRing.size > 150) magRing.removeFirst() }
                 }
                 if (pn > 0) o.put("p", r(psum / pn, 100.0))
                 write("env", o)
