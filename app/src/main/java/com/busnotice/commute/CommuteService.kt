@@ -1954,7 +1954,7 @@ class CommuteService : Service() {
             val single = trip.legs.count { it.isMetroOnly() } == 1
             val learner = tacLearner
             scope.launch(Dispatchers.IO) {
-                val m = MetroCells.eta(applicationContext, key, if (single && learner != null) { t -> learner.isMetroTac(t) } else null)
+                val m = MetroCells.eta(applicationContext, key, if (single && learner != null) ({ t: Int? -> learner.isMetroTac(t) }) else null)
                 etaCache[key] = m
                 withContext(Dispatchers.Main) { TraceLog.event("fp_eta_load", "key" to key, "cells" to m.size) }
             }
