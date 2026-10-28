@@ -46,7 +46,8 @@ class TransitA11y : AccessibilityService() {
         // 同一段文字 30 秒内只记一次
         if (text == lastText && now - lastAt < 30_000) return
         lastText = text; lastAt = now
-        TraceLog.event("a11y", "pkg" to pkg, "text" to text.take(120))
+        // 只记系统界面 / 钱包的文字：别的 App 屏幕内容不落盘（隐私）
+        if (pkg.contains("systemui") || pkg.contains("wallet")) TraceLog.event("a11y", "pkg" to pkg, "text" to text.take(120))
         tapSignal(text, pkg, now)
         BALANCE.find(text)?.groupValues?.get(1)?.toDoubleOrNull()?.let { v ->
             val p = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
