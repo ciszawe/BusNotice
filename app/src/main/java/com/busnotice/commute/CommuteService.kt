@@ -282,7 +282,7 @@ class CommuteService : Service() {
         boardSnap = null; undoUntil.value = 0L; pendingLearnLeg = -1
         metroExitSeen = false; metroExitAt = 0L
         joinLeg = -1; joinSkip = 0; joinScale = 1.0; joinOrigStop = ""; joinStop = ""; joinCandIdx = -1; joinCandAt = 0L; joinCandFixT = 0L; pendingJoin = null
-        placeStart = null; arrived = false; lastPlace = null; tail = false; tailFixes.clear(); startVoted = false
+        placeStart = null; arrived = false; lastPlace = null; placeSince = 0L; startLabel = null; busHitTimes.clear(); tail = false; tailFixes.clear(); startVoted = false
         legIdx = 0; boardedAt = 0L; nearSince = 0L; fastFixes = 0; alertedKey = null; planDone = false; planAlerted = ""
         maxStops.clear(); maxEta.clear()
         manualRun = manual; pendingBoardAt = 0L; pendingBoardLoc = null; boardCommitted = false; riding = false; transferAlerted = false; arriveAlertedAt = 0L
@@ -577,6 +577,47 @@ class CommuteService : Service() {
                 ?.firstOrNull { it.name.startsWith(c.alightName) && (it.isSubway == c.isMetro()) }
                 ?.let { it.lat to it.lng }
         }
+    }
+
+    /** 到这段公交线路（相邻站连成折线）的最近距离，米；没线路数据返回 null */
+    private fun lineDistM(loc: Location, leg: Leg): Double? {
+        val lines = leg.candidates.filter { !it.isMetro() }.mapNotNull { routes[it.lineId] }.filter { it.size >= 2 }
+        if (lines.isEmpty()) return null
+        val k = Math.cos(Math.toRadians(loc.latitude)) * 111_320.0
+        fun xy(p: Pair<Double, Double>) = (p.second - loc.longitude) * k to (p.first - loc.latitude) * 110_540.0
+        var best = Double.MAX_VALUE
+        for (pts in lines) for (i in 0 until pts.size - 1) {
+            val (ax, ay) = xy(pts[i]); val (bx, by) = xy(pts[i + 1])
+            val dx = bx - ax; val dy = by - ay; val l2 = dx * dx + dy * dy
+            val t = if (l2 == 0.0) 0.0 else (-(ax * dx + ay * dy) / l2).coerceIn(0.0, 1.0)
+            val px = ax + t * dx; val py = ay + t * dy
+            best = minOf(best, Math.sqrt(px * px + py * py))
+        }
+        return best
+    }
+
+    private val busHitTimes = ArrayDeque<Long>()
+
+    /**
+     * H1：当前还是地铁段（没进站 / 没上车），人却在地面以车速贴着下一段公交线路走（GPS 连续 3 次、跨 60 秒以上，离线路 ≤ 80 米）
+     * → 没坐地铁，直接改坐了这路公交（或从别的站上的车）：跳过地铁段，按第一次贴线的时刻算公交上车。
+     */
+    private fun busJumpCheck(loc: Location, spd: Float): Boolean {
+        val nk = legIdx + 1
+        if (!trip.legs[legIdx].isMetroOnly() || inMetroRide() || nk >= trip.legs.size || trip.legs[nk].isMetroOnly()) { busHitTimes.clear(); return false }
+        val d = lineDistM(loc, trip.legs[nk])
+        if (spd >= 4f && d != null && d <= 80.0) busHitTimes.addLast(loc.time) else { busHitTimes.clear(); return false }
+        if (busHitTimes.size < 3 || busHitTimes.last() - busHitTimes.first() < 60_000L) return false
+        val at = busHitTimes.first(); busHitTimes.clear()
+        val now = System.currentTimeMillis()
+        TraceLog.event("bus_jump", "from" to legIdx, "to" to nk, "at" to at, "distM" to (d ?: 0.0).toInt())
+        Diag.mark(this, "在地面上以车速沿第 ${nk + 1} 段公交走，跳过地铁，判断已上公交")
+        onBoarded(manual = false, at = at)           // 地铁段：当作「坐过」
+        boardedAt = at; alightAt = at; rideLearned = true; metroExitSeen = true; stationAt = 0L
+        joinLeg = nk                                   // 半路上的车：不学这段乘车时长
+        onBoarded(manual = false, at = at)           // 公交段：上车
+        saveRun(deadlineAt); kick()
+        return true
     }
 
     private fun onRoute(loc: Location, leg: Leg): Boolean {
@@ -916,6 +957,11 @@ class CommuteService : Service() {
                 TraceLog.event("metro_board", "by" to "cell", "at" to dep, "cell" to cc, "walkEnd" to walkEnd)
                 return dep
             }
+        }
+        // H2：不用刷卡也能判——磁场持续大幅抖动 = 列车在跑（只看停下走路之后的；要已经持续 1 分钟以上）
+        TraceLog.magTrainAt(maxOf(walkEnd, stationAt))?.takeIf { now - it >= 60_000L }?.let { at ->
+            TraceLog.event("metro_board", "by" to "mag", "at" to at, "walkEnd" to walkEnd)
+            return at
         }
         if ((now >= train + 6 * 60_000L && now - walkEnd > 60_000L) || now >= train + 12 * 60_000L) {
             TraceLog.event("metro_board", "by" to "time", "at" to fallbackAt, "dep" to dep, "walkEnd" to walkEnd)
@@ -1399,6 +1445,8 @@ class CommuteService : Service() {
     private var placeStart: Location? = null   // 这趟第一段上车前的第一个好定位（起点）
     private var arrived = false                // 按到站结束（到下车站 / 刷卡出站）
     private var lastPlace: Places.Label? = null
+    private var placeSince = 0L
+    private var startLabel: Places.Label? = null
 
     private fun placeFix(loc: Location) {
         runCatching {
@@ -1406,7 +1454,17 @@ class CommuteService : Service() {
             if (!::trip.isInitialized || loc.accuracy >= 200) return
             if (placeStart == null && legIdx == 0 && boardedAt == 0L && loc.time >= startedAt - 30_000) placeStart = Location(loc)
             val l = Places.classify(this, loc.latitude, loc.longitude, loc.accuracy)
-            if (l != lastPlace) { lastPlace = l; TraceLog.event("place", "label" to l.name) }
+            if (l != lastPlace) { lastPlace = l; placeSince = loc.time; TraceLog.event("place", "label" to l.name) }
+            if (startLabel == null && loc.time - startedAt < 120_000L) startLabel = l
+            // H3 兜底：进了家 / 公司（不是出发的那个地方）待满 3 分钟、行程还没结束 → 直接算到了
+            if ((l == Places.Label.HOME || l == Places.Label.WORK) && l != startLabel && !arrived && !tail && !finishing &&
+                loc.time - startedAt > 5 * 60_000L && loc.time - placeSince >= 3 * 60_000L) {
+                TraceLog.event("place_arrive", "label" to l.name, "leg" to legIdx, "riding" to riding)
+                Diag.mark(this, "已经${if (l == Places.Label.HOME) "到家" else "到公司"}，行程结束")
+                arrived = true
+                if (metroRideOn) runCatching { endMetroRide() }
+                placeVotes(); finish()   // 人已经在目的地，不用再录「最后一段路」
+            }
         }
     }
 
@@ -1512,6 +1570,8 @@ class CommuteService : Service() {
                 onBoarded(manual = false); return
             }
         }
+
+        if (spd != null && trusted && busJumpCheck(loc, spd)) return
 
         // 到过上车点、现在速度很快 → 大概率上车了
         // 地铁段不看车速：站口附近跑两步、打车到站口都会被当成「车开了」；地铁上车只认刷卡 / 地下基站 / 列车晃动
