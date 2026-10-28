@@ -201,6 +201,7 @@ class CommuteService : Service() {
     private var boardedAt = 0L          // 上一段上车时间
     private var nearSince = 0L          // 第一次走到当前段上车点附近的时间
     private var fastFixes = 0
+    private var busFastLogged = 0L
     private var alertedKey: String? = null
     private val maxStops = HashMap<String, Int>()
     private val maxEta = HashMap<String, Int>()
@@ -721,8 +722,10 @@ class CommuteService : Service() {
             val g = lastGpsFix
             stationAt = when {
                 nearSince > 0 && now - nearSince > 120_000 -> nearSince
+                // 最后一次 GPS 要贴着站口（200 米），且不是还在出发地（公司 / 家离车站近，出门 GPS 一停就会误判进站）
                 g != null && g.time >= startedAt - 30_000 && now - g.time > 90_000 &&
-                    leg.candidates.any { Geo.distanceM(g.latitude, g.longitude, it.lat, it.lng) <= 500 } -> g.time
+                    leg.candidates.any { Geo.distanceM(g.latitude, g.longitude, it.lat, it.lng) <= 200 } &&
+                    walkFixes.firstOrNull().let { o -> o == null || Geo.distanceM(g.latitude, g.longitude, o.lat, o.lng) > 150 } -> g.time
                 else -> 0L
             }
         }
@@ -1474,7 +1477,13 @@ class CommuteService : Service() {
         return 60_000L
     }
 
+    private var lastLocAt = 0L
+
     private fun onLocation(loc: Location) {
+        val nowL = System.currentTimeMillis()
+        // 定位整段断掉（系统冻结后台）：记下断了多久，给保活排查用
+        if (lastLocAt > 0 && nowL - lastLocAt > 3 * 60_000L) TraceLog.event("loc_gap", "sec" to (nowL - lastLocAt) / 1000)
+        lastLocAt = nowL
         TraceLog.loc(loc)
         placeFix(loc)
         val spd = speedOf(loc)
@@ -1505,11 +1514,18 @@ class CommuteService : Service() {
         }
 
         // 到过上车点、现在速度很快 → 大概率上车了
-        if (nearSince > 0 && spd != null && trusted && spd > 6f) {
+        // 地铁段不看车速：站口附近跑两步、打车到站口都会被当成「车开了」；地铁上车只认刷卡 / 地下基站 / 列车晃动
+        if (nearSince > 0 && spd != null && trusted && spd > 6f && !trip.legs[legIdx].isMetroOnly()) {
             fastFixes++
             if (fastFixes >= 3) onBoarded(manual = false)
         } else if (spd != null && trusted) {
             fastFixes = 0
+        }
+        // 公交段：GPS 已经是车速却没判上车，记下卡在哪个条件上（每分钟最多一条）
+        if (spd != null && trusted && spd > 6f && !trip.legs[legIdx].isMetroOnly() && !riding && loc.time - busFastLogged > 60_000L) {
+            busFastLogged = loc.time
+            TraceLog.event("bus_fast_wait", "spd" to spd, "near" to (nearSince > 0), "boardedAt" to boardedAt, "onLine" to routeHits.toList().takeLast(3).count { it },
+                "route" to trip.legs[legIdx].candidates.count { routes[it.lineId] != null }, "fast" to fastFixes)
         }
     }
 
@@ -1701,7 +1717,14 @@ class CommuteService : Service() {
     fun onStaleTap(at: Long) {
         scope.launch(Dispatchers.Main) {
             runCatching {
-                if (!::trip.isInitialized || tail || riding || metroExitSeen || legIdx == 0) return@runCatching
+                if (!::trip.isInitialized || tail || riding) return@runCatching
+                // 公交段还没上车：刷卡弹窗当时没读到、1–2 分钟后才在通知栏看到 → 按刷卡时刻补认上车（照样要位置对得上）
+                val cur = trip.legs[legIdx]
+                if (!cur.isMetroOnly() && (legIdx == 0 || !trip.legs[legIdx - 1].isMetroOnly()) && System.currentTimeMillis() - at <= 3 * 60_000L) {
+                    TraceLog.event("tap_backfill", "as" to "BUS_BOARD", "leg" to legIdx, "at" to at)
+                    applyTransit(TransitSignal.Kind.TAP, "补读刷卡", at); return@runCatching
+                }
+                if (metroExitSeen || legIdx == 0) return@runCatching
                 if (!trip.legs[legIdx - 1].isMetroOnly() || trip.legs[legIdx].isMetroOnly()) return@runCatching
                 if (boardedAt <= 0 || at - boardedAt < 3 * 60_000L) return@runCatching
                 val bus = busAtStopNow(at)
@@ -1821,7 +1844,8 @@ class CommuteService : Service() {
                     // 还在地铁上（换乘中没下车，或最后一段坐着）且已坐了 3 分钟以上：出站
                     prevMetro && alightAt == 0L && boardedAt > 0 && at - boardedAt > 3 * 60_000L -> TransitSignal.Kind.EXIT
                     // 中间一段地铁：以为还在站台等车，但进站已经 3 分钟以上又刷卡 → 只能是出站
-                    cur.isMetroOnly() && !riding && legIdx < last && stationAt > 0 && at - stationAt > 3 * 60_000L -> TransitSignal.Kind.EXIT
+                    // 只有刷卡进过站才算：进站只是推断出来的（定位 / 时间），这次刷卡多半就是过闸进站
+                    cur.isMetroOnly() && !riding && legIdx < last && stationAt > 0 && stationByTap && at - stationAt > 3 * 60_000L -> TransitSignal.Kind.EXIT
                     // 刚出站 1 分钟内又来一次：同一次出站的重复，不算上公交
                     prevMetro && metroExitSeen && sinceExit < 60_000L -> return
                     riding && cur.isMetroOnly() && at - boardedAt > 3 * 60_000L -> TransitSignal.Kind.EXIT
@@ -1919,6 +1943,48 @@ class CommuteService : Service() {
     private val fpRec = MetroFpRecorder()
     private var fpEta: Map<Long, Long> = emptyMap()
     private val fpSeen = HashSet<Long>()
+    /** 各段地铁的 E1 模型（后台读一次；读历史记录要一两秒，不放主线程） */
+    private val etaCache = java.util.concurrent.ConcurrentHashMap<String, Map<Long, Long>>()
+    private val etaLoading = java.util.Collections.synchronizedSet(HashSet<String>())
+
+    private fun etaFor(legI: Int): Map<Long, Long>? {
+        val key = trip.id.take(8) + ":" + legI
+        etaCache[key]?.let { return it }
+        if (etaLoading.add(key)) {
+            val single = trip.legs.count { it.isMetroOnly() } == 1
+            val learner = tacLearner
+            scope.launch(Dispatchers.IO) {
+                val m = MetroCells.eta(applicationContext, key, if (single && learner != null) { t -> learner.isMetroTac(t) } else null)
+                etaCache[key] = m
+                withContext(Dispatchers.Main) { TraceLog.event("fp_eta_load", "key" to key, "cells" to m.size) }
+            }
+        }
+        return null
+    }
+
+    /**
+     * G5：没在车上（中途才打开 / 重启 / 判漏了上车），却在地下见到一个学过的、不是上车站的基站
+     * → 其实已经在车上了：直接切到这段地铁「车上」，上车时刻和到站时刻都按学到的剩余时间倒推。
+     */
+    private fun joinByCell(s: CellSnap, underground: Boolean): Boolean {
+        if (!underground || riding && trip.legs[legIdx].isMetroOnly()) return false
+        val e = s.enb?.toLong() ?: return false
+        val m = listOf(legIdx, legIdx + 1).firstOrNull { it < trip.legs.size && trip.legs[it].isMetroOnly() } ?: return false
+        val model = etaFor(m) ?: return false
+        val rem = model[e] ?: return false
+        val maxRem = model.values.maxOrNull() ?: return false
+        if (maxRem - rem < 150_000L) return false   // 还在上车站附近：照常等刷卡 / 列车开动
+        val boardAt = s.t - (maxRem - rem)
+        TraceLog.event("metro_join_cell", "leg" to m, "enb" to e, "remS" to rem / 1000, "boardAt" to boardAt)
+        Diag.mark(this, "认出地铁沿途的基站，判断已在车上")
+        var n = 0
+        while (!inMetroRide() && legIdx <= m && n++ < 4) onBoarded(manual = false, at = boardAt)
+        if (!inMetroRide()) return false
+        boardedAt = boardAt
+        fpEta = model; fpEtaAt = s.t + rem
+        saveRun(deadlineAt); kick()
+        return true
+    }
     /** E1：按基站学到的预计到下车站时刻（0 = 没有） */
     private var fpEtaAt = 0L
     private var metroRideOn = false
@@ -1944,21 +2010,23 @@ class CommuteService : Service() {
     private fun onCell(s: CellSnap) {
         if (!::trip.isInitialized || tail || finishing) return
         val l = tacLearner ?: MetroCells.load(this).also { tacLearner = it }
+        val underground = l.isMetroTac(s.nrTac)
+        if (!inMetroRide()) joinByCell(s, underground)
         val inRide = inMetroRide()
         if (inRide) {
+            val legM = if (riding) legIdx else legIdx - 1
             if (!metroRideOn) {
                 metroRideOn = true; metroRideStart = s.t
-                metroRideKey = trip.id.take(8) + ":" + (if (riding) legIdx else legIdx - 1)
-                fpEta = MetroCells.eta(this, metroRideKey); fpSeen.clear(); fpEtaAt = 0L
-                TraceLog.event("fp_eta_load", "key" to metroRideKey, "cells" to fpEta.size)
+                metroRideKey = trip.id.take(8) + ":" + legM
+                fpSeen.clear()
             }
-            val underground = l.isMetroTac(s.nrTac)
+            if (fpEta.isEmpty()) etaFor(legM)?.let { fpEta = it }
             l.sampleRide(s); fpRec.sample(s, underground)
             // E1：地下见到一个新基站、学过它离下车站还有多久 → 用它校准到站时刻
             val e = s.enb?.toLong()
-            val firstCell = fpSeen.isEmpty()
-            // 这一趟的第一个基站是上车站（含站台等车），等多久不定，不拿来校准
-            if (underground && e != null && fpSeen.add(e) && !firstCell) fpEta[e]?.let { rem ->
+            val maxRem = fpEta.values.maxOrNull() ?: 0L
+            // 上车站的基站（含站台等车）等多久不定，不拿来校准；中途重启时第一个基站已在路上，照样用
+            if (underground && e != null && fpSeen.add(e)) fpEta[e]?.takeIf { maxRem - it >= 120_000L }?.let { rem ->
                 fpEtaAt = s.t + rem
                 TraceLog.event("fp_eta", "enb" to e, "remS" to rem / 1000, "eta" to fpEtaAt)
             }
@@ -2012,7 +2080,7 @@ class CommuteService : Service() {
         val l = tacLearner ?: return
         val tac = l.endRide()
         MetroCells.save(this, l)
-        fpEtaAt = 0L; fpSeen.clear()
+        fpEtaAt = 0L; fpSeen.clear(); fpEta = emptyMap()
         // 半路上车的也存：E1 只看到终点还剩多久，从哪站上都一样
         fpRec.finish()?.let { seq ->
             MetroCells.appendRide(this, metroRideKey, org.json.JSONObject()
