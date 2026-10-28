@@ -221,13 +221,14 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
                                     text = { Text("导出行程记录（${days} 天）") },
                                     onClick = { menuOpen = false; com.busnotice.commute.TraceLog.share(ctx) },
                                 )
-                                if (com.busnotice.commute.CommuteService.instance == null) {
-                                    listOf(30, 60).forEach { sp ->
-                                        DropdownMenuItem(
-                                            text = { Text("演示：真实记录回放（${sp}×）") },
-                                            onClick = { menuOpen = false; com.busnotice.commute.DemoPlayer.start(ctx, sp) },
-                                        )
-                                    }
+                                // 行程进行中不能回放（会和真实胶囊打架），但入口留着、置灰说明原因
+                                val tripOn = com.busnotice.commute.CommuteService.instance != null
+                                listOf(30, 60).forEach { sp ->
+                                    DropdownMenuItem(
+                                        text = { Text(if (tripOn) "演示回放（${sp}×）· 行程中不可用" else "演示：真实记录回放（${sp}×）") },
+                                        enabled = !tripOn,
+                                        onClick = { menuOpen = false; com.busnotice.commute.DemoPlayer.start(ctx, sp) },
+                                    )
                                 }
                                 DropdownMenuItem(
                                     text = { Text("重置常去地点") },
