@@ -579,6 +579,16 @@ class CommuteService : Service() {
         }
     }
 
+    /**
+     * 市区公交走走停停，连续 3 次 ≥6 m/s 太苛刻：最近 5 次 GPS 里 ≥3 次 ≥4.5 m/s、至少 1 次 ≥6 m/s，
+     * 且 ≥4 次贴线（最新一次必须贴线）就算在车上。
+     */
+    private fun busRideLikely(): Boolean {
+        if (speeds.size < 4 || routeHits.size < 4) return false
+        val sp = speeds.toList(); val r = routeHits.toList()
+        return sp.count { it >= 4.5f } >= 3 && sp.maxOrNull()!! >= 6f && r.count { it } >= 4 && r.last()
+    }
+
     /** 到这段公交线路（相邻站连成折线）的最近距离，米；没线路数据返回 null */
     private fun lineDistM(loc: Location, leg: Leg): Double? {
         val lines = leg.candidates.filter { !it.isMetro() }.mapNotNull { routes[it.lineId] }.filter { it.size >= 2 }
@@ -1564,8 +1574,10 @@ class CommuteService : Service() {
             speeds.addLast(spd); if (speeds.size > 5) speeds.removeFirst()
             routeHits.addLast(onRoute(loc, trip.legs[legIdx])); if (routeHits.size > 5) routeHits.removeFirst()
             val onLine = routeHits.size >= 3 && routeHits.toList().takeLast(3).all { it }
-            if (nearSince == 0L && boardedAt == 0L && !trip.legs[legIdx].isMetroOnly() &&
-                Motion.classify(speeds.toList(), onLine) == Motion.State.RIDE) {
+            // 不再要求「没到过上车点 / 第一段」：换乘后（boardedAt 已有值）、没在站旁拿到定位的公交段同样适用
+            if (!trip.legs[legIdx].isMetroOnly() &&
+                (Motion.classify(speeds.toList(), onLine) == Motion.State.RIDE || busRideLikely())) {
+                TraceLog.event("bus_board", "by" to "gps", "near" to (nearSince > 0), "spd" to speeds.toList().toString(), "onLine" to routeHits.count { it })
                 speeds.clear(); routeHits.clear()
                 onBoarded(manual = false); return
             }
@@ -1578,8 +1590,8 @@ class CommuteService : Service() {
         if (nearSince > 0 && spd != null && trusted && spd > 6f && !trip.legs[legIdx].isMetroOnly()) {
             fastFixes++
             if (fastFixes >= 3) onBoarded(manual = false)
-        } else if (spd != null && trusted) {
-            fastFixes = 0
+        } else if (spd != null && trusted && spd < 1f && fastFixes > 0) {
+            fastFixes--   // 红灯/进站停一下不清零，真停下来才慢慢减
         }
         // 公交段：GPS 已经是车速却没判上车，记下卡在哪个条件上（每分钟最多一条）
         if (spd != null && trusted && spd > 6f && !trip.legs[legIdx].isMetroOnly() && !riding && loc.time - busFastLogged > 60_000L) {
