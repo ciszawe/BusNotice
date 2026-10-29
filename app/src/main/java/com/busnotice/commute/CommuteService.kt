@@ -863,8 +863,11 @@ class CommuteService : Service() {
                 metro = a.option?.candidate?.isMetro() == true)
         }
         // 到换乘点：离下一段上车点 500 米内，或按乘车时间快到了，弹一次
-        if (legIdx > 0 && boardedAt > 0 && !transferAlerted &&
-            ((nearest != null && nearest <= 500) || (connecting && now >= expectArrive - 180_000))) {
+        // 倒计时只在没有新鲜定位、或定位也说已经不远时才算（10/29 早：离换乘站还有 3.2 公里就按倒计时弹了）
+        val tFresh = loc != null && now - loc.time < 120_000 && loc.accuracy < 200
+        val timeOk = connecting && now >= expectArrive - 180_000 && !(tFresh && nearest != null && nearest > 800)
+        if (legIdx > 0 && boardedAt > 0 && !transferAlerted && ((nearest != null && nearest <= 500) || timeOk)) {
+            TraceLog.event("transfer_alert", "nearest" to nearest?.toInt(), "byTime" to timeOk)
             transferAlerted = true
             val c = a.option?.candidate
             val at = prev?.candidates?.firstOrNull { it.alightName.isNotEmpty() }?.alightName ?: "换乘站"
@@ -1191,13 +1194,20 @@ class CommuteService : Service() {
             ?: (boardedAt + rideMs(legIdx))
         // 公交按沿线距离估过到站时间：取两者晚的，免得时间估短了提前结束
         val eta = if (!metro && busEtaAt > 0) maxOf(timeEta, busEtaAt) else timeEta
-        val near = d != null && d <= 700 && (loc?.accuracy ?: 9999f) < 400
+        // 公交站距常只有 300–500 米，700 米会提前两三站（10/29 晚实测）：公交收到 350 米；地铁仍 700 米
+        val freshLoc = loc != null && now - loc.time < 120_000 && loc.accuracy < 200
+        val near = d != null && (loc?.accuracy ?: 9999f) < 400 &&
+            (if (metro) d <= 700 else d <= 350 + minOf(loc?.accuracy ?: 0f, 50f))
+        // 公交有新鲜沿线投影：过了倒数第二站（只剩 1 站）且离站 ≤ 600 米才算快到
+        val busLast = !metro && bs != null && bs.stopsLeft <= 1 && d != null && d <= 600
         // 地铁段还没拿到站数（服务刚恢复、预取没完成）时，手填的乘车时间不可靠，先不按时间提醒下车
         val etaKnown = !metro || metroRideSec[legIdx] != null || Learn.rideMin(this, trip.id, legIdx) != null
         // 按时间提醒「快到了」：有定位且离下车站 1.5 公里以上时不提醒（地铁里网络定位误差大，放宽精度）
+        // 公交有新鲜定位时只信位置，不按倒计时（倒计时只在没定位时兜底）
         val timeUp = etaKnown && now >= eta - 90_000 && !freshFar &&
-            (d == null || d < 1_500 + (if (metro) (loc?.accuracy ?: 0f) else 0f))
-        if (arriveAlertedAt == 0L && (near || timeUp)) {
+            (if (metro) (d == null || d < 1_500 + (loc?.accuracy ?: 0f)) else !freshLoc)
+        if (arriveAlertedAt == 0L && (near || busLast || timeUp)) {
+            TraceLog.event("arrive_alert", "d" to d?.toInt(), "near" to near, "busLast" to busLast, "timeUp" to timeUp)
             arriveAlertedAt = now
             LiveNotifier.alert(this, "快到 $name 了", "准备下车", metro = metro, id = 1005)
         }
