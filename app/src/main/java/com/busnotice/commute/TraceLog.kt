@@ -67,18 +67,26 @@ object TraceLog {
     private val magRing = ArrayDeque<Pair<Long, Double>>()
 
     /**
-     * [since] 之后第一次出现「列车在跑」的磁场特征：连续 60 秒窗口里至少 40% 的 2 秒样本 msd ≥ 8 μT，返回窗口开头。
-     * 站台上、走路时一般 < 7；坐在车上 5–50 来回跳（按 10 月十几趟地铁记录定的门槛）。
+     * [since] 之后第一次出现「列车在跑」的磁场特征（思路同大阪大学 StationSense：牵引电机工作时车厢磁场持续大幅抖动）：
+     * 90 秒窗口里至少 8 个样本、跨度 ≥45 秒，且 ≥40% 的样本 msd ≥ 8 μT，返回窗口开头。
+     * 按时间而不按样本数：熄屏后系统会把传感器节流到每分钟几条（10/29 实测），按 2 秒一条算会永远凑不够。
      */
     fun magTrainAt(since: Long): Long? {
         val xs = synchronized(magRing) { magRing.filter { it.first >= since } }
-        if (xs.size < 25) return null
-        for (i in 0..xs.size - 25) {
-            val end = xs[i].first + 60_000L
+        for (i in xs.indices) {
+            val end = xs[i].first + 90_000L
             val w = xs.subList(i, xs.size).takeWhile { it.first < end }
-            if (w.size >= 25 && w.count { it.second >= 8.0 } * 10 >= w.size * 4) return xs[i].first
+            if (w.size >= 8 && w.last().first - w.first().first >= 45_000L && w.count { it.second >= 8.0 } * 10 >= w.size * 4) return xs[i].first
         }
         return null
+    }
+
+    // 停站试验（只记录不参与判断）：磁场活跃后安静 ≥25 秒 → 记一条 mag_stop，之后和基站判的 metro_stop 对照
+    private var magMoving = false
+    private var magLastAct = 0L
+    private fun magStopTick(t: Long, sd: Double) {
+        if (sd >= 8.0) { magLastAct = t; magMoving = true }
+        else if (magMoving && t - magLastAct >= 25_000L) { magMoving = false; event("mag_stop", "quietFrom" to magLastAct) }
     }
     private const val RECENT_MAX = 450   // 约 15 分钟：等车上车的判断要回看进站以来的全部窗口
 
@@ -153,6 +161,7 @@ object TraceLog {
                     val sd = sqrt((msq / mn - mean * mean).coerceAtLeast(0.0))
                     o.put("mm", r(mean, 10.0)).put("msd", r(sd, 100.0))
                     synchronized(magRing) { magRing.addLast(t to sd); while (magRing.size > 150) magRing.removeFirst() }
+                    magStopTick(t, sd)
                 }
                 if (pn > 0) o.put("p", r(psum / pn, 100.0))
                 write("env", o)
