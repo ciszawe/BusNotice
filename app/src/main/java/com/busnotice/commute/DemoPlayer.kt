@@ -86,16 +86,12 @@ object DemoPlayer {
                 delay(1000)
             }
             countdown.value = null
-            var vd = PRE.toDouble()
-            var last = System.currentTimeMillis()
+            val t0 = System.currentTimeMillis()
+            val scale = 60.0 / speed.coerceAtLeast(1)   // 60× ≈ 1 分钟版；30× 每段慢一倍
             var lastKey = ""
             val fired = HashSet<Int>()
             while (isActive) {
-                val nowMs = System.currentTimeMillis()
-                // 换乘站干等的那段快进 4 倍，其余按选的倍速
-                val mult = if (vd > XFER + 120 && vd < BUS_ARR - 7 * 60) 4.0 else 1.0
-                vd += (nowMs - last) / 1000.0 * speed * mult; last = nowMs
-                val v = vd.toInt().coerceAtMost(END)
+                val v = virtualAt((System.currentTimeMillis() - t0) / 1000.0 / scale)
                 val f = frame(v)
                 snapshot.value = f.first
                 val key = f.second.title + f.second.text + f.second.progress
@@ -106,7 +102,7 @@ object DemoPlayer {
                 ALERTS.forEachIndexed { i, a ->
                     if (v >= a.at && fired.add(i)) LiveNotifier.alert(app, a.title, a.text, metro = a.metro)
                 }
-                if (v >= END) { delay(5000); break }   // 停在「到家」画面几秒再退出，别一闪而过
+                if (v >= END) { delay(4000); break }   // 停在「到家」画面几秒再退出，别一闪而过
                 delay(250)
             }
             finish(app)
@@ -129,6 +125,38 @@ object DemoPlayer {
     private fun hm(v: Int) = "%02d:%02d".format(v / 3600, v / 60 % 60)
     private fun hms(v: Int) = "%02d:%02d:%02d".format(v / 3600, v / 60 % 60, v % 60)
     private fun minsTo(v: Int, t: Int) = maxOf(1, ceil((t - v) / 60.0).toInt())
+
+    /**
+     * 有重点的节奏：每段真实时间段在演示里播几秒。
+     * 快到地铁站 / 进站、快到换乘站、换乘等车（站内等→现在走→快跑）、准备下车放慢；路上和干等快过。
+     */
+    private val PACE by lazy { listOf(
+        PRE to 0.0, T0 to 4.0,              // 出发前倒推：4 秒
+        IN - 100 to 6.0,                    // 走去地铁站：2 秒
+        RIDE to 12.0,                       // 快到地铁站 + 已进站（本趟 / 下趟）：6 秒
+        XFER - 90 to 17.0,                  // 地铁上：5 秒
+        XFER + 90 to 23.0,                  // 快到换乘站、出站：6 秒
+        LEAVE - 60 to 27.0,                 // 站内等：4 秒（20 分钟压掉）
+        LEAVE to 29.0,
+        RUN to 34.0,                        // 现在走：5 秒
+        BUS_ARR to 38.0,                    // 快跑：4 秒
+        TAP + 60 to 42.0,                   // 车到站、刷卡上车：4 秒
+        PROMPT to 47.0,                     // 公交上：5 秒
+        ALIGHT to 51.0,                     // 准备下车：4 秒
+        HOME to 54.0,                       // 已到站：3 秒
+        END to 56.0,                        // 到家
+    ) }
+
+    /** 演示第 sec 秒对应真实记录里的哪一秒 */
+    private fun virtualAt(sec: Double): Int {
+        val k = PACE
+        if (sec <= 0) return k.first().first
+        for (i in 1 until k.size) {
+            val (v1, s1) = k[i]; val (v0, s0) = k[i - 1]
+            if (sec <= s1) return (v0 + (v1 - v0) * (sec - s0) / (s1 - s0)).toInt()
+        }
+        return END
+    }
 
     private class Alert(val at: Int, val title: String, val text: String, val metro: Boolean = false)
 
