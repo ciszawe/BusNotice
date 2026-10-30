@@ -10,6 +10,7 @@ import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
 import android.os.IBinder
+import android.os.PowerManager
 import android.os.Looper
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
@@ -290,6 +291,7 @@ class CommuteService : Service() {
         resetBusRide(); busRoute = null; busRouteLine = ""
         power = null; highSince = 0L; coolUntil = 0L
         setPower(Power.HIGH) // 预热：先拿到一个准的位置
+        holdCpu(true)
         scope.launch(Dispatchers.IO) { prefetchMetroStops(t); prefetch(t); prefetchLastMetroByName(t) }
         loop?.cancel()
         // 围栏拉起的是一趟全新的行程：不接中断前的进度
@@ -1109,8 +1111,19 @@ class CommuteService : Service() {
         val perHop = maxOf(planned, observed.coerceAtMost(240_000L))
         // E1：有按基站学到的到站时刻就用它，已过几站按剩余时间倒推（区间长短不一，可能差一站）
         if (fpEtaAt > 0 && fpEtaAt > boardedAt) {
-            val left = ((fpEtaAt - now).coerceAtLeast(0L) + planned - 1) / planned
-            return (hops - left.toInt()).coerceIn(0, hops - 1) to fpEtaAt
+            val rem = (fpEtaAt - now).coerceAtLeast(0L)
+            val full = fpEta.values.maxOrNull()?.takeIf { it > 0 }
+            val st = mr.stations
+            // 按真实站间距离分配剩余时间（区间长短不一，均分会慢一站）；10/30 早：已到第 2 站还显示第 1 站
+            val fpPassed = if (full != null && st.size == hops + 1) {
+                val cum = DoubleArray(st.size)
+                for (i in 1 until st.size) cum[i] = cum[i - 1] + Geo.distanceM(st[i - 1].lat, st[i - 1].lng, st[i].lat, st[i].lng)
+                val pos = (1.0 - rem.toDouble() / full).coerceIn(0.0, 1.0) * cum.last()
+                cum.indexOfLast { it <= pos + 150.0 }
+            } else hops - ((rem + planned - 1) / planned).toInt()
+            // 定位对上过的站（metro_stop）也算：两者取大，不再被 E1 压住
+            val anchorPassed = if (metroAnchorIdx >= 0 && metroAnchorAt > 0) metroAnchorIdx + ((now - metroAnchorAt) / perHop).toInt() else -1
+            return maxOf(fpPassed, anchorPassed).coerceIn(0, hops - 1) to fpEtaAt
         }
         return if (metroAnchorIdx >= 0 && metroAnchorAt > 0) {
             val passed = (metroAnchorIdx + ((now - metroAnchorAt) / perHop).toInt()).coerceIn(0, hops - 1)
@@ -1213,7 +1226,9 @@ class CommuteService : Service() {
         }
         // 结束：到了下车站 150 米内；或提醒后过了 5 分钟且超过预计到站时间（地铁 3 分钟、公交 10 分钟）。
         // 新鲜定位显示离下车站 1.5 公里以上时绝不按时间结束（人还在车上，只是车慢）
-        val byLoc = arriveAlertedAt > 0 && d != null && d <= 150
+        // 地铁：出站后拿到较准的定位（≤100 米）离下车站 500 米内，且已过预计到站 → 直接算到了，不等 150 米
+        val metroOut = metro && loc != null && now - loc.time < 120_000 && loc.accuracy <= 100 && d != null && d <= 500 && now >= eta - 60_000L
+        val byLoc = (arriveAlertedAt > 0 && d != null && d <= 150) || metroOut
         val byTime = arriveAlertedAt > 0 && !freshFar && now - arriveAlertedAt > 5 * 60_000L &&
             now > eta + (if (metro) 3 else 10) * 60_000L
         if (byLoc || byTime) {
@@ -1223,7 +1238,7 @@ class CommuteService : Service() {
             }
             TraceLog.event("ride_end", "by" to (if (byLoc) "loc" else "time"))
             // 最后一段是地铁、按位置到站：记下这次实际坐了多久（下次按站推算更准，不再提前说快到了）
-            if (byLoc && metro && boardedAt > 0) {
+            if (byLoc && !metroOut && metro && boardedAt > 0) {
                 val min = ((now - boardedAt) / 60_000L).toInt()
                 val plan = (rideMs(legIdx) / 60_000L).toInt()
                 if (min >= 3 && min in plan / 2..plan * 2 + 5) learnRide(legIdx, min)
@@ -1475,7 +1490,7 @@ class CommuteService : Service() {
             if (placeStart == null && legIdx == 0 && boardedAt == 0L && loc.time >= startedAt - 30_000) placeStart = Location(loc)
             val l = Places.classify(this, loc.latitude, loc.longitude, loc.accuracy)
             if (l != lastPlace) { lastPlace = l; placeSince = loc.time; TraceLog.event("place", "label" to l.name) }
-            if (startLabel == null && loc.time - startedAt < 120_000L) startLabel = l
+            if (startLabel == null && !restored && loc.time - startedAt < 120_000L) startLabel = l
             // H3 兜底：进了家 / 公司（不是出发的那个地方）待满 3 分钟、行程还没结束 → 直接算到了
             if ((l == Places.Label.HOME || l == Places.Label.WORK) && l != startLabel && !arrived && !tail && !finishing &&
                 loc.time - startedAt > 5 * 60_000L && loc.time - placeSince >= 3 * 60_000L) {
@@ -1523,6 +1538,7 @@ class CommuteService : Service() {
         if (instance === this || instance == null) LiveState.snapshot.value = null
         LiveNotifier.replace(this, LiveNotifier.quiet(this, "${trip.name} 已到站", "正在记录到目的地的最后一段路（学习常去地点）"))
         TraceLog.event("tail_start", "by" to by)
+        holdCpu(false)
         stepSensor(false)
         deadlineAt = now + TAIL_MS
         setPower(Power.LOW)
@@ -1622,6 +1638,7 @@ class CommuteService : Service() {
             .putBoolean("manual", manualRun)
             .putInt("busSeg", busMaxSeg).putInt("joinLeg", joinLeg).putInt("joinSkip", joinSkip)
             .putInt("mAnchorIdx", metroAnchorIdx).putLong("mAnchorAt", metroAnchorAt)
+            .putLong("arrAlert", arriveAlertedAt).putBoolean("trAlert", transferAlerted).putLong("fpEtaAt", fpEtaAt)
             .putLong("pendBoard", pendingBoardAt).putBoolean("boardDone", boardCommitted)
             .putString("pendLoc", pendingBoardLoc?.let { "${it.latitude},${it.longitude}" } ?: "").apply()
     }
@@ -1633,6 +1650,18 @@ class CommuteService : Service() {
     }
 
     /** 有同一趟行程的未结束进度就恢复，返回原来的截止时间；没有返回 null */
+    // 行程中保持 CPU 不睡：10/30 早熄屏后进程被冻结 4–5 分钟（传感器、基站、主循环全停），地铁里一点更新都没有
+    private var wl: PowerManager.WakeLock? = null
+    private fun holdCpu(on: Boolean) {
+        runCatching {
+            if (on) {
+                if (wl == null) wl = (getSystemService(POWER_SERVICE) as PowerManager)
+                    .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "busnotice:trip").apply { setReferenceCounted(false) }
+                wl?.acquire(100 * 60_000L)   // 最多 100 分钟，防忘记释放
+            } else wl?.takeIf { it.isHeld }?.release()
+        }
+    }
+
     private fun restoreRun(t: Trip): Long? {
         val p = runPrefs()
         val dl = p.getLong("deadline", 0)
@@ -1653,6 +1682,9 @@ class CommuteService : Service() {
         rideLearned = true // 中断过的这趟不再学乘车时长，免得样本不准
         p.getInt("joinLeg", -1).takeIf { it in t.legs.indices }?.let { pendingJoin = it to p.getInt("joinSkip", 0) }
         metroAnchorIdx = p.getInt("mAnchorIdx", -1); metroAnchorAt = p.getLong("mAnchorAt", 0L)
+        // 提醒过的不再重复弹（10/30 早：被杀重启后又弹一次「准备下车」，人已经到公司了）
+        arriveAlertedAt = p.getLong("arrAlert", 0L); transferAlerted = p.getBoolean("trAlert", false)
+        fpEtaAt = p.getLong("fpEtaAt", 0L)
         busMaxSeg = p.getInt("busSeg", -1); busSeg = busMaxSeg   // 站点列表不存，恢复后重新取
         restored = true
         val rc = p.getString("ridingCand", "") ?: ""
@@ -2192,6 +2224,7 @@ class CommuteService : Service() {
     }
 
     private fun finish() {
+        holdCpu(false)
         if (metroRideOn) runCatching { endMetroRide() }
         if (busMovingOn) runCatching { busMovingOn = false; tacLearner?.let { it.endSurface(); MetroCells.save(this, it) } }
         TraceLog.onCell = null
@@ -2216,6 +2249,7 @@ class CommuteService : Service() {
     }
 
     override fun onDestroy() {
+        holdCpu(false)
         if (!finishing) { Diag.mark(this, "服务被系统停止（非主动结束）"); TraceLog.stop() }
         try { lm?.removeUpdates(listener) } catch (_: Exception) { }
         // 只有自己还是当前实例（或没有更新的实例）时才清内存里的看板，免得旧实例的 onDestroy 把新实例刚设的状态清掉。
