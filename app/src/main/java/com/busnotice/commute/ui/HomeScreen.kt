@@ -115,6 +115,9 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
     val trips = remember(resumeTick, version) { TripStore.all(ctx) }
     val live by LiveState.snapshot.collectAsState()
     val demo by com.busnotice.commute.DemoPlayer.snapshot.collectAsState()
+    val demoCount by com.busnotice.commute.DemoPlayer.countdown.collectAsState()
+    // 演示（含倒计时）期间：首页只放虚构的行程卡、不显示当前地点，录屏不露真实信息
+    val demoOn = demo != null || demoCount != null
     val adviceFlow by com.busnotice.commute.DepartAdvisor.current.collectAsState()
     var nowTick by remember { mutableStateOf(System.currentTimeMillis()) }
     // 出发建议卡片：每 20 秒刷新倒计时；过期 / 行程开始了就自动消失
@@ -249,19 +252,23 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
                             }
                         }
                     }
-                    placeText?.let { PlaceChip(it, dark) }
+                    if (!demoOn) placeText?.let { PlaceChip(it, dark) }
                   }
                 }
                 val demoBoard = demo
+                demoCount?.let { n ->
+                    item(key = "demo-count") { PlaceChip("演示 $n 秒后开始 · 现在可以回到桌面", dark) }
+                }
                 if (demoBoard != null) {
                     item(key = "demo-badge") { PlaceChip(com.busnotice.commute.DemoPlayer.BADGE, dark) }
                     item(key = "demo") { LiveBoard(demoBoard, com.busnotice.commute.DemoPlayer.trip, dark) }
                 }
                 val board = if (demoBoard != null) null else live
-                if (demoBoard == null && board == null && pendingTrip == null && advice != null) {
+                if (!demoOn && board == null && pendingTrip == null && advice != null) {
                     item(key = "depart") { DepartBoard(advice!!, nowTick, dark) }
                 }
-                if (board != null && pendingTrip == null) {
+                if (demoOn) Unit
+                else if (board != null && pendingTrip == null) {
                     item(key = "live") { LiveBoard(board, trips.firstOrNull { it.id == board.tripId }, dark) }
                 } else if (pendingTrip != null && !pendingExpired) {
                     // 服务 30 秒内还没起来就不再显示占位
@@ -271,14 +278,19 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
                 // 缺必需设置时放上面显眼处，全齐了就放到列表最后
                 val permUrgent = perms.any { !it.granted && !it.optional }
                 if (permUrgent) item(key = "perm") { PermRow(perms, dark) { permSheet = true } }
-                if (trips.isEmpty()) item {
+                if (!demoOn && trips.isEmpty()) item {
                     Column(Modifier.fillMaxWidth().padding(vertical = 48.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                         Text("还没有行程", style = MaterialTheme.typography.titleMedium, color = ink)
                         Spacer(Modifier.height(4.dp))
                         Text("新建一条，选好上车站和时间就行", style = MaterialTheme.typography.bodyMedium, color = dimColor)
                     }
                 }
-                items(trips, key = { it.id }) { t ->
+                if (demoOn) items(com.busnotice.commute.DemoPlayer.showTrips, key = { "demo-" + it.id }) { t ->
+                    TripCard(
+                        trip = t, running = demo?.tripId == t.id, dark = dark,
+                        onToggle = {}, onTest = {}, onEdit = {}, onReverse = {}, onDelete = {}, onRestart = {}, onApplyLearned = {},
+                    )
+                } else items(trips, key = { it.id }) { t ->
                     TripCard(
                         trip = t,
                         running = live?.tripId == t.id,
