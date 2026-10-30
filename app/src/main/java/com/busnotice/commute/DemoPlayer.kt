@@ -13,40 +13,40 @@ import kotlinx.coroutines.launch
 import kotlin.math.ceil
 
 /**
- * 演示：真实记录回放（录屏做宣传片用）。
+ * 演示回放（录屏做宣传片用）。
  *
- * 时间点取自一次真实行程（进站、到换乘站、刷卡上公交、提醒下车、到家），按 30× / 60× 加速，
- * 在首页看板和流体云上按真实界面播放一遍。线路名、站名全部是虚构的，看板上和胶囊上都标「真实记录回放」。
+ * 一趟压缩过的回家行程：地铁 5 站 → 换乘站内等 2 分钟 → 现在走 → 公交 5 站 → 到家，
+ * 提醒文案和判断逻辑同真实行程，30× 匀速约 1 分钟。线路名、站名全部是虚构的。
  * 不读任何真实数据、不联网、不写行程记录；正在跑真实行程时不能启动。
  */
 object DemoPlayer {
     const val TRIP_ID = "demo-replay"
-    const val BADGE = "真实记录回放 · 站点均为虚构"
+    const val BADGE = "演示回放 · 站点均为虚构"
 
     private const val METRO = "星河线"
     private const val BUS = "K7路"
     private val METRO_STOPS = listOf("云杉路", "望江", "松柏里", "文昌宫", "白鹭洲", "枫林")
-    private val BUS_STOPS = listOf("枫林站东", "槐荫路", "明德桥", "观澜", "青禾巷", "晓月湖", "石泉", "柳岸", "青石桥")
+    private val BUS_STOPS = listOf("枫林站东", "槐荫路", "明德桥", "观澜", "晓月湖", "青石桥")
 
-    // 真实记录里的时刻（当天秒数）
+    // 演示时间线（压缩过的一趟：地铁 5 站、公交 5 站、换乘站只等 2 分钟），提醒文案和判断逻辑同真实行程
     private fun s(h: Int, m: Int, sec: Int = 0) = h * 3600 + m * 60 + sec
-    private val PRE = s(12, 2)            // 出发前：按换乘公交倒推的出门时刻
-    private val T0 = s(12, 8)
-    private val IN = s(12, 12, 41)        // 地下基站认出已进站
-    private val RIDE = s(12, 14)
-    private val XFER = s(12, 31, 41)      // 到换乘站
-    private val BUS_ARR = s(12, 53, 30)
-    private val TAP = s(12, 53, 59)       // 刷卡上公交
-    private val PROMPT = s(13, 15)        // 提醒准备下车
-    private val ALIGHT = s(13, 17)
-    private val HOME = s(13, 18)          // 到家
-    private val END = HOME + 120
-
+    private val PRE = s(12, 5)            // 出发前：按换乘公交倒推，3 分钟后走
+    private val T0 = s(12, 8)             // 现在走
+    private val IN = s(12, 11)            // 已进站
+    private val RIDE = s(12, 12)          // 列车进站、上车
+    private val XFER = s(12, 19, 30)      // 到换乘站（5 站 × 1.5 分钟）
+    private val WALK = 3                  // 换乘步行分钟
+    private val BUS_ARR = XFER + 6 * 60   // 出站时公交还有 6 分钟 → 站内等 2 分钟再走
+    private val TAP = BUS_ARR + 30        // 刷卡上公交
+    private val ALIGHT = TAP + 5 * 90     // 公交 5 站 × 1.5 分钟
+    private val PROMPT = ALIGHT - 100     // 提醒准备下车
+    private val HOME = ALIGHT + 40        // 到站后停一下再显示「到家了」
+    private val END = HOME + 20
     val trip = Trip(
         id = TRIP_ID, name = "回家", startMinute = 12 * 60, endMinute = 13 * 60 + 20,
         legs = listOf(
-            Leg(listOf(Candidate(Candidate.Type.METRO, METRO, METRO_STOPS.first(), 0.0, 0.0, alightName = METRO_STOPS.last())), rideMin = 18),
-            Leg(listOf(Candidate(Candidate.Type.BUS, BUS, BUS_STOPS.first(), 0.0, 0.0, alightName = BUS_STOPS.last())), rideMin = 22, transferWalkMin = 4),
+            Leg(listOf(Candidate(Candidate.Type.METRO, METRO, METRO_STOPS.first(), 0.0, 0.0, alightName = METRO_STOPS.last())), rideMin = 8),
+            Leg(listOf(Candidate(Candidate.Type.BUS, BUS, BUS_STOPS.first(), 0.0, 0.0, alightName = BUS_STOPS.last())), rideMin = 8, transferWalkMin = WALK),
         ),
     )
 
@@ -80,18 +80,19 @@ object DemoPlayer {
             for (n in COUNTDOWN downTo 1) {
                 countdown.value = n
                 LiveNotifier.replace(app, LiveNotifier.build(app, LiveNotifier.Visual(
-                    title = "演示 $n 秒后开始", text = "可以回到桌面了 · 真实记录回放", short = "${n}秒", sub = "真实记录回放",
+                    title = "演示 $n 秒后开始", text = "可以回到桌面了 · 演示回放", short = "${n}秒", sub = "演示回放",
                     progress = null, stops = 0, trackerRes = R.drawable.ic_metro, metro = true, riding = false,
                 )))
                 delay(1000)
             }
             countdown.value = null
             val t0 = System.currentTimeMillis()
-            val scale = 60.0 / speed.coerceAtLeast(1)   // 60× ≈ 1 分钟版；30× 每段慢一倍
+            // 匀速播放：1 分钟版 = 30×（1 分钟 2 秒，站名、倒计时都看得清），2 分钟版 = 15×
+            val rate = if (speed >= 60) 30.0 else 15.0
             var lastKey = ""
             val fired = HashSet<Int>()
             while (isActive) {
-                val v = virtualAt((System.currentTimeMillis() - t0) / 1000.0 / scale)
+                val v = (PRE + (System.currentTimeMillis() - t0) / 1000.0 * rate).toInt().coerceAtMost(END)
                 val f = frame(v)
                 snapshot.value = f.first
                 val key = f.second.title + f.second.text + f.second.progress
@@ -102,7 +103,7 @@ object DemoPlayer {
                 ALERTS.forEachIndexed { i, a ->
                     if (v >= a.at && fired.add(i)) LiveNotifier.alert(app, a.title, a.text, metro = a.metro)
                 }
-                if (v >= END) { delay(4000); break }   // 停在「到家」画面几秒再退出，别一闪而过
+                if (v >= END) { delay(5000); break }   // 停在「到家」画面几秒再退出，别一闪而过
                 delay(250)
             }
             finish(app)
@@ -126,52 +127,18 @@ object DemoPlayer {
     private fun hms(v: Int) = "%02d:%02d:%02d".format(v / 3600, v / 60 % 60, v % 60)
     private fun minsTo(v: Int, t: Int) = maxOf(1, ceil((t - v) / 60.0).toInt())
 
-    /**
-     * 有重点的节奏：每段真实时间段在演示里播几秒。
-     * 快到地铁站 / 进站、快到换乘站、换乘等车（站内等→现在走→快跑）、准备下车放慢；路上和干等快过。
-     */
-    private val PACE by lazy { listOf(
-        PRE to 0.0, T0 to 4.0,              // 出发前倒推：4 秒
-        IN - 100 to 6.0,                    // 走去地铁站：2 秒
-        RIDE to 12.0,                       // 快到地铁站 + 已进站（本趟 / 下趟）：6 秒
-        XFER - 90 to 17.0,                  // 地铁上：5 秒
-        XFER + 90 to 23.0,                  // 快到换乘站、出站：6 秒
-        LEAVE - 60 to 27.0,                 // 站内等：4 秒（20 分钟压掉）
-        LEAVE to 29.0,
-        RUN to 34.0,                        // 现在走：5 秒
-        BUS_ARR to 38.0,                    // 快跑：4 秒
-        TAP + 60 to 42.0,                   // 车到站、刷卡上车：4 秒
-        PROMPT to 47.0,                     // 公交上：5 秒
-        ALIGHT to 51.0,                     // 准备下车：4 秒
-        HOME to 54.0,                       // 已到站：3 秒
-        END to 56.0,                        // 到家
-    ) }
-
-    /** 演示第 sec 秒对应真实记录里的哪一秒 */
-    private fun virtualAt(sec: Double): Int {
-        val k = PACE
-        if (sec <= 0) return k.first().first
-        for (i in 1 until k.size) {
-            val (v1, s1) = k[i]; val (v0, s0) = k[i - 1]
-            if (sec <= s1) return (v0 + (v1 - v0) * (sec - s0) / (s1 - s0)).toInt()
-        }
-        return END
-    }
-
     private class Alert(val at: Int, val title: String, val text: String, val metro: Boolean = false)
 
     // 和真实行程一样的弹窗（文案格式取自真实提醒）
     private val ALERTS by lazy { listOf(
-        Alert(T0, "现在走 · $METRO", "步行约 5 分钟到${METRO_STOPS.first()} · 本趟约 6 分钟进站 · 下趟约 12 分钟", true),
-        Alert(IN - 100, "快到 ${METRO_STOPS.first()} · $METRO 约3分", "步行约 2 分钟到${METRO_STOPS.first()} · 本趟约 3 分钟进站 · 下趟约 9 分钟", true),
+        Alert(T0, "现在走 · $METRO", "步行约 3 分钟到${METRO_STOPS.first()} · 本趟约 4 分钟进站 · 下趟约 10 分钟", true),
+        Alert(IN - 60, "快到 ${METRO_STOPS.first()} · $METRO 约2分", "步行约 1 分钟到${METRO_STOPS.first()} · 本趟约 2 分钟进站 · 下趟约 8 分钟", true),
         Alert(IN, "已进站 · $METRO", "本趟约 1 分钟进站 · 下趟约 7 分钟", true),
-        Alert(XFER - 90, "快到 ${METRO_STOPS.last()} · $BUS 约22分", "步行约 4 分钟到${BUS_STOPS.first()} · 先在站内等，到点叫你"),
-        Alert(LEAVE, "现在走 · $BUS", "$BUS 6 分钟到 · 还有 2 站 · 步行 4 分钟"),
-        Alert(RUN, "快跑 · $BUS", "$BUS 2 分钟到站，步行要 2 分钟，有点悬"),
-        Alert(PROMPT, "快到 ${BUS_STOPS.last()} 了", "准备下车 · 真实记录回放"),
+        Alert(XFER - 90, "快到 ${METRO_STOPS.last()} · $BUS 约7分", "步行约 $WALK 分钟到${BUS_STOPS.first()} · 先在站内等，到点叫你"),
+        Alert(LEAVE, "现在走 · $BUS", "$BUS 4 分钟到 · 还有 2 站 · 步行 $WALK 分钟"),
+        Alert(PROMPT, "快到 ${BUS_STOPS.last()} 了", "准备下车"),
     ) }
-    private val LEAVE get() = BUS_ARR - 6 * 60   // 公交 6 分钟到、步行 4 分钟 + 余量 → 现在走
-    private val RUN get() = BUS_ARR - 2 * 60     // 路上耽搁了：车 2 分钟到、还要走 2 分钟 → 快跑
+    private val LEAVE get() = BUS_ARR - (WALK + 1) * 60   // 步行 3 分钟 + 1 分钟余量 → 现在走
 
     /** 地铁本趟 / 下趟（6 分钟一班，本趟 12:14 进站） */
     private fun trainText(v: Int): String {
@@ -208,13 +175,13 @@ object DemoPlayer {
                 snap(1, "${leaveIn}分后走", "在站内等 · $BUS ${m} 分钟到 · 还有 ${maxOf(1, ceil(m / 2.5).toInt())} 站 · 步行 $walk 分钟",
                     Decision.Mode.LEAVE_LATER)
             }
-            v < RUN -> snap(1, "现在走", "$BUS ${minsTo(v, BUS_ARR)} 分钟到 · 还有 ${maxOf(1, ceil(minsTo(v, BUS_ARR) / 2.5).toInt())} 站 · 步行 $walk 分钟",
+            v < BUS_ARR - 30 -> snap(1, "现在走", "$BUS ${minsTo(v, BUS_ARR)} 分钟到 · 还有 ${maxOf(1, ceil(minsTo(v, BUS_ARR) / 2.5).toInt())} 站 · 步行 $walk 分钟",
                 Decision.Mode.LEAVE_NOW)
-            v < BUS_ARR -> snap(1, "快跑", "$BUS ${minsTo(v, BUS_ARR)} 分钟到站，步行要 ${minsTo(v, BUS_ARR)} 分钟，有点悬", Decision.Mode.HURRY)
+            v < BUS_ARR -> snap(1, "车快到了", "$BUS 即将进站 · 你已到${BUS_STOPS.first()}", Decision.Mode.AT_STOP)
             v < TAP -> snap(1, "车到站了", "$BUS 已进站 · ${BUS_STOPS.first()}", Decision.Mode.AT_STOP)
-            v < TAP + 60 -> snap(1, "已上车", "刷卡确认上车 · ${hms(TAP)}", null, riding = true, passed = 0, stops = BUS_STOPS)
+            v < TAP + 30 -> snap(1, "已上车", "刷卡确认上车 · ${hms(TAP)}", null, riding = true, passed = 0, stops = BUS_STOPS)
             v < PROMPT -> {
-                val p = ((v - TAP) * (BUS_STOPS.size - 1) / (ALIGHT - TAP)).coerceIn(0, BUS_STOPS.size - 3)
+                val p = ((v - TAP) * (BUS_STOPS.size - 1) / (ALIGHT - TAP)).coerceIn(0, BUS_STOPS.size - 2)
                 snap(1, "${BUS_STOPS.size - 1 - p}站", "下一站 ${BUS_STOPS[p + 1]} · 约 ${hm(ALIGHT)} 下车", null,
                     riding = true, passed = p, stops = BUS_STOPS)
             }
@@ -229,7 +196,7 @@ object DemoPlayer {
         val line = if (metro) METRO else BUS
         val prog = sn.progress ?: sn.stopsPassed?.let { p -> sn.stopsTotal?.let { t -> p * 100 / t } }
         val vis = LiveNotifier.Visual(
-            title = "${sn.headline} · $line", text = sn.detail, short = sn.headline, sub = "真实记录回放",
+            title = "${sn.headline} · $line", text = sn.detail, short = sn.headline, sub = "演示回放",
             progress = prog, stops = sn.stopsTotal ?: 0,
             trackerRes = if (metro) R.drawable.ic_metro else R.drawable.ic_bus, metro = metro, riding = sn.riding,
         )
