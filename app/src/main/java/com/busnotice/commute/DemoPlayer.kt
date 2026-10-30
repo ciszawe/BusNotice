@@ -30,6 +30,7 @@ object DemoPlayer {
 
     // 真实记录里的时刻（当天秒数）
     private fun s(h: Int, m: Int, sec: Int = 0) = h * 3600 + m * 60 + sec
+    private val PRE = s(12, 2)            // 出发前：按换乘公交倒推的出门时刻
     private val T0 = s(12, 8)
     private val IN = s(12, 12, 41)        // 地下基站认出已进站
     private val RIDE = s(12, 14)
@@ -61,8 +62,10 @@ object DemoPlayer {
             val t0 = System.currentTimeMillis()
             var lastKey = ""
             var prompted = false
+            var leaveAlerted = false
+            var xferAlerted = false
             while (isActive) {
-                val v = T0 + ((System.currentTimeMillis() - t0) * speed / 1000L).toInt()
+                val v = PRE + ((System.currentTimeMillis() - t0) * speed / 1000L).toInt()
                 if (v >= END) break
                 val f = frame(v)
                 snapshot.value = f.first
@@ -71,6 +74,15 @@ object DemoPlayer {
                     lastKey = key
                     LiveNotifier.ensureChannels(app)
                     LiveNotifier.replace(app, LiveNotifier.build(app, f.second))
+                }
+                if (!leaveAlerted && v >= T0) {
+                    leaveAlerted = true
+                    LiveNotifier.alert(app, "现在走 · $METRO", "${hm(XFER)} 到${METRO_STOPS.last()} · 换 $BUS · 真实记录回放", metro = true)
+                }
+                if (!xferAlerted && v >= XFER - 90) {
+                    xferAlerted = true
+                    LiveNotifier.alert(app, "快到 ${METRO_STOPS.last()} · $BUS",
+                        "步行约 ${trip.legs[1].transferWalkMin} 分钟到${BUS_STOPS.first()} · 真实记录回放")
                 }
                 if (!prompted && v >= PROMPT) {
                     prompted = true
@@ -109,6 +121,8 @@ object DemoPlayer {
             fromStop = stops?.first(), toStop = stops?.last(),
         )
         val sn = when {
+            v < T0 -> snap(0, "${minsTo(v, T0)}分钟后走", "按 $BUS 倒推 · ${hm(T0)} 出发 · ${hm(XFER)} 到${METRO_STOPS.last()}换乘",
+                Decision.Mode.LEAVE_LATER, progress = ((v - PRE) * 100 / (T0 - PRE)))
             v < IN -> snap(0, "${minsTo(v, IN)}分钟", "步行去${METRO_STOPS.first()}站 · $METRO", Decision.Mode.METRO,
                 progress = ((v - T0) * 100 / (IN - T0)))
             v < RIDE -> snap(0, "已进站", "地下基站认出已进站 · ${hms(IN)}", Decision.Mode.METRO)
