@@ -228,7 +228,7 @@ fun HomeScreen(resumeTick: Int, onNew: () -> Unit, onEdit: (Trip) -> Unit) {
                                 val tripOn = com.busnotice.commute.CommuteService.instance != null
                                 listOf(30, 60).forEach { sp ->
                                     DropdownMenuItem(
-                                        text = { Text(if (tripOn) "演示回放（${sp}×）· 行程中不可用" else "演示：真实记录回放（${sp}×）") },
+                                        text = { val len = if (sp >= 60) "约 1 分钟" else "约 2 分钟"; Text(if (tripOn) "演示回放（$len）· 行程中不可用" else "演示：真实记录回放（$len）") },
                                         enabled = !tripOn,
                                         onClick = { menuOpen = false; com.busnotice.commute.DemoPlayer.start(ctx, sp) },
                                     )
