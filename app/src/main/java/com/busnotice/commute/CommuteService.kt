@@ -697,7 +697,11 @@ class CommuteService : Service() {
         }
 
         // 换乘中：还在上一段车上，按「剩余乘车 + 换乘步行」估算到下一站的时间
-        val expectArrive = if (boardedAt > 0 && prev != null) (anchoredArrive(legIdx - 1) ?: (boardedAt + rideMs(legIdx - 1))) else 0L
+        // 前一段是地铁且有基站学到的到站时刻（E1，近 14 天 8 趟学出来的，10/30 晚误差 <1 分钟）：优先用它，
+        // 不再用「上车时刻 + 平均乘车时长」——上车时刻是倒推的，常把站台候车也算进去，偏早 2–3 分钟
+        val fpArrive = if (prev?.isMetroOnly() == true && fpEtaAt > boardedAt && now < fpEtaAt + 10 * 60_000L) fpEtaAt else 0L
+        val expectArrive = if (boardedAt > 0 && prev != null)
+            (fpArrive.takeIf { it > 0 } ?: anchoredArrive(legIdx - 1) ?: (boardedAt + rideMs(legIdx - 1))) else 0L
         val fromMetro = prev?.isMetroOnly() == true
         // 判断下了地铁：地理围栏（换乘站附近）+ 移动速度 + 计步，三者配合
         if (fromMetro && expectArrive > 0 && alightAt == 0L) {
@@ -867,7 +871,9 @@ class CommuteService : Service() {
         // 到换乘点：离下一段上车点 500 米内，或按乘车时间快到了，弹一次
         // 倒计时只在没有新鲜定位、或定位也说已经不远时才算（10/29 早：离换乘站还有 3.2 公里就按倒计时弹了）
         val tFresh = loc != null && now - loc.time < 120_000 && loc.accuracy < 200
-        val timeOk = connecting && now >= expectArrive - 180_000 && !(tFresh && nearest != null && nearest > 800)
+        // 提前量：基站到站时刻准，提前 90 秒（约前一站开出）；只有平均时长时才提前 3 分钟
+        val lead = if (fpArrive > 0) 90_000L else 180_000L
+        val timeOk = connecting && now >= expectArrive - lead && !(tFresh && nearest != null && nearest > 800)
         if (legIdx > 0 && boardedAt > 0 && !transferAlerted && ((nearest != null && nearest <= 500) || timeOk)) {
             TraceLog.event("transfer_alert", "nearest" to nearest?.toInt(), "byTime" to timeOk)
             transferAlerted = true
@@ -1100,7 +1106,31 @@ class CommuteService : Service() {
     private fun connectPassed(r: ChelaileApi.MetroRoute, total: Long, now: Long): Int {
         val hops = r.hops.coerceAtLeast(1)
         if (arriveAnchorAt > 0) return hops - 1
+        fpPassed(r, now)?.let { return it.coerceIn(0, hops - 1) }
         return if (total <= 0) 0 else (((now - boardedAt).toDouble() / total) * hops).toInt().coerceIn(0, hops - 1)
+    }
+
+    /**
+     * 列车开出上车站那一刻的剩余时间。模型里最大的值是上车站基站，含站台候车（10/30 晚：最大 1397 秒，
+     * 实际 18:50:51 开车、19:08:30 到，只有约 1060 秒）。取第一个离开上车站（比最大值少 150 秒以上）的基站 + 30 秒。
+     */
+    private fun depRem(model: Map<Long, Long>): Long? {
+        val mx = model.values.maxOrNull() ?: return null
+        val moving = model.values.filter { mx - it >= 150_000L }.maxOrNull() ?: return mx
+        return minOf(mx, moving + 30_000L)
+    }
+
+    /** E1：按基站学到的剩余时间 + 真实站间距离，算已过几站；没有 E1 返回 null */
+    private fun fpPassed(mr: ChelaileApi.MetroRoute, now: Long): Int? {
+        if (fpEtaAt <= 0 || fpEtaAt <= boardedAt) return null
+        val full = depRem(fpEta)?.takeIf { it > 0 } ?: return null
+        val st = mr.stations
+        if (st.size != mr.hops + 1 || st.size < 2) return null
+        val rem = (fpEtaAt - now).coerceAtLeast(0L)
+        val cum = DoubleArray(st.size)
+        for (i in 1 until st.size) cum[i] = cum[i - 1] + Geo.distanceM(st[i - 1].lat, st[i - 1].lng, st[i].lat, st[i].lng)
+        val pos = (1.0 - rem.toDouble() / full).coerceIn(0.0, 1.0) * cum.last()
+        return cum.indexOfLast { it <= pos + 150.0 }
     }
 
     private fun metroProgress(mr: ChelaileApi.MetroRoute, total: Long, now: Long): Pair<Int, Long> {
@@ -1112,7 +1142,7 @@ class CommuteService : Service() {
         // E1：有按基站学到的到站时刻就用它，已过几站按剩余时间倒推（区间长短不一，可能差一站）
         if (fpEtaAt > 0 && fpEtaAt > boardedAt) {
             val rem = (fpEtaAt - now).coerceAtLeast(0L)
-            val full = fpEta.values.maxOrNull()?.takeIf { it > 0 }
+            val full = depRem(fpEta)?.takeIf { it > 0 }
             val st = mr.stations
             // 按真实站间距离分配剩余时间（区间长短不一，均分会慢一站）；10/30 早：已到第 2 站还显示第 1 站
             val fpPassed = if (full != null && st.size == hops + 1) {
@@ -2088,7 +2118,7 @@ class CommuteService : Service() {
         val rem = model[e] ?: return false
         val maxRem = model.values.maxOrNull() ?: return false
         if (maxRem - rem < 150_000L) return false   // 还在上车站附近：照常等刷卡 / 列车开动
-        val boardAt = s.t - (maxRem - rem)
+        val boardAt = s.t - ((depRem(model) ?: maxRem) - rem).coerceAtLeast(0L)   // 开车时刻，不含站台候车
         TraceLog.event("metro_join_cell", "leg" to m, "enb" to e, "remS" to rem / 1000, "boardAt" to boardAt)
         Diag.mark(this, "认出地铁沿途的基站，判断已在车上")
         var n = 0
