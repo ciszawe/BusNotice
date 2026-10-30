@@ -226,7 +226,8 @@ private fun Pill(text: String, bg: Color, fg: Color, border: Color?, modifier: M
 /** 站点圆点：已过白色、当前黄色带光、未到暗色、下车站黄色圆环 */
 @Composable
 private fun StopDots(passed: Int, total: Int, from: String? = null, curName: String? = null, to: String? = null) {
-    val cur = passed.coerceAtMost(total - 1).coerceAtLeast(0)
+    // 到了下车站（passed == total）黄点就落在终点上，不再停在上一站
+    val cur = passed.coerceIn(0, total)
     val dense = total > 14   // 站太多就不画中间的小点，只画线
     Column(Modifier.padding(top = 16.dp)) {
         Canvas(Modifier.fillMaxWidth().height(18.dp)) {
