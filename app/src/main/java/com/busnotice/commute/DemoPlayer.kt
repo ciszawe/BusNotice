@@ -43,12 +43,29 @@ object DemoPlayer {
     private val END = HOME + 120
 
     val trip = Trip(
-        id = TRIP_ID, name = "回家",
+        id = TRIP_ID, name = "回家", startMinute = 12 * 60, endMinute = 13 * 60 + 20,
         legs = listOf(
             Leg(listOf(Candidate(Candidate.Type.METRO, METRO, METRO_STOPS.first(), 0.0, 0.0, alightName = METRO_STOPS.last())), rideMin = 18),
             Leg(listOf(Candidate(Candidate.Type.BUS, BUS, BUS_STOPS.first(), 0.0, 0.0, alightName = BUS_STOPS.last())), rideMin = 22, transferWalkMin = 4),
         ),
     )
+
+    // 首页在演示期间显示的行程卡：全是虚构的，不露真实线路和时间
+    val showTrips = listOf(
+        Trip(
+            id = "demo-out", name = "出门",
+            legs = listOf(
+                Leg(listOf(Candidate(Candidate.Type.BUS, BUS, BUS_STOPS.last(), 0.0, 0.0, alightName = BUS_STOPS.first())), rideMin = 22),
+                Leg(listOf(Candidate(Candidate.Type.METRO, METRO, METRO_STOPS.last(), 0.0, 0.0, alightName = METRO_STOPS.first())), rideMin = 18, transferWalkMin = 4),
+            ),
+            startMinute = 8 * 60, endMinute = 8 * 60 + 40,
+        ),
+        trip,
+    )
+
+    /** 开始前的倒计时（秒），给录屏的人时间回到桌面；null = 没在倒计时 */
+    val countdown = MutableStateFlow<Int?>(null)
+    private const val COUNTDOWN = 8
 
     val snapshot = MutableStateFlow<LiveSnapshot?>(null)
     private var job: Job? = null
@@ -59,6 +76,16 @@ object DemoPlayer {
         stop(ctx)
         val app = ctx.applicationContext
         job = CoroutineScope(SupervisorJob() + Dispatchers.Main).launch {
+            LiveNotifier.ensureChannels(app)
+            for (n in COUNTDOWN downTo 1) {
+                countdown.value = n
+                LiveNotifier.replace(app, LiveNotifier.build(app, LiveNotifier.Visual(
+                    title = "演示 $n 秒后开始", text = "可以回到桌面了 · 真实记录回放", short = "${n}秒", sub = "真实记录回放",
+                    progress = null, stops = 0, trackerRes = R.drawable.ic_metro, metro = true, riding = false,
+                )))
+                delay(1000)
+            }
+            countdown.value = null
             val t0 = System.currentTimeMillis()
             var lastKey = ""
             var prompted = false
@@ -102,6 +129,7 @@ object DemoPlayer {
 
     private fun finish(ctx: Context) {
         snapshot.value = null
+        countdown.value = null
         job = null
         if (CommuteService.instance == null) runCatching { NotificationManagerCompat.from(ctx).cancel(LiveNotifier.LIVE_ID) }
     }
