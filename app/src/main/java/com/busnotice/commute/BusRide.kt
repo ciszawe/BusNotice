@@ -71,4 +71,24 @@ object BusRide {
         val after = lengthM(stops.subList(bestSeg + 1, stops.size))
         return Snap(bestSeg, bestT, bestOff, segLen * (1 - bestT) + after, stops.size - 1 - bestSeg)
     }
+
+    /**
+     * 没有新定位时按车速往前推：从上一次投影沿线再走 meters 米（只用于显示站数，不用于提醒）。
+     * 最多推到倒数第二站，免得没定位时显示「下一站就是」。
+     */
+    fun advance(stops: List<ChelaileApi.StopPoint>, from: Snap, meters: Double): Snap {
+        val n = stops.size - 1
+        if (n < 3 || meters <= 0 || from.seg >= n - 2) return from
+        fun len(i: Int) = Geo.distanceM(stops[i].lat, stops[i].lng, stops[i + 1].lat, stops[i + 1].lng)
+        var seg = from.seg; var frac = from.frac; var left = meters
+        while (left > 0) {
+            val l = len(seg)
+            val rest = l * (1 - frac)
+            if (seg >= n - 2 || left < rest) { if (l > 0) frac += left / l; break }
+            left -= rest; seg++; frac = 0.0
+        }
+        frac = frac.coerceIn(0.0, 0.95)
+        val after = lengthM(stops.subList(seg + 1, stops.size))
+        return Snap(seg, frac, from.offM, len(seg) * (1 - frac) + after, n - seg)
+    }
 }
