@@ -56,6 +56,10 @@
             android:exported="false" />
 
         <receiver
+            android:name=".WakeReceiver"
+            android:exported="false" />
+
+        <receiver
             android:name=".GeoReceiver"
             android:exported="false" />
 
