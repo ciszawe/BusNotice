@@ -55,6 +55,11 @@ object Scheduler {
         DepartAdvisor.current.value = null
     }
 
+    /** 误启动（没出发就收起）：撤销「今天已经走过」 */
+    fun unmarkRan(ctx: Context, planId: String) {
+        ctx.getSharedPreferences("ran_day", Context.MODE_PRIVATE).edit().remove(planId).apply()
+    }
+
     fun ranToday(ctx: Context, planId: String): Boolean =
         ctx.getSharedPreferences("ran_day", Context.MODE_PRIVATE).getLong(planId, -1L) == LocalDate.now().toEpochDay()
 
