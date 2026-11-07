@@ -53,6 +53,11 @@ object GeoWatch {
         for (i in 0 until 3) pi(ctx, tripId, i, false)?.let { runCatching { lm.removeProximityAlert(it) }; it.cancel() }
     }
 
+    /** 误启动后撤销「今天围栏已拉起过」 */
+    fun unmarkToday(ctx: Context, tripId: String) {
+        ctx.getSharedPreferences("geo", Context.MODE_PRIVATE).edit().remove(tripId).apply()
+    }
+
     /** 现在算不算这趟行程的出行时段：学到的通常上车时间 ±60 分钟，没学到就用时间窗前后各放 60 分钟 */
     fun inHabitBand(ctx: Context, trip: Trip): Boolean {
         val today = LocalDate.now()
