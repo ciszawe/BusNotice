@@ -276,6 +276,11 @@ class CommuteService : Service() {
         trustFixSince = startedAt - if (restart) 10 * 60_000L else 30_000L
         runCatching { TraceLog.start(this, t.id, t.name) }
         TraceLog.event("run", "manual" to manual, "restart" to (intent == null), "userRestart" to restart, "why" to why)
+        Health.logSystem(this); Health.logExits(this)
+        if (!screenRegistered) runCatching {
+            registerReceiver(screenRx, Health.screenFilter(), RECEIVER_NOT_EXPORTED); screenRegistered = true
+        }
+        TraceLog.event("dev", "what" to (if (Health.screenOn(this)) "screen_on" else "screen_off"), "plugged" to Health.plugged(this))
         TraceLog.onCell = { snap -> scope.launch(Dispatchers.Main) { runCatching { onCell(snap) }.onFailure { Log.w(TAG, "基站处理失败", it) } } }
         walkFixes.clear(); firstWalkDone = false; userRestarted = restart
         metroGate.reset(); cellExitAt = 0L; lastUgAt = 0L; surfaceSince = 0L; goodGpsAt = 0L; lastLiveKey = ""; if (metroRideOn) fpRec.finish(); metroRideOn = false; busMovingOn = false; tacLearner = null
@@ -298,6 +303,7 @@ class CommuteService : Service() {
         loop?.cancel()
         // 围栏拉起的是一趟全新的行程：不接中断前的进度
         val fresh = intent?.getBooleanExtra("fresh", false) == true || restart
+        geoStart = intent?.getBooleanExtra("fresh", false) == true && !restart && !manual
         if (fresh) clearRun()
         val resumedDl = if (fresh) null else restoreRun(t)
         // 看板缓存：接着中断前那趟跑就先用存下的看板顶上（第一轮刷新前首页不空着）；新的一趟就删掉旧缓存
@@ -648,7 +654,12 @@ class CommuteService : Service() {
             val wait = try { tick() } catch (e: Exception) {
                 Log.w(TAG, "刷新失败", e); 20_000L
             }
+            val t0 = System.currentTimeMillis()
             delay(wait)
+            val over = System.currentTimeMillis() - t0 - wait
+            // 该醒没醒：进程被系统冻住了多久（熄屏时常见），给保活排查用
+            if (over > 60_000L) TraceLog.event("freeze", "sec" to over / 1000, "plannedS" to wait / 1000,
+                "screen" to Health.screenOn(this), "plugged" to Health.plugged(this))
         }
         finish()
     }
@@ -835,7 +846,7 @@ class CommuteService : Service() {
         }
         val a0 = Decision.decide(options, connecting)
         // 离到换乘站还有 10 分钟以上：实时到站那么远不准，不提赶不赶得上，只给预计到换乘站的时间
-        val a = if (connecting && prev != null && expectArrive - now > 10 * 60_000L) {
+        val a1 = if (connecting && prev != null && expectArrive - now > 10 * 60_000L) {
             val at = prev.candidates.firstOrNull { it.alightName.isNotEmpty() }?.alightName ?: "换乘站"
             val hhmm = java.time.Instant.ofEpochMilli(expectArrive).atZone(ZoneId.systemDefault()).toLocalTime()
                 .let { String.format("%02d:%02d", it.hour, it.minute) }
@@ -843,12 +854,28 @@ class CommuteService : Service() {
             Decision.Advice(Decision.Mode.CONNECT, a0.option, null, a0.walkSec, 0, "${hhmm}到",
                 "预计 $hhmm 到 $at · 之后换 $nextLine，快到时再看赶哪班")
         } else a0
+        // 实时说「无车」：按历史到站时刻给「下一班约 HH:MM」，倒计时交给系统走（进程被冻住也照样对）。只显示，不提醒
+        val tt = if (a1.mode == Decision.Mode.NO_BUS && (a1.arrival == null || a1.arrival.stopsAway < 0))
+            a1.option?.candidate?.takeIf { it.type == Candidate.Type.BUS }
+                ?.let { BusTimetable.predict(this, BusSampler.key(it), now) }?.takeIf { it.atMs >= now - 60_000L }
+        else null
+        if (tt != null && ttLogged != tt.atMs) { ttLogged = tt.atMs; TraceLog.event("timetable", "at" to tt.atMs, "lo" to tt.loMin, "hi" to tt.hiMin, "days" to tt.days) }
+        val a = if (tt != null) a1.copy(headline = "约" + BusTimetable.hhmm(tt.mid()),
+            detail = "实时暂无车 · 近 ${tt.days} 天这班一般 ${BusTimetable.hhmm(tt.loMin)}–${BusTimetable.hhmm(tt.hiMin)} 到" +
+                (a1.detail.takeIf { it.isNotEmpty() }?.let { " · $it" } ?: "")) else a1
+        // 关键时刻：换乘等车、或车 15 分钟内到 → 每分钟用闹钟叫醒一次（熄屏冻结时只有闹钟叫得醒）
+        val waitingBus = !riding && !leg.isMetroOnly() && (legIdx == 0 || alightAt > 0 || (connecting && now >= expectArrive - 5 * 60_000L))
+        val soonBus = (a.arrival?.etaSec?.let { it in 0..900 } == true) || (tt != null && tt.atMs - now <= 15 * 60_000L) ||
+            (connecting && alightAt > 0)
+        if (waitingBus && soonBus) WakeAlarm.arm(this, now + 60_000L) else WakeAlarm.cancel(this)
         a.option?.candidate?.let { lastCand = it }
         // 先坐地铁再换公交、还没出发：倒推「最晚几点走，到换乘站刚好赶上公交」
         val plan = if (!planDone && legIdx == 0 && boardedAt == 0L && nearSince == 0L && leg.isMetroOnly())
             runCatching { planTransfer(leg, options, secOfDay, loc) }.getOrNull() else null
         if (plan != null) return planTick(plan, leg, a, now)
-        val v = visual(a, leg, connecting, expectArrive, now)
+        val v = visual(a, leg, connecting, expectArrive, now).let { v0 ->
+            if (tt != null && (v0.countdownTo == null || v0.countdownTo <= now)) v0.copy(countdownTo = tt.atMs) else v0
+        }
         LiveNotifier.update(this, LiveNotifier.build(this, v)); logLive(v)
         // 换乘中还在地铁上：看板也给站点圆点和站名（和胶囊同一算法）
         val cr = if (connecting && prev?.isMetroOnly() == true && now < expectArrive) metroRoutes[legIdx - 1] else null
@@ -1259,6 +1286,7 @@ class CommuteService : Service() {
         if (arriveAlertedAt == 0L && (near || busLast || timeUp)) {
             TraceLog.event("arrive_alert", "d" to d?.toInt(), "near" to near, "busLast" to busLast, "timeUp" to timeUp)
             arriveAlertedAt = now
+            saveRun(deadlineAt)   // 立刻存：11/4 早被杀重启 5 次，每次都重弹「快到了」
             LiveNotifier.alert(this, "快到 $name 了", "准备下车", metro = metro, id = 1005)
         }
         // 结束：到了下车站 150 米内；或提醒后过了 5 分钟且超过预计到站时间（地铁 3 分钟、公交 10 分钟）。
@@ -1547,8 +1575,19 @@ class CommuteService : Service() {
             val l = Places.classify(this, loc.latitude, loc.longitude, loc.accuracy)
             if (l != lastPlace) { lastPlace = l; placeSince = loc.time; TraceLog.event("place", "label" to l.name) }
             if (startLabel == null && !restored && loc.time - startedAt < 120_000L) startLabel = l
+            val neverBoarded = legIdx == 0 && boardedAt == 0L && !riding
+            // 到了上车站附近（围栏）拉起的，结果第一个好定位就在家/公司里：是误触发（11/6 18:22 在公司加班时被拉起）。
+            // 悄悄收起，并且不算「今天已经走过」，等真离开时还能自动开始
+            if (geoStart && neverBoarded && !restored && (l == Places.Label.HOME || l == Places.Label.WORK) &&
+                loc.time - placeSince >= 3 * 60_000L && !finishing && !tail) {
+                TraceLog.event("false_start", "label" to l.name)
+                Diag.mark(this, "还在${if (l == Places.Label.HOME) "家" else "公司"}，没出发，先收起")
+                Scheduler.unmarkRan(this, trip.id); GeoWatch.unmarkToday(this, trip.id)
+                finish(); return
+            }
             // H3 兜底：进了家 / 公司（不是出发的那个地方）待满 3 分钟、行程还没结束 → 直接算到了
-            if ((l == Places.Label.HOME || l == Places.Label.WORK) && l != startLabel && !arrived && !tail && !finishing &&
+            // 一次车都没坐过就不按「到家/到公司」结束：分不清是到了还是根本没走（11/6：首个定位晚到，在公司里被判成「到公司」）
+            if ((l == Places.Label.HOME || l == Places.Label.WORK) && l != startLabel && !neverBoarded && !arrived && !tail && !finishing &&
                 loc.time - startedAt > 5 * 60_000L && loc.time - placeSince >= 3 * 60_000L) {
                 TraceLog.event("place_arrive", "label" to l.name, "leg" to legIdx, "riding" to riding)
                 Diag.mark(this, "已经${if (l == Places.Label.HOME) "到家" else "到公司"}，行程结束")
@@ -1904,6 +1943,14 @@ class CommuteService : Service() {
             }.onFailure { Log.w(TAG, "补读刷卡失败", it) }
         }
     }
+
+    private var ttLogged = 0L
+    private var geoStart = false
+    private var screenRegistered = false
+    private val screenRx = Health.screenReceiver()
+
+    /** 关键时刻的闹钟到了：马上刷新一次（进程刚被叫醒） */
+    fun onWakeAlarm() { scope.launch(Dispatchers.Main) { kick() } }
 
     private fun kick() {
         if (finishing || deadlineAt <= System.currentTimeMillis()) return
@@ -2302,6 +2349,7 @@ class CommuteService : Service() {
 
     private fun finish() {
         holdCpu(false)
+        WakeAlarm.cancel(this)
         if (metroRideOn) runCatching { endMetroRide() }
         if (busMovingOn) runCatching { busMovingOn = false; tacLearner?.let { it.endSurface(); MetroCells.save(this, it) } }
         TraceLog.onCell = null
@@ -2327,6 +2375,7 @@ class CommuteService : Service() {
 
     override fun onDestroy() {
         holdCpu(false)
+        if (screenRegistered) { runCatching { unregisterReceiver(screenRx) }; screenRegistered = false }
         if (!finishing) { Diag.mark(this, "服务被系统停止（非主动结束）"); TraceLog.stop() }
         try { lm?.removeUpdates(listener) } catch (_: Exception) { }
         // 只有自己还是当前实例（或没有更新的实例）时才清内存里的看板，免得旧实例的 onDestroy 把新实例刚设的状态清掉。
